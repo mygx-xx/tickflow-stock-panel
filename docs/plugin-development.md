@@ -339,7 +339,7 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `client.py` — 连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
     **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败
   - `provider.py` — 字段映射与单位换算(见下「eltdx 口径要点」)+ 试拉 + 可用性自检
-  - `tests/test_eltdx_provider.py` — 111 个契约测试(假 client 注入, 不连主站)
+  - `tests/test_eltdx_provider.py` — 112 个契约测试(假 client 注入, 不连主站)
   - **eltdx 口径要点**(eltdx 3.2.2 实测基线, 改动前务必复测):
     - `change_pct` 是**百分数制**(`0.442478` = 0.4425%), 面板契约要小数制 → provider 内 **/100**
     - `total_hand` / `volume_lots` 单位是**手**(自验 `amount/(last x hand) ≈ 100`), 面板同为手 → 直用

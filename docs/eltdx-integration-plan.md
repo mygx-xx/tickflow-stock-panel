@@ -53,8 +53,8 @@ backend/app/plugins/eltdx/
 ├── plugin.yaml        31 行   清单：runtime/entry/check/datasets/install_hint/合规提示
 ├── requirements.txt    3 行   依赖声明（eltdx>=3.2.2），设置页「安装依赖」读取
 ├── __init__.py         1 行
-├── client.py         318 行   适配层：连接池 / 代码双向转换 / 自管分页 / 软失败语义
-└── provider.py       964 行   契约层：字段映射 / 单位换算 / 试拉 / 可用性自检
+├── client.py         358 行   适配层：连接池 / 代码双向转换 / 自管分页 / 软失败语义
+└── provider.py       993 行   契约层：字段映射 / 单位换算 / 试拉 / 可用性自检
 ```
 
 **分层原则**：`client.py` 只与 eltdx 打交道（负责"怎么拿到数据"），`provider.py` 只与面板契约打交道（负责"数据长什么样"）。口径换算全部集中在 provider，便于对账与审计。
@@ -137,7 +137,7 @@ close                                     资源释放
 - 对账未通过则不接入（宁可回退 TickFlow，也不接错口径）
 
 ### 4.6 契约测试（贯穿）
-每个切片都补契约测试，范本 `backend/tests/test_fuyao_provider.py`，**不依赖真实网络**（假 client 注入）。当前 **111 个**测试用例。
+每个切片都补契约测试，范本 `backend/tests/test_fuyao_provider.py`，**不依赖真实网络**（假 client 注入）。当前 **112 个**测试用例。
 
 ---
 
@@ -145,19 +145,22 @@ close                                     资源释放
 
 | 文件 | 行数 |
 |---|---|
-| `backend/app/plugins/eltdx/provider.py` | 964 |
-| `backend/app/plugins/eltdx/client.py` | 318 |
+| `backend/app/plugins/eltdx/provider.py` | 993 |
+| `backend/app/plugins/eltdx/client.py` | 358 |
 | `backend/app/plugins/eltdx/plugin.yaml` | 31 |
 | `backend/app/plugins/eltdx/requirements.txt` | 3 |
 | `backend/app/plugins/eltdx/__init__.py` | 1 |
-| `backend/tests/test_eltdx_provider.py` | 1484（80 个 test 函数） |
-| `docs/plugin-development.md` | +49（eltdx 条目与口径要点） |
+| `backend/tests/test_eltdx_provider.py` | 1516（81 个 test 函数） |
+| `docs/plugin-development.md` | +51（eltdx 条目与口径要点） |
 | `docs/eltdx-capability-audit.md` | 本文档配套 |
 | `docs/eltdx-integration-plan.md` | 本文件 |
 
-**提交历史**（`feat/eltdx-data-source`，已推送至 `origin`）：
+**提交历史**（8 个提交，已快进合并入 `main` 并推送至 `origin`）：
 
 ```
+3a43483  docs(eltdx): 补充全市场压测结果（修复轮 133.7 万行/22.5s，增量轮 11s）
+dbefab1  docs(eltdx): 补充能力核查结论与接入方案文档
+a9b2247  fix(plugins): 修复 eltdx 全市场快照分片超限导致 0 行 + 实现全量分钟增量轮
 50490c3  feat(plugins): eltdx 接入 adj_factor(除权因子, 单事件比值推导)          5 files, +704 -19
 843c1a3  feat(plugins): eltdx 接入 financial(shares 表)并修复北交所 symbol 误标   5 files, +403 -12
 a4463ed  feat(plugins): eltdx 接入 depth5(五档盘口/封单/盘口深度)                 5 files, +275 -10
@@ -165,7 +168,7 @@ a4463ed  feat(plugins): eltdx 接入 depth5(五档盘口/封单/盘口深度)   
 07112dd  feat(plugins): 新增 eltdx(通达信)数据源插件(daily/realtime)              7 files, +1138
 ```
 
-**质量门禁**：插件契约测试 111 passed ｜ 全量后端 2570 passed / 6 skipped / 0 failed ｜ `ruff check` clean ｜ `ruff format --check` clean。
+**质量门禁**：插件契约测试 **112 passed** ｜ 全量后端 2570 passed / 6 skipped ｜ `ruff check` clean ｜ `ruff format --check` clean。
 
 ---
 
