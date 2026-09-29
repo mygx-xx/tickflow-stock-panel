@@ -577,6 +577,37 @@ def test_minute_filters_out_of_range_bars() -> None:
     assert df["datetime"][0].day == 29
 
 
+def test_minute_request_count_scales_by_240_bars_per_day() -> None:
+    """回归防护: 分钟请求根数必须按「每日 240 根」折算, 不能把自然日数当根数。
+
+    曾实测到的缺陷: 实现写成 ``int(span_days * 0.8) + 10``(5 天 -> 14 根),
+    14 根只覆盖不到 1 天, 于是 5 天的同步只落盘最后一天(数据页「分钟K」显示 1)。
+    正确: 5 自然日 -> 约 2~3 交易日 -> 需 >=720 根。
+    """
+    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31)]})
+    _provider(fake).get_minute(["000001.SZ"], date(2026, 9, 24), date(2026, 9, 29))
+
+    calls = [c for c in fake.calls if c[0] == "bars" and c[2] == "1m"]
+    assert calls, "分钟应走 bars(period='1m')"
+    count = calls[0][3]
+    # 5 自然日 ~ 2-3 交易日; 至少要能覆盖这些天的每日 240 根
+    assert count >= 2 * 240, f"5 自然日只请求 {count} 根, 不足 2 个交易日"
+    assert count <= 12000, "不得超过 _MINUTE_MAX_BARS 上限"
+
+
+def test_minute_request_count_scales_with_range() -> None:
+    """更长区间的请求根数必须单调增大(否则长区间会静默截断成短区间)。"""
+    fake1 = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31)]})
+    _provider(fake1).get_minute(["000001.SZ"], date(2026, 9, 28), date(2026, 9, 29))
+    short = next(c for c in fake1.calls if c[0] == "bars" and c[2] == "1m")[3]
+
+    fake2 = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31)]})
+    _provider(fake2).get_minute(["000001.SZ"], date(2026, 8, 1), date(2026, 9, 29))
+    long = next(c for c in fake2.calls if c[0] == "bars" and c[2] == "1m")[3]
+
+    assert long > short, "长区间的请求根数必须更大"
+
+
 def test_minute_single_symbol_failure_isolated() -> None:
     """单标的异常隔离: 一只失败不影响其他标的(分钟走并发, 需逐个兜底)。"""
 

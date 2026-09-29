@@ -670,9 +670,11 @@ class EltDxProvider:
         start_dt = _as_datetime(start_time, end_of_day=False)
         end_dt = _as_datetime(end_time, end_of_day=True)
         span_days = max(1, (end_dt.date() - start_dt.date()).days)
-        # 1m 每日 240 根; 自然日 -> 交易日约 0.75, 留余量后向上取整
-        count = min(int(span_days * 0.8) + 10, _MINUTE_MAX_BARS) * 240 // 240
-        count = max(count, 240)
+        # 1m **每日 240 根**(09:31~11:30 + 13:01~15:00)。自然日 -> 交易日约 0.8 占比,
+        # 再按每日根数放大并留余量。注意: 必须乘 240 —— 否则把"自然日数"当成"K 线根数",
+        # 5 天只会取到 14 根(不到 1 天), 落盘就只剩最后一天(实测踩过)。
+        est_days = int(span_days * 0.8) + 2
+        count = min(est_days * 240 + 240, _MINUTE_MAX_BARS)
         rows: list[dict] = []
 
         def _one(sym: str) -> list[dict]:
