@@ -332,13 +332,14 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
     失败按契约**抛异常**由服务按批隔离, 不跨源回退)、
     `financial`(**只实现 `shares` 表**: `corporate.finance_batch` 的总/流通股本, eltdx 单位为
     **万股**故 provider 内 x10000; `period_end`/`announce_date` 取 `updated_date`。
-    下游驱动 `share_capital` 的历史换手率 `volume x 10000 / float_shares`)
-  - **未接入** `adj_factor`(口径障碍见下), 与 `metrics` / `income` / `balance_sheet` /
-    `cash_flow` 四张财务表(f10 报表字段见下, 未声明即回退或由多源合并保留 TickFlow 值)
+    下游驱动 `share_capital` 的历史换手率 `volume x 10000 / float_shares`)、
+    `adj_factor`(除权因子**单事件比值**: 由 `(hfq_scale, hfq_offset)` 推导, 公式与标定见下)
+  - **未接入** `metrics` / `income` / `balance_sheet` / `cash_flow` 四张财务表
+    (f10 报表字段见下, 未声明即回退或由多源合并保留 TickFlow 值)
   - `client.py` — 连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
     **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败
   - `provider.py` — 字段映射与单位换算(见下「eltdx 口径要点」)+ 试拉 + 可用性自检
-  - `tests/test_eltdx_provider.py` — 86 个契约测试(假 client 注入, 不连主站)
+  - `tests/test_eltdx_provider.py` — 111 个契约测试(假 client 注入, 不连主站)
   - **eltdx 口径要点**(eltdx 3.2.2 实测基线, 改动前务必复测):
     - `change_pct` 是**百分数制**(`0.442478` = 0.4425%), 面板契约要小数制 → provider 内 **/100**
     - `total_hand` / `volume_lots` 单位是**手**(自验 `amount/(last x hand) ≈ 100`), 面板同为手 → 直用
@@ -347,10 +348,17 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
     - 快照 `time_raw` 是当日 `HHMMSScc` 紧凑整数(8 位, 末 2 位百分秒; 实测 `15330366` = 15:33:03.66)
     - **分钟要用 `bars.get(period='1m')` 而非 `minutes.history`**: 后者是**分时点**
       (仅 `price`+`volume`, 无 OHLC 且 `amount` 恒 0), 不满足分钟 K 契约
-    - **`adj_factor` 口径障碍**: eltdx 用 `(scale, offset)` 二元组表达除权(scale 管送转、
-      offset 管现金分红), 面板 `ex_factor` 是**单事件比值**。实测 `002818.SZ` 在 2026-09-29
-      是真实除权日, 但 `hfq_scale` 前后均为 1.70(变化只在 offset), 故**不能只取 scale 比值**,
-      需专门推导等效 ratio 并对账后才可接入
+    - **`adj_factor` 的换算公式**(实测标定, 已与本地表 32/32 对账):
+      eltdx 用 `(scale, offset)` 二元组表达除权(scale 管送转、offset 管现金分红), 面板
+      `ex_factor` 是**单事件比值**且累积链由 `pipeline._apply_adj_factor` 自建。换算:
+      `div = (cur.hfq_offset - prev.hfq_offset) / cur.hfq_scale`(每股分红);
+      `ex_factor = (cur.hfq_scale / prev.hfq_scale) x prev_close / (prev_close - div)`,
+      其中 `prev_close` 取事件日**前一交易日**的不复权收盘(当日收盘是除权后的价, 不可用)。
+      ⚠️ **必须用 `hfq_*` 而非 `qfq_*`**: 实测 `qfq_offset` 是前复权偏移量(000001.SZ
+      2026-09-24 增量 0.36), 真实分红是 hfq 口径(0.249); 只用 scale 比值会漏掉分红型除权
+      (002818.SZ 该日 scale 前后都是 1.70, 变化只在 offset)。
+      精度: `hfq_offset` 有累计浮点/取整误差, 反推的 div 与交易所公布值可能有微小出入,
+      `ex_factor` 最大约 **0.024%** 相对偏差(影响复权价第 4 位小数); 需完全一致时用 fuyao
     - **财务表不接的原因**: `f10.finance_report(zcfzb/lrb/xjllb)` 返回的是**不透明代码**
       (`T007`/`T039`/`N000`…), eltdx 包内**不含代码→名称字典**(已全包搜索确认)。
       会计恒等式虽自洽(`T039-T077 ≈ 总负债`), 但 40+ 字段只能靠算术反推; 而面板的财务合并

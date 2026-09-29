@@ -162,6 +162,18 @@ class _FakeClient:
         self.calls.append(("finance_batch", tuple(codes)))
         return None
 
+    def adjustment_factors(self, code):
+        """除权事件列表; 默认返回 [](既有用例不受影响)。
+
+        ``_adj_events`` 由 :func:`_adj_client` 就地挂上(不改本类 ``__init__`` 签名,
+        避免既有子类覆写 ``__init__`` 时漏传新参数)。``raise_for`` 里的代码抛异常,
+        用于验证 get_adj_factors 的单标的隔离。
+        """
+        self.calls.append(("adj", code))
+        if code in getattr(self, "_adj_raise", ()):
+            raise RuntimeError("station down")
+        return list(getattr(self, "_adj_events", {}).get(code, []))
+
     def close(self):
         self.calls.append(("close",))
 
@@ -361,17 +373,23 @@ def test_get_realtime_maps_all_shares() -> None:
 
 
 def test_declared_datasets_only() -> None:
-    """只声明已实现的数据集; 未声明的 provider_has_dataset 语义为 False(回退 TickFlow)。"""
+    """声明的数据集 = 已实现的集合(未声明的 provider_has_dataset 为 False → 回退)。"""
     p = EltDxProvider()
     ds = p.config.datasets
-    assert set(ds) == {"daily", "realtime", "minute", "full_minute", "depth5", "financial"}
-    for not_supported in ("adj_factor",):
-        assert not_supported not in ds, f"{not_supported} 尚未接入, 不应声明"
+    assert set(ds) == {
+        "daily",
+        "realtime",
+        "minute",
+        "full_minute",
+        "depth5",
+        "financial",
+        "adj_factor",
+    }
 
 
 def test_test_dataset_reports_error_for_undeclared() -> None:
-    """试拉未声明数据集 → 返回 error 说明会回退, 不抛异常。"""
-    out = EltDxProvider().test_dataset("adj_factor")
+    """试拉未声明的数据集名 → 返回 error 说明会回退, 不抛异常。"""
+    out = EltDxProvider().test_dataset("not_a_dataset")
     assert out["rows"] == 0
     assert "回退" in out["error"]
 
@@ -426,7 +444,10 @@ def test_manifest_parses_and_entry_loads() -> None:
         "full_minute",
         "depth5",
         "financial",
+        "adj_factor",
     }
+    # manifest 与 provider 的声明必须一致, 否则设置页展示与运行时路由会脱节
+    assert set(manifest["datasets"]) == set(EltDxProvider().config.datasets)
     assert manifest["install_hint"]
     # entry/check 可解析到真实对象
     from app.data_providers.custom.loader import _load_entry
@@ -970,3 +991,494 @@ def test_financials_shares_none_response_returns_empty() -> None:
 def test_financial_declared_in_datasets() -> None:
     """financial 必须在 config.datasets 中(否则 provider_has_dataset 判 False 而回退)。"""
     assert "financial" in EltDxProvider().config.datasets
+
+
+# ---------------------------------------------------------------------------
+# 除权因子(adj_factor): [symbol, trade_date, ex_factor] 单事件比值
+# ---------------------------------------------------------------------------
+
+
+def _adj_event(
+    d: date,
+    *,
+    scale: float = 1.0,
+    offset: float = 0.0,
+    qfq_scale: float = 1.0,
+    qfq_offset: float = 0.0,
+) -> SimpleNamespace:
+    """AdjustmentFactor 替身: 只有 ``(date, qfq_*, hfq_*)`` 被 provider 消费。
+
+    ``qfq_*`` 默认与 ``hfq_*`` 同值: 顺带证明推导**不读** qfq(改了 qfq 结果不变)。
+    """
+    return SimpleNamespace(
+        date=d,
+        hfq_scale=scale,
+        hfq_offset=offset,
+        qfq_scale=qfq_scale,
+        qfq_offset=qfq_offset,
+    )
+
+
+def _adj_client(
+    events: dict[str, list[SimpleNamespace]] | None = None,
+    *,
+    bars: dict[str, list[SimpleNamespace]] | None = None,
+    raise_for: set[str] | None = None,
+) -> _FakeClient:
+    """除权因子假 client: 事件表 + 日 K 表 + 指定标的抛异常(单标的隔离用)。
+
+    事件表按**面板 symbol** 给出(``000001.SZ``), 这里转成 eltdx 代码(``sz000001``)存,
+    因为 provider 调的是 ``adjustment_factors(to_eltdx_code(sym))`` —— 顺带把"请求前
+    必须转代码"这条钉进假 client。日 K 表仍按面板 symbol 存(provider 传原 symbol)。
+
+    不改动 ``_FakeClient.__init__`` 的签名(既有用例全部按关键字调用, 且子类各自
+    覆写 ``__init__`` 时不会串味); 除权因子需要的两个状态在这里就地挂上。
+    """
+    fake = _FakeClient(bars=bars or {})
+    fake._adj_events = {to_eltdx_code(s): v for s, v in (events or {}).items()}
+    fake._adj_raise = {to_eltdx_code(s) for s in (raise_for or set())}
+    fake._adj_panel = dict(events or {})
+    return fake
+
+
+def _adj_events(fake: _FakeClient, sym: str) -> list[SimpleNamespace]:
+    """按面板 symbol 取假事件表(测试内的便捷读取, 不触发 client 调用)。"""
+    return list(fake._adj_panel.get(sym, []))
+
+
+# 标的: 面板格式(000001.SZ -> eltdx 代码 sz000001)
+_SYM = "000001.SZ"
+_SYM2 = "600000.SH"
+
+# 事件日与其前一交易日的固定日期(交易日历无关, 只需严格先后)
+_ADJ_PREV_DAY = date(2026, 6, 9)
+_ADJ_EVENT_DAY = date(2026, 6, 10)
+_ADJ_AFTER_DAY = date(2026, 6, 11)
+_ADJ_START = date(2026, 1, 1)
+_ADJ_END = date(2026, 12, 31)
+
+
+def _adj_bars(sym: str, prev_close: float | None = 10.0, event_close: float | None = None):
+    """事件日前一交易日(以及可选的事件日)的日 K 替身。"""
+    if prev_close is None:
+        bars = []
+    else:
+        bars = [_bar(datetime(2026, 6, 9, 15, 0, tzinfo=_CN), c=prev_close)]
+    if event_close is not None:
+        bars.append(_bar(datetime(2026, 6, 10, 15, 0, tzinfo=_CN), c=event_close))
+    return {sym: bars}
+
+
+def test_adj_factors_column_contract_and_order() -> None:
+    """列必须**恰好**是 [symbol, trade_date, ex_factor](单事件比值, 非累积)。"""
+    events = {_SYM: [_adj_event(_ADJ_PREV_DAY, offset=0.0), _adj_event(_ADJ_EVENT_DAY, offset=0.5)]}
+    fake = _adj_client(events, bars=_adj_bars(_SYM))
+    df = _provider(fake).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    assert df.columns == ["symbol", "trade_date", "ex_factor"]
+    assert df.height >= 1, "有事件的用例必须真产出数据(否则列断言会空转)"
+    assert fake.calls.count(("adj", "sz000001")) == 1, "面板 symbol 必须转成 eltdx 代码再请求"
+
+
+def test_adj_factors_symbol_normalization_roundtrip() -> None:
+    """symbol 归一: 面板格式 ``000001.SZ`` 进就 ``000001.SZ`` 出(不是 sz000001)。"""
+    events = {_SYM: [_adj_event(_ADJ_PREV_DAY), _adj_event(_ADJ_EVENT_DAY, offset=0.1)]}
+    df = _provider(_adj_client(events, bars=_adj_bars(_SYM))).get_adj_factors(
+        [_SYM], _ADJ_START, _ADJ_END
+    )
+
+    assert df["symbol"].to_list() == [_SYM]
+
+
+def test_adj_factors_sorted_by_symbol_and_trade_date() -> None:
+    """输出按 (symbol, trade_date) 升序(下游 join_asof 依赖有序)。"""
+    later = date(2026, 6, 20)
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, offset=0.0),
+            _adj_event(later, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, offset=0.0),
+        ],
+        _SYM2: [
+            _adj_event(_ADJ_PREV_DAY, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, offset=0.0),
+        ],
+    }
+    bars = {**_adj_bars(_SYM), **_adj_bars(_SYM2)}
+    df = _provider(_adj_client(events, bars=bars)).get_adj_factors(
+        [_SYM2, _SYM], _ADJ_START, _ADJ_END
+    )
+
+    got = [(r["symbol"], r["trade_date"]) for r in df.to_dicts()]
+    assert got == [
+        (_SYM, _ADJ_EVENT_DAY),
+        (_SYM, later),
+        (_SYM2, _ADJ_EVENT_DAY),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 除权因子: 区间过滤 / 首事件跳过
+# ---------------------------------------------------------------------------
+
+
+def test_adj_factors_filters_events_outside_range() -> None:
+    """区间外的除权事件必须过滤(源会一次返回全历史事件)。"""
+    events = {
+        _SYM: [
+            _adj_event(date(2025, 12, 1), offset=0.0),  # 区间外(且是首个事件)
+            _adj_event(_ADJ_EVENT_DAY, offset=0.2),  # 区间内
+            _adj_event(date(2027, 3, 1), offset=0.4),  # 区间外
+        ]
+    }
+    df = _provider(_adj_client(events, bars=_adj_bars(_SYM))).get_adj_factors(
+        [_SYM], _ADJ_START, _ADJ_END
+    )
+
+    assert df["trade_date"].to_list() == [_ADJ_EVENT_DAY]
+
+
+def test_adj_factors_range_bounds_are_inclusive() -> None:
+    """区间端点包含边界: 事件日 == start 或 == end 都算在区间内。"""
+    events = {_SYM: [_adj_event(_ADJ_PREV_DAY), _adj_event(_ADJ_EVENT_DAY, offset=0.2)]}
+    p = _provider(_adj_client(events, bars=_adj_bars(_SYM, prev_close=10.0)))
+
+    assert p.get_adj_factors([_SYM], _ADJ_EVENT_DAY, _ADJ_EVENT_DAY).height == 1
+    assert p.get_adj_factors([_SYM], _ADJ_EVENT_DAY, _ADJ_AFTER_DAY).height == 1
+    assert p.get_adj_factors([_SYM], _ADJ_START, _ADJ_PREV_DAY).height == 0
+
+
+def test_adj_factors_skips_first_event_so_n_minus_one_rows() -> None:
+    """N 个事件只产出 N-1 行: 首个事件无前序参照(累积链从第 2 个起有定义)。"""
+    events = {
+        _SYM: [
+            _adj_event(date(2026, 3, 2), offset=0.0),
+            _adj_event(date(2026, 4, 2), offset=0.1),
+            _adj_event(date(2026, 5, 4), offset=0.2),
+            _adj_event(date(2026, 6, 1), offset=0.3),
+        ]
+    }
+    bars = {
+        _SYM: [
+            _bar(datetime(2026, 3, 1, 15, 0, tzinfo=_CN), c=10.0),
+            _bar(datetime(2026, 4, 1, 15, 0, tzinfo=_CN), c=10.0),
+            _bar(datetime(2026, 5, 1, 15, 0, tzinfo=_CN), c=10.0),
+        ]
+    }
+    df = _provider(_adj_client(events, bars=bars)).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    assert len(events[_SYM]) == 4, "N == 4 个事件"
+    assert df.height == 3, "首个事件必须被跳过(无前序参照), 故只有 N-1 行"
+    assert df["trade_date"].to_list() == [date(2026, 4, 2), date(2026, 5, 4), date(2026, 6, 1)]
+    assert date(2026, 3, 2) not in df["trade_date"].to_list()
+
+
+# ---------------------------------------------------------------------------
+# 除权因子: 公式(纯分红 / 送转 / 复合)
+# ---------------------------------------------------------------------------
+
+
+def test_adj_factors_pure_cash_dividend_formula() -> None:
+    """纯现金分红(scale 不变, offset 增大): ex_factor = prev_close / (prev_close - div)。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=1.0, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=1.0, offset=0.5),
+        ]
+    }
+    df = _provider(_adj_client(events, bars=_adj_bars(_SYM, prev_close=10.0))).get_adj_factors(
+        [_SYM], _ADJ_START, _ADJ_END
+    )
+
+    assert df.height == 1
+    row = df.row(0, named=True)
+    assert row["trade_date"] == _ADJ_EVENT_DAY
+    # div = (0.5 - 0.0) / 1.0 -> ex = (1.0 / 1.0) x 10.0 / (10.0 - 0.5)
+    assert row["ex_factor"] == pytest.approx(10.0 / 9.5)
+    assert row["ex_factor"] == pytest.approx(1.0526315789473684)
+
+
+def test_adj_factors_split_formula_scale_changed() -> None:
+    """送转(scale 变化, offset 不变): div=0 -> ex_factor = cur_scale / prev_scale。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=1.0, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=2.0, offset=0.0),
+        ]
+    }
+    row = (
+        _provider(_adj_client(events, bars=_adj_bars(_SYM, prev_close=10.0)))
+        .get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+        .row(0, named=True)
+    )
+
+    assert row["ex_factor"] == pytest.approx(2.0), "10 送 10 的除权比值应为 2.0"
+
+
+def test_adj_factors_composite_scale_and_offset() -> None:
+    """复合(scale 与 offset 同时变): 两类效应按公式相乘复合, 不是简单相加。"""
+    prev_scale, cur_scale = 2.0, 3.0
+    prev_offset, cur_offset = 0.4, 1.0
+    prev_close = 20.0
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=prev_scale, offset=prev_offset),
+            _adj_event(_ADJ_EVENT_DAY, scale=cur_scale, offset=cur_offset),
+        ]
+    }
+    row = (
+        _provider(_adj_client(events, bars=_adj_bars(_SYM, prev_close=prev_close)))
+        .get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+        .row(0, named=True)
+    )
+
+    div = (cur_offset - prev_offset) / cur_scale  # = 0.2
+    want = (cur_scale / prev_scale) * prev_close / (prev_close - div)
+    assert div == pytest.approx(0.2)
+    assert row["ex_factor"] == pytest.approx(want)
+    assert row["ex_factor"] == pytest.approx(1.5 * 20.0 / 19.8)
+    # 单纯相加会把分红项算错(少乘 scale 比), 这里钉死不是相加
+    assert row["ex_factor"] != pytest.approx((cur_scale / prev_scale) + div)
+
+
+def test_adj_factors_uses_hfq_not_qfq() -> None:
+    """契约红线: 只读 hfq_*, qfq_* 改了也不影响结果(实测 qfq_offset 是前复权偏移)。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=1.0, offset=0.0, qfq_scale=7.7, qfq_offset=99.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=1.0, offset=0.5, qfq_scale=3.3, qfq_offset=-42.0),
+        ]
+    }
+    row = (
+        _provider(_adj_client(events, bars=_adj_bars(_SYM, prev_close=10.0)))
+        .get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+        .row(0, named=True)
+    )
+
+    assert row["ex_factor"] == pytest.approx(10.0 / 9.5)
+
+
+# ---------------------------------------------------------------------------
+# 除权因子: 基准价(prev_close)相关红线
+# ---------------------------------------------------------------------------
+
+
+def test_adj_factors_basis_close_is_strictly_before_event_date() -> None:
+    """回归防护: 基准价必须取事件日**严格之前**的收盘, 事件日当天收盘(除权后)不可用。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=1.0, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=1.0, offset=0.5),
+        ]
+    }
+    bars = _adj_bars(_SYM, prev_close=10.0, event_close=5.5)  # 事件日不复权价大跌(除权后)
+    row = (
+        _provider(_adj_client(events, bars=bars))
+        .get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+        .row(0, named=True)
+    )
+
+    assert row["ex_factor"] == pytest.approx(10.0 / 9.5), "应基于 6-09 的 10.0"
+    assert row["ex_factor"] != pytest.approx(5.5 / 5.0), "绝不能拿 6-10 的 5.5 当基准"
+
+
+def test_adj_factors_missing_basis_price_skips_row() -> None:
+    """无事件日之前的 K 线(基准价缺失) -> 该事件不产出行(不伪造基准价)。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=1.0, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=1.0, offset=0.5),
+        ]
+    }
+    fake = _adj_client(events, bars={})  # 一根 K 线都没有
+    df = _provider(fake).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    assert df.height == 0, "无基准价不得伪造出一行"
+    assert not df.columns
+
+
+def test_adj_factors_basis_bar_on_event_date_only_is_not_used() -> None:
+    """只有事件日当天的 K 线(无更早的) -> 基准价缺失, 该事件同样跳过。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=1.0, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=1.0, offset=0.5),
+        ]
+    }
+    bars = {_SYM: [_bar(datetime(2026, 6, 10, 15, 0, tzinfo=_CN), c=10.0)]}
+    df = _provider(_adj_client(events, bars=bars)).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    assert df.height == 0, "事件日当天的 K 线不能充当前一交易日基准价"
+
+
+def test_adj_factors_basis_bar_with_non_positive_close_ignored() -> None:
+    """基准 K 线收盘价 <= 0 视为不可用 -> 回退更早的有效收盘, 实在没有就跳过。"""
+    earlier = date(2026, 6, 5)
+    mid = date(2026, 6, 9)
+    events = {_SYM: [_adj_event(mid, offset=0.0), _adj_event(_ADJ_EVENT_DAY, offset=0.5)]}
+    bars = {
+        _SYM: [
+            _bar(datetime(2026, 6, 5, 15, 0, tzinfo=_CN), c=8.0),
+            _bar(datetime(2026, 6, 9, 15, 0, tzinfo=_CN), c=0.0),
+        ]
+    }
+    row = (
+        _provider(_adj_client(events, bars=bars))
+        .get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+        .row(0, named=True)
+    )
+
+    assert earlier < mid  # 回退到 6-05 的 8.0
+    assert row["ex_factor"] == pytest.approx(8.0 / 7.5)
+
+
+def test_adj_factors_skips_row_when_denominator_non_positive() -> None:
+    """denom = prev_close - div <= 0(数据异常) -> 跳过该行, 不产出负/发散的比值。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=1.0, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=1.0, offset=50.0),  # div = 50 > prev_close = 10
+        ]
+    }
+    df = _provider(_adj_client(events, bars=_adj_bars(_SYM, prev_close=10.0))).get_adj_factors(
+        [_SYM], _ADJ_START, _ADJ_END
+    )
+
+    assert df.height == 0, "denom <= 0 必须跳过(否则会得到负因子)"
+
+
+def test_adj_factors_skips_row_when_prev_scale_invalid() -> None:
+    """前序事件 scale 为 0/None -> 比值不可求, 跳过该行(不抛异常)。"""
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY, scale=0.0, offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY, scale=1.0, offset=0.0),
+        ]
+    }
+    df = _provider(_adj_client(events, bars=_adj_bars(_SYM))).get_adj_factors(
+        [_SYM], _ADJ_START, _ADJ_END
+    )
+
+    assert df.height == 0
+
+
+# ---------------------------------------------------------------------------
+# 除权因子: 事件数不足 / 回调 / 失败隔离 / 能力声明
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_events", [0, 1])
+def test_adj_factors_fewer_than_two_events_returns_empty(n_events) -> None:
+    """0 或 1 个事件 -> 空帧(height 0), 且不发起日 K 请求(无需基准价)。"""
+    events = {_SYM: [_adj_event(_ADJ_EVENT_DAY, offset=0.5)][:n_events]}
+    fake = _adj_client(events, bars=_adj_bars(_SYM))
+    df = _provider(fake).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    assert isinstance(df, pl.DataFrame)
+    assert df.height == 0
+    assert not [c for c in fake.calls if c[0] == "bars"], "事件不足 2 个不应取日 K"
+
+
+def test_adj_factors_empty_symbols_returns_empty() -> None:
+    """空标的列表 -> 空帧, 不触发任何 client 调用。"""
+    fake = _adj_client({})
+    df = _provider(fake).get_adj_factors([], _ADJ_START, _ADJ_END)
+
+    assert df.height == 0
+    assert fake.calls == []
+
+
+def test_adj_factors_on_chunk_done_covers_all_symbols() -> None:
+    """on_chunk_done 覆盖每个标的(含无数据的), 末次为 (total, total)。"""
+    events = {
+        _SYM: [_adj_event(_ADJ_PREV_DAY), _adj_event(_ADJ_EVENT_DAY, offset=0.5)],
+        _SYM2: [],  # 无事件也必须被回调覆盖
+    }
+    bars = {**_adj_bars(_SYM), **_adj_bars(_SYM2)}
+    seen: list[tuple[int, int]] = []
+    _provider(_adj_client(events, bars=bars)).get_adj_factors(
+        [_SYM, _SYM2], _ADJ_START, _ADJ_END, on_chunk_done=lambda c, t: seen.append((c, t))
+    )
+
+    assert len(seen) == 2, "每个标的回调一次"
+    assert seen[-1] == (2, 2)
+    assert {c for c, _ in seen} == {1, 2}, "cur 必须覆盖 1..total"
+
+
+def test_adj_factors_per_symbol_failure_isolated() -> None:
+    """单标的异常隔离: 一只抛异常不影响其他标的, 异常不上抛。"""
+    events = {
+        _SYM: [_adj_event(_ADJ_PREV_DAY, offset=0.0), _adj_event(_ADJ_EVENT_DAY, offset=0.5)],
+        _SYM2: [_adj_event(_ADJ_PREV_DAY, offset=0.0), _adj_event(_ADJ_EVENT_DAY, offset=0.5)],
+    }
+    bars = {**_adj_bars(_SYM), **_adj_bars(_SYM2)}
+    df = _provider(_adj_client(events, bars=bars, raise_for={_SYM2})).get_adj_factors(
+        [_SYM, _SYM2], _ADJ_START, _ADJ_END
+    )
+
+    assert df["symbol"].to_list() == [_SYM], "失败标的无行, 成功标的照常产出"
+
+
+def test_adj_factors_invalid_symbol_contributes_no_rows() -> None:
+    """非法 symbol(无法转 eltdx 代码) -> 不发起请求、不产出行、不崩溃。"""
+    events = {_SYM: [_adj_event(_ADJ_PREV_DAY, offset=0.0), _adj_event(_ADJ_EVENT_DAY, offset=0.5)]}
+    fake = _adj_client(events, bars=_adj_bars(_SYM))
+    df = _provider(fake).get_adj_factors(["not-a-symbol", _SYM], _ADJ_START, _ADJ_END)
+
+    assert df["symbol"].to_list() == [_SYM]
+    assert _adj_events(fake, "not-a-symbol") == [], "非法代码不会命中任何事件表"
+    assert [c for c in fake.calls if c[0] == "adj"] == [] or all(
+        c[1] != "not-a-symbol" for c in fake.calls if c[0] == "adj"
+    ), "非法代码不得转成 eltdx 代码去请求"
+
+
+def test_adj_factors_declared_in_datasets() -> None:
+    """adj_factor 必须在 config.datasets 中(否则 provider_has_dataset 判 False 而回退)。"""
+    assert "adj_factor" in EltDxProvider().config.datasets
+
+
+def test_adj_factors_empty_frame_has_no_adj_columns() -> None:
+    """无行时返回裸空帧(与文件内 daily/minute 空帧口径一致), 不伪造列。"""
+    df = _provider(_adj_client({})).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    assert isinstance(df, pl.DataFrame)
+    assert df.height == 0
+    assert df.columns == []
+
+
+class _FakeClientBarCountLimit(_FakeClient):
+    """日 K 假 client: 断言 count 上界被如实透传。"""
+
+    def bars(self, symbol, *, period="day", count):
+        self.calls.append(("bars", symbol, period, count))
+        return list(self._bars.get(symbol, []))[:count]
+
+
+def test_adj_factors_requests_daily_bars_for_basis_price() -> None:
+    """基准价来自 client.bars(symbol, period='day', count=回看窗口), 且 count 随区间放大。
+
+    回归防护: 回看根数必须覆盖整个请求区间, 否则老事件找不到基准价会被整批跳过
+    (实测固定取 120 根时, 11 年跨度只剩 6 行)。
+    """
+    from app.plugins.eltdx.provider import _ADJ_LOOKBACK_BARS
+
+    events = {_SYM: [_adj_event(_ADJ_PREV_DAY, offset=0.0), _adj_event(_ADJ_EVENT_DAY, offset=0.5)]}
+    fake = _FakeClientBarCountLimit(bars=_adj_bars(_SYM))
+    fake._adj_events = {to_eltdx_code(_SYM): events[_SYM]}
+    fake._adj_raise = set()
+    _provider(fake).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    bar_calls = [c for c in fake.calls if c[0] == "bars"]
+    assert len(bar_calls) == 1
+    _, sym, period, count = bar_calls[0]
+    assert (sym, period) == (_SYM, "day")
+    # 窄区间: 仍不小于基础回看窗口; 且不得超过 eltdx 的 8000 根上限
+    assert count >= _ADJ_LOOKBACK_BARS
+    assert count <= 8000
+    # 宽区间必须放大回看根数(否则老事件无基准价)
+    fake2 = _FakeClientBarCountLimit(bars=_adj_bars(_SYM))
+    fake2._adj_events = {to_eltdx_code(_SYM): events[_SYM]}
+    fake2._adj_raise = set()
+    _provider(fake2).get_adj_factors([_SYM], date(2015, 1, 1), date(2026, 9, 30))
+    wide = next(c for c in fake2.calls if c[0] == "bars")[3]
+    assert wide > count, "宽区间的回看根数必须更大"

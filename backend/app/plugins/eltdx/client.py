@@ -32,6 +32,7 @@ import logging
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -274,6 +275,23 @@ class EltDxClient:
         if not out:
             logger.warning("eltdx snapshots 返回空(symbols=%d)", len(symbols))
         return out
+
+    # ---- 除权因子 -------------------------------------------------------
+
+    def adjustment_factors(self, code: str) -> list[Any]:
+        """单标的除权事件列表(``AdjustmentFactor``); 失败返回 []。
+
+        每个事件含 ``(date, qfq_scale, qfq_offset, hfq_scale, hfq_offset)``。
+        注意: **推导面板 ex_factor 要用 hfq_* 而非 qfq_*** —— 实测 qfq_offset 是
+        前复权偏移量, hfq_offset 增量除以 hfq_scale 才是真实每股分红(见 provider)。
+        """
+        try:
+            resp = self._ensure().corporate.adjustment_factors(code)
+        except Exception as e:
+            logger.warning("eltdx adjustment_factors 失败 %s: %s", code, e)
+            return []
+        items = list(getattr(resp, "items", ()) or ())
+        return sorted(items, key=lambda it: getattr(it, "date", None) or date.min)
 
     # ---- 财务(基础财务信息) ---------------------------------------------
 
