@@ -41,6 +41,7 @@ from app.plugins.eltdx.client import (
     DEFAULT_SERVER_COUNT,
     DEFAULT_TIMEOUT_S,
     EltDxClient,
+    to_eltdx_code,
     to_panel_symbol,
 )
 
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 # 北京墙钟时区(UTC+8)。用固定偏移而非 zoneinfo: 中国无夏令时, 且避免 tzdata 依赖
 _CN_TZ = timezone(timedelta(hours=8))
 
-_DATASETS = ("daily", "realtime", "minute", "full_minute")
+_DATASETS = ("daily", "realtime", "minute", "full_minute", "depth5")
 
 # 日 K 列(面板 canonical 9 列, 含 quote_ts; 由 normalizer.DAILY_COLS 单源定义)
 _DAILY_COLUMNS = DAILY_COLS
@@ -166,6 +167,61 @@ def _kline_row(symbol: str, bar: Any) -> dict | None:
         "volume": _to_float(getattr(bar, "volume_lots", None)),
         "amount": _to_float(getattr(bar, "amount", None)),
     }
+
+
+def _depth_row(rec: Any) -> dict | None:
+    """盘口记录 → 面板标准盘口字典(5 档买卖价量 + 毫秒时间戳)。
+
+    实测来源: ``quotes.get_depth().records[]`` 的 ``buy_levels`` / ``sell_levels``,
+    各 5 档 ``QuoteLevel(price, volume)``; volume 单位为**手**(与面板契约一致)。
+    ``volume=0`` 是有意义的值(封死涨/跌停), 必须保留为 0。
+    ``timestamp``: 记录只有 ``update_time_raw``(当日 HHMMSS 紧凑整数, 实测 6 位),
+    无日期; 契约为毫秒 Unix 时间戳, 故按北京墙钟当日还原(同快照 time_raw 处理)。
+    """
+    bids = list(getattr(rec, "buy_levels", ()) or ())
+    asks = list(getattr(rec, "sell_levels", ()) or ())
+    if not bids and not asks:
+        return None
+    return {
+        "bid_prices": [_to_float(getattr(lv, "price", None)) for lv in bids],
+        "bid_volumes": [_to_float(getattr(lv, "volume", None)) for lv in bids],
+        "ask_prices": [_to_float(getattr(lv, "price", None)) for lv in asks],
+        "ask_volumes": [_to_float(getattr(lv, "volume", None)) for lv in asks],
+        "timestamp": _hhmmss_ts(getattr(rec, "update_time_raw", None)),
+    }
+
+
+def _hhmmss_ts(raw: Any) -> int | None:
+    """当日紧凑时间(``HHMMSS`` 6 位 或 ``HHMMSScc`` 8 位) → 当日北京墙钟毫秒时间戳。
+
+    盘口记录的 ``update_time_raw`` 实测为 **6 位**(如 ``153252`` = 15:32:52),
+    与快照的 8 位(``HHMMSScc``, 末 2 位为百分秒)不同, 故按长度自适应:
+    6 位 → 直接 HHMMSS; 8 位 → 前 6 位 HHMMSS + 末 2 位作秒的小数。
+    """
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    text = str(value).zfill(6)
+    if len(text) == 6:
+        head, micro = text, 0
+    elif len(text) == 8:
+        head, micro = text[:6], int(text[6:]) * 10_000  # 百分秒 → 微秒
+    else:
+        return None
+    if not head.isdigit():
+        return None
+    hour, minute, sec = int(head[0:2]), int(head[2:4]), int(head[4:6])
+    if hour > 23 or minute > 59 or sec > 59:
+        return None
+    today = date.today()
+    try:
+        dt = datetime(today.year, today.month, today.day, hour, minute, sec, micro, tzinfo=_CN_TZ)
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
 
 
 def _snapshot_row(snap: Any) -> dict | None:
@@ -547,6 +603,44 @@ class EltDxProvider:
                 out.append(row)
         return out
 
+    # ---- 五档盘口(depth5) ----------------------------------------------
+
+    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """五档盘口 → ``{symbol: {bid_prices, bid_volumes, ask_prices, ask_volumes, timestamp}}``。
+
+        契约(docs/plugin-development.md): 价量数组**按一档到五档排列**, 数量单位为**手**,
+        ``timestamp`` 为毫秒 Unix 时间戳; 服务层按 capability 统一分片限速, provider
+        **不自行切换/回退**到其他数据源(故这里失败即抛异常, 由服务隔离该批)。
+
+        实测口径(eltdx 3.2.2): ``quotes.get_depth(codes).records[].buy_levels/sell_levels``
+        各 5 档 ``QuoteLevel(price, volume)``, volume 单位为手(五档合计与全日总量量级自洽)。
+        **注意**: 封死涨停时卖一量为 0 —— 0 是有意义的值(服务据此判定"真封"),
+        故必须原样输出 0 而非 None/跳过。
+        """
+        if not symbols:
+            return {}
+        # 注意: client.depth() 自己会做面板格式 → eltdx 代码的转换, 故这里传原始 symbol,
+        # 不能传已转换的 eltdx 代码(会被二次转换判为非法而全部丢弃)。
+        valid = [s for s in symbols if to_eltdx_code(s)]
+        if not valid:
+            logger.warning("eltdx get_depth_batch: 无有效代码(入参 %d 个)", len(symbols))
+            return {}
+        page = self._client.depth(valid)  # 失败抛异常: 由服务按批隔离, 不跨源回退
+        records = list(getattr(page, "records", ()) or ())
+        if not records:
+            logger.warning("eltdx get_depth_batch: 返回 0 条(请求 %d 只)", len(valid))
+            return {}
+
+        out: dict[str, dict] = {}
+        for rec in records:
+            symbol = to_panel_symbol(getattr(rec, "full_code", None) or getattr(rec, "code", None))
+            if symbol is None:
+                continue
+            row = _depth_row(rec)
+            if row is not None:
+                out[symbol] = row
+        return out
+
     # ---- 设置页「试拉」 -------------------------------------------------
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
@@ -570,6 +664,21 @@ class EltDxProvider:
             if dataset == "full_minute":
                 syms = [s for s in (symbols or [])][:2] or ["000001.SZ"]
                 df = self.get_intraday_batch(syms, count=10)
+                return self._preview(dataset, df)
+            if dataset == "depth5":
+                syms = [s for s in (symbols or [])][:3] or ["000001.SZ"]
+                data = self.get_depth_batch(syms)
+                rows = [
+                    {
+                        "symbol": k,
+                        "bid1_vol": (v["bid_volumes"] or [None])[0],
+                        "ask1_vol": (v["ask_volumes"] or [None])[0],
+                        "bid_prices": v["bid_prices"],
+                        "ask_prices": v["ask_prices"],
+                    }
+                    for k, v in data.items()
+                ]
+                df = pl.DataFrame(rows) if rows else pl.DataFrame()
                 return self._preview(dataset, df)
             syms = [s for s in (symbols or [])][:5]
             rows = self.get_realtime_indices(syms) or [] if syms else self.get_realtime()

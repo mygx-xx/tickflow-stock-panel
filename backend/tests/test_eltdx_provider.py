@@ -153,6 +153,10 @@ class _FakeClient:
         self.calls.append(("snapshots", len(symbols)))
         return list(self._snapshots)
 
+    def depth(self, symbols):
+        self.calls.append(("depth", tuple(symbols)))
+        return None  # 默认无盘口(需要盘口的用例自行覆写)
+
     def close(self):
         self.calls.append(("close",))
 
@@ -355,8 +359,8 @@ def test_declared_datasets_only() -> None:
     """只声明已实现的数据集; 未声明的 provider_has_dataset 语义为 False(回退 TickFlow)。"""
     p = EltDxProvider()
     ds = p.config.datasets
-    assert set(ds) == {"daily", "realtime", "minute", "full_minute"}
-    for not_supported in ("adj_factor", "depth5", "financial"):
+    assert set(ds) == {"daily", "realtime", "minute", "full_minute", "depth5"}
+    for not_supported in ("adj_factor", "financial"):
         assert not_supported not in ds, f"{not_supported} 尚未接入, 不应声明"
 
 
@@ -410,7 +414,7 @@ def test_manifest_parses_and_entry_loads() -> None:
     assert manifest is not None, "plugin.yaml 未被识别"
     assert manifest["name"] == "eltdx"
     assert manifest["runtime"] == "python"
-    assert set(manifest["datasets"]) == {"daily", "realtime", "minute", "full_minute"}
+    assert set(manifest["datasets"]) == {"daily", "realtime", "minute", "full_minute", "depth5"}
     assert manifest["install_hint"]
     # entry/check 可解析到真实对象
     from app.data_providers.custom.loader import _load_entry
@@ -580,3 +584,139 @@ def test_full_minute_declared_in_datasets() -> None:
     ds = EltDxProvider().config.datasets
     assert "minute" in ds
     assert "full_minute" in ds
+
+
+# ---------------------------------------------------------------------------
+# 五档盘口(depth5): 价量各 5 档 + 毫秒时间戳; 失败抛异常(不跨源回退)
+# ---------------------------------------------------------------------------
+
+
+def _depth_rec(code: str, *, ask1_vol: float = 100.0, bid1_vol: float = 200.0, time_raw=153252):
+    """QuoteRefreshPage.records[] 替身: buy_levels/sell_levels 各 5 档。"""
+    bids = tuple(
+        SimpleNamespace(
+            price=10.0 - i * 0.01, volume=(bid1_vol if i == 0 else 100.0 + i), price_delta_raw=0
+        )
+        for i in range(5)
+    )
+    asks = tuple(
+        SimpleNamespace(
+            price=10.01 + i * 0.01, volume=(ask1_vol if i == 0 else 100.0 + i), price_delta_raw=1
+        )
+        for i in range(5)
+    )
+    return SimpleNamespace(
+        full_code=code, buy_levels=bids, sell_levels=asks, update_time_raw=time_raw
+    )
+
+
+class _FakeDepthPage:
+    def __init__(self, records):
+        self.records = tuple(records)
+
+
+def test_depth_batch_contract_structure() -> None:
+    """契约: {symbol: {bid_prices[5], bid_volumes[5], ask_prices[5], ask_volumes[5], timestamp}}。"""
+
+    class _C(_FakeClient):
+        def depth(self, symbols):
+            return _FakeDepthPage([_depth_rec("sz000001"), _depth_rec("sh600000")])
+
+    out = _provider(_C()).get_depth_batch(["000001.SZ", "600000.SH"])
+
+    assert set(out) == {"000001.SZ", "600000.SH"}
+    for row in out.values():
+        assert set(row) == {"bid_prices", "bid_volumes", "ask_prices", "ask_volumes", "timestamp"}
+        assert len(row["bid_prices"]) == len(row["bid_volumes"]) == 5
+        assert len(row["ask_prices"]) == len(row["ask_volumes"]) == 5
+        assert all(isinstance(v, float) for v in row["bid_volumes"])
+
+
+def test_depth_zero_ask1_preserved_for_sealed_limit_up() -> None:
+    """契约红线: 封死涨停时卖一量为 0, **0 必须保留**(服务据此判定"真封")。"""
+
+    class _C(_FakeClient):
+        def depth(self, symbols):
+            return _FakeDepthPage([_depth_rec("sz000001", ask1_vol=0)])
+
+    out = _provider(_C()).get_depth_batch(["000001.SZ"])
+    assert out["000001.SZ"]["ask_volumes"][0] == 0, "0 不能被丢弃或写成 None"
+
+
+def test_depth_volume_unit_is_lots_passthrough() -> None:
+    """volume 单位为手, 与面板契约一致 → 直用不换算。"""
+
+    class _C(_FakeClient):
+        def depth(self, symbols):
+            return _FakeDepthPage([_depth_rec("sz000001", ask1_vol=986, bid1_vol=3815)])
+
+    row = _provider(_C()).get_depth_batch(["000001.SZ"])["000001.SZ"]
+    assert row["ask_volumes"][0] == 986
+    assert row["bid_volumes"][0] == 3815
+
+
+def test_depth_raises_on_failure_no_cross_source_fallback() -> None:
+    """契约: 盘口失败必须抛出(由服务按批隔离), **不得**自行回退其他数据源。"""
+
+    class _C(_FakeClient):
+        def depth(self, symbols):
+            raise RuntimeError("station down")
+
+    with pytest.raises(RuntimeError, match="station down"):
+        _provider(_C()).get_depth_batch(["000001.SZ"])
+
+
+def test_depth_empty_symbols_and_invalid_codes() -> None:
+    """空入参/无效代码 → 返回 {} 且不触发网络调用。"""
+
+    class _C(_FakeClient):
+        def depth(self, symbols):
+            raise AssertionError("不应调用 depth")
+
+    p = _provider(_C())
+    assert p.get_depth_batch([]) == {}
+    assert p.get_depth_batch(["not-a-symbol"]) == {}
+
+
+def test_depth_skips_records_without_levels() -> None:
+    """无档位的记录丢弃(不产出空行)。"""
+
+    class _C(_FakeClient):
+        def depth(self, symbols):
+            return _FakeDepthPage(
+                [
+                    SimpleNamespace(full_code="sz000001", buy_levels=(), sell_levels=()),
+                    _depth_rec("sh600000"),
+                ]
+            )
+
+    out = _provider(_C()).get_depth_batch(["000001.SZ", "600000.SH"])
+    assert set(out) == {"600000.SH"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expect_hm"),
+    [
+        (153252, (15, 32, 52)),  # 6 位 HHMMSS(盘口实测形态)
+        (15330366, (15, 33, 3)),  # 8 位 HHMMSScc(快照形态)
+        (93100, (9, 31, 0)),
+        (999999, None),  # hour=99 越界
+        (None, None),
+        ("abc", None),
+    ],
+)
+def test_hhmmss_ts_parses_both_widths(raw, expect_hm) -> None:
+    """时间戳解析需兼容 6 位(盘口)与 8 位(快照)两种紧凑形态。"""
+    from app.plugins.eltdx.provider import _hhmmss_ts
+
+    ts = _hhmmss_ts(raw)
+    if expect_hm is None:
+        assert ts is None
+    else:
+        dt = datetime.fromtimestamp(ts / 1000)
+        assert (dt.hour, dt.minute, dt.second) == expect_hm
+
+
+def test_depth5_declared_in_datasets() -> None:
+    """depth5 必须已声明(否则服务层 provider_has_dataset 判 False 而回退)。"""
+    assert "depth5" in EltDxProvider().config.datasets

@@ -327,13 +327,15 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
     `realtime`(全市场快照 `quotes.get_snapshots`, 另实现 `get_realtime_indices` 供指数行情)、
     `minute`(1 分钟 K: **`bars.get(period='1m')` 是真 OHLC**, 供分时图/分钟回测)、
     `full_minute`(`get_intraday_batch` 修复轮走当日窗口批量; `get_intraday_latest` 全市场
-    无更优批量端点时返回空帧 → 服务按契约降级为仅修复轮 60s)
-  - **未接入** `adj_factor` / `depth5` / `financial`(未声明即自动回退 TickFlow; `adj_factor`
+    无更优批量端点时返回空帧 → 服务按契约降级为仅修复轮 60s)、
+    `depth5`(`quotes.get_depth` 各 5 档; volume 单位为手, 封死涨跌停时量为 **0 需原样保留**,
+    失败按契约**抛异常**由服务按批隔离, 不跨源回退)
+  - **未接入** `adj_factor` / `financial`(未声明即自动回退 TickFlow; `adj_factor`
     的口径障碍见下)
   - `client.py` — 连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
     **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败
   - `provider.py` — 字段映射与单位换算(见下「eltdx 口径要点」)+ 试拉 + 可用性自检
-  - `tests/test_eltdx_provider.py` — 48 个契约测试(假 client 注入, 不连主站)
+  - `tests/test_eltdx_provider.py` — 61 个契约测试(假 client 注入, 不连主站)
   - **eltdx 口径要点**(eltdx 3.2.2 实测基线, 改动前务必复测):
     - `change_pct` 是**百分数制**(`0.442478` = 0.4425%), 面板契约要小数制 → provider 内 **/100**
     - `total_hand` / `volume_lots` 单位是**手**(自验 `amount/(last x hand) ≈ 100`), 面板同为手 → 直用

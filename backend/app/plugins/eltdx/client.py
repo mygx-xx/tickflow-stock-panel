@@ -274,3 +274,16 @@ class EltDxClient:
         if not out:
             logger.warning("eltdx snapshots 返回空(symbols=%d)", len(symbols))
         return out
+
+    # ---- 五档盘口 -------------------------------------------------------
+
+    def depth(self, symbols: list[str]) -> Any:
+        """五档盘口页(``QuoteRefreshPage``, 取 ``.records``)。
+
+        与快照不同, 盘口契约要求失败由**服务层按批隔离**且不跨数据源回退,
+        故这里不做软失败 —— 异常直接上抛, 交由调用方/服务处理。
+        """
+        codes = [c for c in (to_eltdx_code(s) for s in symbols) if c]
+        if not codes:
+            return None
+        return self._ensure().quotes.get_depth(codes)
