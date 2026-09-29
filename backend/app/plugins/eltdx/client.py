@@ -339,6 +339,9 @@ class EltDxClient:
         """批量基础财务信息(``FinanceBatch``, 取 ``.records``)。
 
         ``codes`` 为 eltdx 代码(如 ``sh600519``)。失败抛异常, 由调用方按批隔离。
+
+        注意: 上游对**单次请求的代码组合**较敏感, 实测批大小需 <=20(见 provider 的
+        ``_FINANCE_BATCH``); 超限或部分组合会报 ``invalid ASCII response code``。
         """
         if not codes:
             return None

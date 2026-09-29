@@ -527,11 +527,24 @@ _CN = timezone(timedelta(hours=8))
 
 
 def _mbar(
-    hh: int, mm: int, *, sec: int = 0, c: float = 10.2, vol: float = 100.0, amt: float = 102000.0
+    hh: int,
+    mm: int,
+    *,
+    sec: int = 0,
+    c: float = 10.2,
+    vol: float = 100.0,
+    amt: float = 102000.0,
+    day: date | None = None,
 ):
-    """1m KlineBar 替身: time 为 Asia/Shanghai aware(与 eltdx 实测一致)。"""
+    """1m KlineBar 替身: time 为 Asia/Shanghai aware(与 eltdx 实测一致)。
+
+    ``day`` 默认**当天**: ``get_intraday_batch`` / ``get_intraday_latest`` 内部用
+    ``date.today()` 构造当日窗口, 硬编码日期会让行被区间过滤掉。需要指定日期
+    (如测区间过滤)时传 ``day=``。
+    """
+    d = day or date.today()
     return _bar(
-        datetime(2026, 9, 29, hh, mm, sec, tzinfo=_CN),
+        datetime(d.year, d.month, d.day, hh, mm, sec, tzinfo=_CN),
         o=c,
         h=c + 0.01,
         low=c - 0.01,
@@ -543,8 +556,9 @@ def _mbar(
 
 def test_minute_field_mapping_and_naive_beijing_wallclock() -> None:
     """契约红线: datetime 必须是北京时间墙钟 **naive**(非 UTC、无 tzinfo)。"""
-    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31), _mbar(9, 32)]})
-    df = _provider(fake).get_minute(["000001.SZ"], date(2026, 9, 29), date(2026, 9, 29))
+    d = date(2026, 9, 29)
+    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31, day=d), _mbar(9, 32, day=d)]})
+    df = _provider(fake).get_minute(["000001.SZ"], d, d)
 
     assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
     assert df.height == 2
@@ -555,8 +569,9 @@ def test_minute_field_mapping_and_naive_beijing_wallclock() -> None:
 
 def test_minute_uses_1m_period_route() -> None:
     """分钟必须走 period='1m'(不是 day, 也不是分时接口)。"""
-    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31)]})
-    _provider(fake).get_minute(["000001.SZ"], date(2026, 9, 29), date(2026, 9, 29))
+    d = date(2026, 9, 29)
+    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31, day=d)]})
+    _provider(fake).get_minute(["000001.SZ"], d, d)
     assert ("bars", "000001.SZ", "1m", ANY) in [
         (c[0], c[1], c[2], ANY) for c in fake.calls if c[0] == "bars"
     ]
@@ -564,15 +579,16 @@ def test_minute_uses_1m_period_route() -> None:
 
 def test_minute_filters_out_of_range_bars() -> None:
     """区间外分钟必须过滤(源可能返回超过请求区间的深度)。"""
+    d = date(2026, 9, 29)
     fake = _FakeClient(
         minute_bars={
             "000001.SZ": [
                 _bar(datetime(2026, 9, 25, 10, 0, tzinfo=_CN)),  # 区间外(前一交易日)
-                _mbar(9, 31),
+                _mbar(9, 31, day=d),
             ]
         }
     )
-    df = _provider(fake).get_minute(["000001.SZ"], date(2026, 9, 29), date(2026, 9, 29))
+    df = _provider(fake).get_minute(["000001.SZ"], d, d)
     assert df.height == 1
     assert df["datetime"][0].day == 29
 
@@ -613,14 +629,14 @@ def test_minute_single_symbol_failure_isolated() -> None:
 
     class _Flaky(_FakeClient):
         def bars(self, symbol, *, period="day", count):
-            if symbol == "600000.SH":
+            # symbol 是 eltdx 代码(如 sh600000)
+            if symbol == to_eltdx_code("600000.SH"):
                 raise RuntimeError("station error")
             return super().bars(symbol, period=period, count=count)
 
-    fake = _Flaky(minute_bars={"000001.SZ": [_mbar(9, 31)]})
-    df = _provider(fake).get_minute(
-        ["000001.SZ", "600000.SH"], date(2026, 9, 29), date(2026, 9, 29)
-    )
+    d = date(2026, 9, 29)
+    fake = _Flaky(minute_bars={"000001.SZ": [_mbar(9, 31, day=d)]})
+    df = _provider(fake).get_minute(["000001.SZ", "600000.SH"], d, d)
     assert df["symbol"].unique().to_list() == ["000001.SZ"]
 
 
@@ -1013,22 +1029,22 @@ def test_financials_shares_empty_symbols_no_request() -> None:
 
 def test_financials_shares_batch_exception_keeps_partial_result() -> None:
     """单批失败不拖垮整表: 返回已取到的行, 绝不向上抛异常。"""
-    batch_size = 75  # provider._FINANCE_BATCH 默认值
-    seen: list[list[str]] = []
+    from app.plugins.eltdx.provider import _FINANCE_BATCH
+
+    ok_codes = ("sz000001",)
 
     class _Flaky(_FakeClient):
         def finance_batch(self, codes):
-            seen.append(list(codes))
-            if len(seen) == 1:
-                return _FinPage([_fin("000001", "sz")])  # 首批成功
-            raise RuntimeError("station down")  # 次批炸
+            # 只让**恰好等于** ok 代码的那一批成功, 其余(含重试/拆分)全炸
+            if tuple(codes) == ok_codes:
+                return _FinPage([_fin("000001", "sz")])
+            raise RuntimeError("station down")
 
-    # 76 只标的 → 2 批(75 + 1)
-    symbols = [f"{i:06d}.SZ" for i in range(1, batch_size + 2)]
+    # 正好一批: 该批含 ok 代码(独立成批) + 一批全炸的
+    symbols = ["000001.SZ", *[f"{i:06d}.SZ" for i in range(2, _FINANCE_BATCH + 2)]]
     df = _provider(_Flaky()).get_financials("shares", symbols)
 
-    assert len(seen) == 2, "应切成 2 批请求"
-    assert df.height == 1, "首批结果必须保留"
+    assert df.height == 1, "成功那批的结果必须保留"
     assert df["symbol"].to_list() == ["000001.SZ"]
     assert df.columns == _SHARES_COLS
 
@@ -1545,3 +1561,101 @@ def test_adj_factors_requests_daily_bars_for_basis_price() -> None:
     _provider(fake2).get_adj_factors([_SYM], date(2015, 1, 1), date(2026, 9, 30))
     wide = next(c for c in fake2.calls if c[0] == "bars")[3]
     assert wide > count, "宽区间的回看根数必须更大"
+
+
+# ---------------------------------------------------------------------------
+# 财务 shares: 批大小上限 + 重试 + 二分拆分(实测服务内 40% 批会失败)
+# ---------------------------------------------------------------------------
+
+
+class _FlakyFinClient(_FinClient):
+    """按"毒批"集合模拟上游: 命中毒批就抛 ``invalid ASCII response code``。
+
+    实测现象: eltdx 的 finance_batch 对单次请求的**代码组合**敏感 —— 即使批=20 也有
+    ~40% 的批失败, 且**可复现**(同批代码重复跑结果一致)。这里的 fake 复刻该行为,
+    用于验证 provider 的重试 + 二分拆分能把它兜住。
+    """
+
+    def __init__(self, poison_prefixes=(), records=()):
+        super().__init__(records)
+        self._poison = {tuple(p) for p in poison_prefixes}
+        self.attempts: list[tuple] = []
+
+    def finance_batch(self, codes):
+        self.calls.append(("finance_batch", tuple(codes)))
+        self.attempts.append(tuple(codes))
+        # 命中毒组合(要求该组合被完整包含) -> 抛上游那个真实错误
+        if any(t and t[0] == codes[0] and set(t) <= set(codes) for t in self._poison):
+            raise RuntimeError("invalid ASCII response code")
+        # 正常返回: 按 eltdx 代码前缀还原 (code, exchange)
+        out = []
+        for c in codes:
+            ex, num = c[:2], c[2:]
+            out.append(_fin(num, ex))
+        return _FinPage(out)
+
+
+def test_finance_batch_size_is_conservative() -> None:
+    """回归防护: 财务批大小必须 <=20。
+
+    实测(真实面板代码序): n=20 成功、n=25 起全部报 ``invalid ASCII response code``;
+    eltdx 官方默认 batch_size=75 在实际代码序下不可用 —— 会成批失败,
+    只落 ~1210/5578 只(覆盖率 21.7%)。降到 20 后配合重试/拆分可达 94.7%。
+    """
+    from app.plugins.eltdx.provider import _FINANCE_BATCH
+
+    assert _FINANCE_BATCH <= 20, "财务批大小超过 20 会成批失败"
+
+
+def test_finance_retry_recovers_transient_failure() -> None:
+    """首次失败 -> 重试成功: 该批数据必须被取回(不能因一次抖动丢弃)。"""
+
+    class _OnceFail(_FinClient):
+        def __init__(self, records=()):
+            super().__init__(records)
+            self._n = 0
+
+        def finance_batch(self, codes):
+            self._n += 1
+            if self._n == 1:
+                raise RuntimeError("invalid ASCII response code")
+            return super().finance_batch(codes)
+
+    fake = _OnceFail(records=[_fin("600519", "sh")])
+    df = _provider(fake).get_financials("shares", ["600519.SH"])
+
+    assert df.height == 1, "重试后应拿到数据"
+    assert df["symbol"].to_list() == ["600519.SH"]
+
+
+def test_finance_split_recovers_poison_batch() -> None:
+    """毒批(固定失败) -> **二分拆分**后必须能取到非毒部分的数据。
+
+    这是实测里最关键的兜底: 有 104 批是靠拆分救回来的。
+    """
+    # 组合(sh600519,sh600000)是"毒", 但拆开后各自可用
+    poison = [("sh600519", "sh600000")]
+    fake = _FlakyFinClient(poison_prefixes=poison)
+    df = _provider(fake).get_financials("shares", ["600519.SH", "600000.SH"])
+
+    assert set(df["symbol"].to_list()) == {"600519.SH", "600000.SH"}, "毒批拆分后应取回全部可用标的"
+    # 必须真的发生过拆分: 存在单只请求
+    assert [a for a in fake.attempts if len(a) == 1], "应当退化为单只请求(拆分兜底)"
+
+
+def test_finance_split_recursion_terminates_on_single_poison_symbol() -> None:
+    """单只也失败(真毒) -> 不递归死循环, 只丢该只, 其余照常返回。"""
+
+    class _SinglePoison(_FinClient):
+        def finance_batch(self, codes):
+            self.calls.append(("finance_batch", tuple(codes)))
+            if list(codes) == ["sz000001"]:
+                raise RuntimeError("invalid ASCII response code")
+            return _FinPage([_fin("600519", "sh")])
+
+    fake = _SinglePoison()
+    df = _provider(fake).get_financials("shares", ["600519.SH", "000001.SZ"])
+
+    assert "600519.SH" in df["symbol"].to_list()
+    # 单只也失败 -> 该只被丢弃, 且**不得**无限递归(调用次数有限)
+    assert len(fake.calls) < 50, "单只毒代码不得导致无限拆分"

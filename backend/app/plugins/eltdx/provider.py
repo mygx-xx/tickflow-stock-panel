@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
@@ -67,8 +68,14 @@ _SHARES_COLUMNS = ["symbol", "period_end", "announce_date", "total_shares", "flo
 # 除权因子: 并发与基准价回看窗口(需覆盖事件日前一交易日, 120 自然日足够)
 _ADJ_WORKERS = int(os.environ.get("ELTDX_ADJ_WORKERS", "8"))
 _ADJ_LOOKBACK_BARS = int(os.environ.get("ELTDX_ADJ_LOOKBACK_BARS", "120"))
-# finance_batch 单次请求标的数(eltdx 默认 batch_size=75, 这里对齐官方默认值)
-_FINANCE_BATCH = int(os.environ.get("ELTDX_FINANCE_BATCH", "75"))
+# finance_batch 单次请求标的数。**实测安全上限约 20 只**(关键: 必须按真实标的序测) ——
+# 用面板代码序时 n=20 成功、n=25 起全部 `invalid ASCII response code`;
+# eltdx 官方 batch_size=75 在实际代码序下**不可用**(会成批失败, 只落 ~1200/5578 只)。
+# 故这里保守取 20; 单批失败仍按批隔离, 不拖垮整表。
+_FINANCE_BATCH = int(os.environ.get("ELTDX_FINANCE_BATCH", "20"))
+# 失败批的本地重试次数与间隔; 重试仍失败则二分拆分(见 _finance_records)
+_FINANCE_RETRIES = int(os.environ.get("ELTDX_FINANCE_RETRIES", "2"))
+_FINANCE_RETRY_SLEEP_S = float(os.environ.get("ELTDX_FINANCE_RETRY_SLEEP", "0.05"))
 
 # 分钟并发(独立于日K, 避免瞬时占满连接池)与单标的根数上限
 _MINUTE_WORKERS = int(os.environ.get("ELTDX_MINUTE_WORKERS", "8"))
@@ -898,23 +905,65 @@ class EltDxProvider:
             return pl.DataFrame()
         rows: list[dict] = []
         batch = max(1, _FINANCE_BATCH)
+        stats = {"ok": 0, "retry_ok": 0, "split_ok": 0, "fail": 0}
         for i in range(0, len(codes), batch):
             chunk = codes[i : i + batch]
-            try:
-                resp = self._client.finance_batch([to_eltdx_code(c) for c in chunk])
-            except Exception as e:  # 单批失败不拖垮整表(与面板"无数据返回空"语义一致)
-                logger.warning("eltdx finance_batch 失败(批 %d): %s", i // batch, e)
-                continue
-            for rec in list(getattr(resp, "records", ()) or ()):
+            records = self._finance_records(chunk, stats)
+            for rec in records:
                 row = _shares_row(rec)
                 if row is not None:
                     rows.append(row)
+        if stats["retry_ok"] or stats["split_ok"] or stats["fail"]:
+            logger.info(
+                "eltdx shares 取数: 首次成功 %d 批, 重试成功 %d 批, 拆分成功 %d 批, 最终失败 %d 批",
+                stats["ok"],
+                stats["retry_ok"],
+                stats["split_ok"],
+                stats["fail"],
+            )
         if not rows:
             logger.warning("eltdx get_financials(shares): 未取到有效行(请求 %d 只)", len(codes))
             return pl.DataFrame()
         df = pl.DataFrame(rows, infer_schema_length=None)
         keep = [c for c in _SHARES_COLUMNS if c in df.columns]
         return df.select(keep).unique(subset=["symbol", "period_end"], keep="last")
+
+    def _finance_records(self, chunk: list[str], stats: dict[str, int]) -> list[Any]:
+        """取一批财务记录, 失败时**重试**并最终**拆半递归**。
+
+        实测(eltaX 3.2.2): ``corporate.finance_batch`` 对单次请求的代码组合敏感 ——
+        即使批大小只有 20, 仍有约 40% 的批报 ``invalid ASCII response code``;
+        且失败**可复现**(同一批代码重复跑结果一致), 无简单规律。
+        因此策略为: 原批 → 重试 N 次 → 仍失败则**二分拆分**继续取, 直至单只。
+
+        ``stats`` 只用于汇总日志(首次/重试/拆分/最终失败)。
+        """
+        if not chunk:
+            return []
+        last_err: Exception | None = None
+        for attempt in range(_FINANCE_RETRIES + 1):
+            try:
+                resp = self._client.finance_batch([to_eltdx_code(c) for c in chunk])
+                recs = list(getattr(resp, "records", ()) or ())
+                if recs or len(chunk) == 0:
+                    stats["ok" if attempt == 0 else "retry_ok"] += 1
+                    return recs
+                # 返回空也算失败(该批无数据), 继续重试
+                last_err = RuntimeError("empty records")
+            except Exception as e:  # 单批失败不拖垮整表, 由重试/拆分兜底
+                last_err = e
+            if attempt < _FINANCE_RETRIES:
+                time.sleep(_FINANCE_RETRY_SLEEP_S)
+        # 重试仍失败 → 二分拆分(把"毒组合"拆开)
+        if len(chunk) > 1:
+            mid = len(chunk) // 2
+            stats["split_ok"] += 1
+            return self._finance_records(chunk[:mid], stats) + self._finance_records(
+                chunk[mid:], stats
+            )
+        stats["fail"] += 1
+        logger.debug("eltdx finance_batch 单只最终失败 %s: %s", chunk[0], last_err)
+        return []
 
     # ---- 设置页「试拉」 -------------------------------------------------
 
