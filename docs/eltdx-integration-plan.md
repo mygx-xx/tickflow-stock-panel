@@ -171,14 +171,26 @@ a4463ed  feat(plugins): eltdx 接入 depth5(五档盘口/封单/盘口深度)   
 
 ## 6. 未完成项与取舍（如实列出）
 
+### 6.1 全市场压测结果（已完成）
+
+| 轮次 | 数据量 | 覆盖 | 耗时 | 说明 |
+|---|---|---|---|---|
+| **修复轮** `get_intraday_batch(count=240)` | **1,337,040 行** | 5571 / 5578 = **99.9%** | **22.5s** + 落盘 0.1s | 每只 **min=max=240 根**；zstd parquet 13.7 MB |
+| **增量轮** `get_intraday_latest(count=3)` | 16,713 行 | 5571 只 | **11.0s** | 每只 3 根 |
+
+**结论：可用于盘中落盘。** 修复轮占 60s 窗口约 38%；增量轮节奏约 12s，优于仅修复轮的 60s。取数耗时是瓶颈，落盘可忽略（0.1s）。
+
+> 建议首次启用时观察一个完整交易日的成功率与主站反馈；如遇限速可下调 `ELTDX_INTRADAY_LATEST_BATCH` 或提高间隔。
+
+### 6.2 其余未完成项
+
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `full_minute` **全市场压测** | ⚠️ **未做** | 理论量级 ~5500 只 x 240 根 ≈ 130 万行（逐标的请求）。**压测前不应假设可用于盘中全市场落盘** |
-| `get_intraday_latest` 全市场路径 | ✅ 已实现 | 走 `bars.get` 批量（1000 只/片、2 并发），实测全市场 5578 只 ~11.7s 返回 16713 根；服务节奏 ~12s（优于仅修复轮的 60s）。**盘中实际表现待一个交易日观察** |
 | `metrics` / `income` / `balance_sheet` / `cash_flow` | ⛔ 不接 | `f10.finance_report` 返回不透明 `T***` 代码，包内无代码→名称字典；面板合并逻辑用 `drop_nulls().last()` **无法用 null 修正错误值** → 口径不明确不接 |
-| 连板梯队 / 封单榜 | ⛔ 无槽位 | eltdx 有三个来源（`helpers.limit_ladder` / `f10.limit_board_ladder` / `f10.limit_up_down_list`），但面板六大数据集无此项，属业务层 |
+| 连板梯队 / 封单榜 | ⛔ 无槽位（按裁定留槽位即可，不做） | eltdx 有三个来源（`helpers.limit_ladder` / `f10.limit_board_ladder` / `f10.limit_up_down_list`），但面板六大数据集无此项，属业务层 |
 | `adj_factor` 精度 | ⚠️ 0.0239% 偏差 | `hfq_offset` 累计浮点/取整精度所致；需与 fuyao 完全一致时请用 fuyao |
 | `trades` / `auctions` / `money_flow` | 未接入 | 面板无对应数据集契约 |
+| 盘中真实表现 | ⏳ 待观察 | 上述耗时均为**收盘后**实测；盘中主站负载更高，建议观察一个交易日 |
 
 **依赖管理注意**：eltdx 由设置页「安装依赖」按钮装入 `backend/.venv`，**不在 `uv.lock`**。若执行 `uv sync --frozen`，需重新点击「安装依赖」（这是面板插件机制的既定约定，与 fuyao/stocksdk 一致）。
 
