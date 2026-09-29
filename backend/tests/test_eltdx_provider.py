@@ -8,8 +8,9 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import ANY
 
 import polars as pl
 import pytest
@@ -113,8 +114,11 @@ def _snap(
 class _FakeClient:
     """假 EltDxClient: 记录调用并按预设返回, 不连主站。"""
 
-    def __init__(self, *, bars=None, shares=None, snapshots=None, fail_bars=False):
+    def __init__(
+        self, *, bars=None, shares=None, snapshots=None, fail_bars=False, minute_bars=None
+    ):
         self._bars = bars or {}
+        self._minute_bars = minute_bars or {}
         self._shares = shares or []
         self._snapshots = snapshots or []
         self._fail_bars = fail_bars
@@ -131,7 +135,10 @@ class _FakeClient:
         self.calls.append(("bars", symbol, period, count))
         if self._fail_bars:
             raise RuntimeError("boom")
-        return list(self._bars.get(symbol, []))
+        # 分钟: 用 minute_bars 提供(与日K分开, 便于断言 period 路由)
+        if period == "1m" and self._minute_bars:
+            return list(self._minute_bars.get(symbol, []))[:count]
+        return list(self._bars.get(symbol, []))[:count]
 
     def iter_bars_batches(self, symbols, *, period="day", count, batch_size):
         """与真实实现同形的有界分批(yield [(symbol, bars)])。"""
@@ -345,17 +352,17 @@ def test_get_realtime_maps_all_shares() -> None:
 
 
 def test_declared_datasets_only() -> None:
-    """只声明 daily/realtime; 其余数据集 provider_has_dataset 语义为 False(回退 TickFlow)。"""
+    """只声明已实现的数据集; 未声明的 provider_has_dataset 语义为 False(回退 TickFlow)。"""
     p = EltDxProvider()
     ds = p.config.datasets
-    assert set(ds) == {"daily", "realtime"}
-    for not_supported in ("adj_factor", "minute", "full_minute", "depth5", "financial"):
-        assert not_supported not in ds
+    assert set(ds) == {"daily", "realtime", "minute", "full_minute"}
+    for not_supported in ("adj_factor", "depth5", "financial"):
+        assert not_supported not in ds, f"{not_supported} 尚未接入, 不应声明"
 
 
 def test_test_dataset_reports_error_for_undeclared() -> None:
     """试拉未声明数据集 → 返回 error 说明会回退, 不抛异常。"""
-    out = EltDxProvider().test_dataset("minute")
+    out = EltDxProvider().test_dataset("adj_factor")
     assert out["rows"] == 0
     assert "回退" in out["error"]
 
@@ -403,7 +410,7 @@ def test_manifest_parses_and_entry_loads() -> None:
     assert manifest is not None, "plugin.yaml 未被识别"
     assert manifest["name"] == "eltdx"
     assert manifest["runtime"] == "python"
-    assert set(manifest["datasets"]) == {"daily", "realtime"}
+    assert set(manifest["datasets"]) == {"daily", "realtime", "minute", "full_minute"}
     assert manifest["install_hint"]
     # entry/check 可解析到真实对象
     from app.data_providers.custom.loader import _load_entry
@@ -449,3 +456,127 @@ def test_daily_returns_empty_frame_when_no_rows() -> None:
     df = p.get_daily(["000001.SZ"], datetime(2026, 9, 1), datetime(2026, 9, 2))
     assert isinstance(df, pl.DataFrame)
     assert df.height == 0
+
+
+# ---------------------------------------------------------------------------
+# 分钟 K: 契约 [symbol, datetime(北京墙钟 naive), o/h/l/c, volume(手), amount(元)]
+# ---------------------------------------------------------------------------
+
+_CN = timezone(timedelta(hours=8))
+
+
+def _mbar(
+    hh: int, mm: int, *, sec: int = 0, c: float = 10.2, vol: float = 100.0, amt: float = 102000.0
+):
+    """1m KlineBar 替身: time 为 Asia/Shanghai aware(与 eltdx 实测一致)。"""
+    return _bar(
+        datetime(2026, 9, 29, hh, mm, sec, tzinfo=_CN),
+        o=c,
+        h=c + 0.01,
+        low=c - 0.01,
+        c=c,
+        volume_lots=vol,
+        amount=amt,
+    )
+
+
+def test_minute_field_mapping_and_naive_beijing_wallclock() -> None:
+    """契约红线: datetime 必须是北京时间墙钟 **naive**(非 UTC、无 tzinfo)。"""
+    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31), _mbar(9, 32)]})
+    df = _provider(fake).get_minute(["000001.SZ"], date(2026, 9, 29), date(2026, 9, 29))
+
+    assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+    assert df.height == 2
+    assert df.schema["datetime"].time_zone is None, "必须是 naive(无时区)"
+    first = df["datetime"][0]
+    assert (first.hour, first.minute) == (9, 31), "必须是北京墙钟(若误转 UTC 会变 01:31)"
+
+
+def test_minute_uses_1m_period_route() -> None:
+    """分钟必须走 period='1m'(不是 day, 也不是分时接口)。"""
+    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31)]})
+    _provider(fake).get_minute(["000001.SZ"], date(2026, 9, 29), date(2026, 9, 29))
+    assert ("bars", "000001.SZ", "1m", ANY) in [
+        (c[0], c[1], c[2], ANY) for c in fake.calls if c[0] == "bars"
+    ]
+
+
+def test_minute_filters_out_of_range_bars() -> None:
+    """区间外分钟必须过滤(源可能返回超过请求区间的深度)。"""
+    fake = _FakeClient(
+        minute_bars={
+            "000001.SZ": [
+                _bar(datetime(2026, 9, 25, 10, 0, tzinfo=_CN)),  # 区间外(前一交易日)
+                _mbar(9, 31),
+            ]
+        }
+    )
+    df = _provider(fake).get_minute(["000001.SZ"], date(2026, 9, 29), date(2026, 9, 29))
+    assert df.height == 1
+    assert df["datetime"][0].day == 29
+
+
+def test_minute_single_symbol_failure_isolated() -> None:
+    """单标的异常隔离: 一只失败不影响其他标的(分钟走并发, 需逐个兜底)。"""
+
+    class _Flaky(_FakeClient):
+        def bars(self, symbol, *, period="day", count):
+            if symbol == "600000.SH":
+                raise RuntimeError("station error")
+            return super().bars(symbol, period=period, count=count)
+
+    fake = _Flaky(minute_bars={"000001.SZ": [_mbar(9, 31)]})
+    df = _provider(fake).get_minute(
+        ["000001.SZ", "600000.SH"], date(2026, 9, 29), date(2026, 9, 29)
+    )
+    assert df["symbol"].unique().to_list() == ["000001.SZ"]
+
+
+def test_minute_empty_returns_typed_empty_frame() -> None:
+    """无数据返回空帧但**列齐全**(下游按列消费, 不能缺列)。"""
+    p = _provider(_FakeClient(minute_bars={}))
+    df = p.get_minute(["000001.SZ"], date(2026, 9, 29), date(2026, 9, 29))
+    assert df.height == 0
+    assert df.columns == ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+
+
+# ---------------------------------------------------------------------------
+# 全量分钟(full_minute): 修复轮 + 稳态增量轮
+# ---------------------------------------------------------------------------
+
+
+def test_intraday_batch_keeps_latest_count_per_symbol() -> None:
+    """修复轮: 每只标的只保留最新 count 根(当日窗口语义)。"""
+    bars = [_mbar(9, 30 + i) for i in range(1, 11)]  # 10 根
+    fake = _FakeClient(minute_bars={"000001.SZ": bars, "600000.SH": bars})
+    df = _provider(fake).get_intraday_batch(["000001.SZ", "600000.SH"], count=3)
+
+    assert df.height == 6  # 2 标的 x 3 根
+    for sym in ("000001.SZ", "600000.SH"):
+        sub = df.filter(pl.col("symbol") == sym).sort("datetime")
+        assert sub.height == 3
+        assert sub["datetime"][-1].minute == 40  # 保留的是最新 3 根
+
+
+def test_intraday_latest_full_market_returns_empty_for_graceful_degrade() -> None:
+    """全市场(symbols=None)无更优批量端点时返回空帧 → 服务按契约降级为仅修复轮。"""
+    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31)]})
+    df = _provider(fake).get_intraday_latest(None, count=3)
+    assert df.height == 0
+    assert not [c for c in fake.calls if c[0] == "bars"], "不应触发全市场逐标的拉取"
+
+
+def test_intraday_latest_works_on_bounded_pool() -> None:
+    """传入受限标的池(监控池)时正常返回每只最新 N 根。"""
+    bars = [_mbar(9, 30 + i) for i in range(1, 6)]
+    fake = _FakeClient(minute_bars={"000001.SZ": bars})
+    df = _provider(fake).get_intraday_latest(["000001.SZ"], count=2)
+    assert df.height == 2
+    assert df["datetime"][-1].minute == 35
+
+
+def test_full_minute_declared_in_datasets() -> None:
+    """full_minute 与 minute 都必须出现在 config.datasets(否则路由回退)。"""
+    ds = EltDxProvider().config.datasets
+    assert "minute" in ds
+    assert "full_minute" in ds

@@ -324,18 +324,30 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - ⚠️ eltdx 为 **Research-Only License**(仅限研究, 禁用商业用途); 数据取自通达信公开行情主站, 启用即视为自行承担合规责任
   - 提供 `daily`(**不复权原始价**, `bars.get(adjust=None)`; eltdx 是逐标的接口, 故用连接池
     `server_count x connections_per_server` + 线程池并发, 实现有界分批的 `iter_daily`)、
-    `realtime`(全市场快照 `quotes.get_snapshots`, 另实现 `get_realtime_indices` 供指数行情)
-  - **未接入** `adj_factor` / `minute` / `full_minute` / `depth5` / `financial`(各自需独立口径验证,
-    未声明即自动回退 TickFlow)
-  - `client.py` — 连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 + 软失败
+    `realtime`(全市场快照 `quotes.get_snapshots`, 另实现 `get_realtime_indices` 供指数行情)、
+    `minute`(1 分钟 K: **`bars.get(period='1m')` 是真 OHLC**, 供分时图/分钟回测)、
+    `full_minute`(`get_intraday_batch` 修复轮走当日窗口批量; `get_intraday_latest` 全市场
+    无更优批量端点时返回空帧 → 服务按契约降级为仅修复轮 60s)
+  - **未接入** `adj_factor` / `depth5` / `financial`(未声明即自动回退 TickFlow; `adj_factor`
+    的口径障碍见下)
+  - `client.py` — 连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
+    **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败
   - `provider.py` — 字段映射与单位换算(见下「eltdx 口径要点」)+ 试拉 + 可用性自检
-  - `tests/test_eltdx_provider.py` — 39 个契约测试(假 client 注入, 不连主站)
+  - `tests/test_eltdx_provider.py` — 48 个契约测试(假 client 注入, 不连主站)
   - **eltdx 口径要点**(eltdx 3.2.2 实测基线, 改动前务必复测):
     - `change_pct` 是**百分数制**(`0.442478` = 0.4425%), 面板契约要小数制 → provider 内 **/100**
     - `total_hand` / `volume_lots` 单位是**手**(自验 `amount/(last x hand) ≈ 100`), 面板同为手 → 直用
-    - `amount` 单位元; 日 K `time` 是 Asia/Shanghai aware datetime → 取 `.date()`
+    - `amount` 单位元; K 线 `time` 是 Asia/Shanghai **aware** datetime → 日 K 取 `.date()`,
+      分钟须 `astimezone(+08:00).replace(tzinfo=None)` 转**北京墙钟 naive**(契约红线)
     - 快照 `time_raw` 是当日 `HHMMSScc` 紧凑整数(8 位, 末 2 位百分秒; 实测 `15330366` = 15:33:03.66)
-  - 实测校准: 与本地经 fuyao 写入的日 K 主档逐字段比对, OHLC / 量额完全一致(2026-09 实测)
+    - **分钟要用 `bars.get(period='1m')` 而非 `minutes.history`**: 后者是**分时点**
+      (仅 `price`+`volume`, 无 OHLC 且 `amount` 恒 0), 不满足分钟 K 契约
+    - **`adj_factor` 口径障碍**: eltdx 用 `(scale, offset)` 二元组表达除权(scale 管送转、
+      offset 管现金分红), 面板 `ex_factor` 是**单事件比值**。实测 `002818.SZ` 在 2026-09-29
+      是真实除权日, 但 `hfq_scale` 前后均为 1.70(变化只在 offset), 故**不能只取 scale 比值**,
+      需专门推导等效 ratio 并对账后才可接入
+  - 实测校准: 与本地经 fuyao 写入的日 K 主档逐字段比对, OHLC / 量额完全一致;
+    1m 分钟累计量与日 K 对账误差 **0.0000%**(2026-09 实测)
 
 ## 路由机制(无需关心, 仅参考)
 

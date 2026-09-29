@@ -44,8 +44,10 @@ _SUFFIX_TO_PREFIX = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
 DEFAULT_SERVER_COUNT = 4
 DEFAULT_CONNECTIONS_PER_SERVER = 4
 DEFAULT_TIMEOUT_S = 8.0
-# 单次 bars.get 最大请求根数(eltdx 默认 800/页, all_pages 自动翻页; 这里显式设上界)
+# 单次 bars.get 最大请求根数(实测 count>800 报 "page size must be between 1 and 800",
+# 故深层历史由本客户端自管分页, 不依赖 SDK 的 all_pages)
 MAX_BARS_PER_REQUEST = 800
+_MAX_PAGE_SIZE = MAX_BARS_PER_REQUEST
 
 
 def to_panel_symbol(code: str) -> str | None:
@@ -170,24 +172,43 @@ class EltDxClient:
     # ---- K 线 -----------------------------------------------------------
 
     def bars(self, symbol: str, *, period: str = "day", count: int) -> list[Any]:
-        """单标的 K 线列表(KlineBar); 失败返回 []。``adjust=None`` 即不复权原始价。"""
+        """单标的 K 线列表(KlineBar); 失败返回 []。``adjust=None`` 即不复权原始价。
+
+        eltdx 单页上限 800 根(实测 ``count>800`` 报 "page size must be between 1 and 800"),
+        故深层历史按 ``start`` 逐页取; 空页即终止(契约要求空页终止条件)。
+        ``all_pages`` 在本版本会因 max_pages 抛异常, 故这里自管分页而非交给 SDK。
+        """
         code = to_eltdx_code(symbol)
         if code is None:
             logger.warning("eltdx bars: 无法识别的 symbol %r", symbol)
             return []
-        try:
-            series = self._ensure().bars.get(
-                code,
-                period=period,
-                count=int(count),
-                adjust=None,  # 面板契约: 日K 必须不复权原始价, 复权交给 adj_factor+enriched
-                all_pages=True,
-                max_pages=200,
-            )
-        except Exception as e:
-            logger.warning("eltdx bars 失败 %s: %s", symbol, e)
+        want = max(0, int(count))
+        if want == 0:
             return []
-        return list(getattr(series, "bars", ()) or ())
+        out: list[Any] = []
+        page = _MAX_PAGE_SIZE
+        for start in range(0, want, page):
+            take = min(page, want - start)
+            try:
+                series = self._ensure().bars.get(
+                    code,
+                    period=period,
+                    count=take,
+                    start=start,
+                    adjust=None,  # 面板契约: K 线必须不复权原始价, 复权交给 adj_factor+enriched
+                )
+            except Exception as e:
+                logger.warning(
+                    "eltdx bars 失败 %s(period=%s start=%d): %s", symbol, period, start, e
+                )
+                break
+            bars = list(getattr(series, "bars", ()) or ())
+            if not bars:
+                break  # 空页终止
+            out.extend(bars)
+            if len(bars) < take:
+                break  # 不足一页 = 已到最早
+        return out
 
     def iter_bars_batches(
         self,

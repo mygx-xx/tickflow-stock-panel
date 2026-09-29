@@ -6,17 +6,20 @@
 #    数据来自通达信公开行情主站, 启用即视为使用者知悉并自行承担合规责任。
 #
 # 覆盖范围(datasets 只声明真实提供的数据集, 未声明的自动回退 TickFlow):
-#   daily    — 不复权原始日 K(bars.get adjust=None), 逐标的按连接池并发取数
-#   realtime — 全市场快照(quotes.get_snapshots), 含指数(见 provider.get_realtime_indices)
-# 未接入: adj_factor(口径需独立验证)、minute/full_minute(需北京墙钟与深度声明)、
-#         depth5(面板暂无数据集契约)、financial(F10 字段需逐表映射)
+#   daily       — 不复权原始日 K(bars.get adjust=None), 逐标的按连接池并发取数
+#   realtime    — 全市场快照(quotes.get_snapshots), 含指数(见 provider.get_realtime_indices)
+#   minute      — 1 分钟 K(bars.get period='1m', **真 OHLC** 非分时点); 供分时图/分钟回测
+#   full_minute — 全量分钟修复轮(get_intraday_batch: 当日窗口批量)
+#                 get_intraday_latest 无更优路径时返回空 → 服务按契约降级为仅修复轮(60s)
+# 未接入: adj_factor(eltdx 为 scale+offset 二元组, 与面板单事件比值口径不同, 需推导验证)、
+#         depth5(quotes.get_depth 有 5 档, 待接入)、financial(F10 字段需逐表映射)
 
 name: eltdx
 display_name: "eltdx (通达信)"
 runtime: python
 entry: app.plugins.eltdx.provider:EltDxProvider
 check: app.plugins.eltdx.provider:availability
-datasets: [daily, realtime]
-description: "通达信在线行情协议直连(eltdx, Research-Only)。日K(不复权原始价, 逐标的经连接池并发)与全市场实时快照(含指数)。零 API Key、无需第三方财经网站。未接入复权因子/分钟线/财务, 自动回退 TickFlow。"
+datasets: [daily, realtime, minute, full_minute]
+description: "通达信在线行情协议直连(eltdx, Research-Only)。日K(不复权原始价, 连接池并发)、全市场实时快照(含指数)、1分钟K(真 OHLC: 分时图与分钟回测)、全量分钟修复轮(盘中当日窗口批量)。零 API Key。未接入复权因子/五档盘口/财务, 自动回退 TickFlow。"
 install_hint: "点击卡片「安装依赖」按钮(执行 pip install eltdx), 或在 backend 目录手动: uv pip install --python .venv/Scripts/python.exe -r app/plugins/eltdx/requirements.txt"
 homepage: "https://github.com/electkismet/eltdx"

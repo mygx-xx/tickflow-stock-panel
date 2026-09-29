@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 from typing import Any
 
 import polars as pl
@@ -44,10 +46,19 @@ from app.plugins.eltdx.client import (
 
 logger = logging.getLogger(__name__)
 
-_DATASETS = ("daily", "realtime")
+# 北京墙钟时区(UTC+8)。用固定偏移而非 zoneinfo: 中国无夏令时, 且避免 tzdata 依赖
+_CN_TZ = timezone(timedelta(hours=8))
+
+_DATASETS = ("daily", "realtime", "minute", "full_minute")
 
 # 日 K 列(面板 canonical 9 列, 含 quote_ts; 由 normalizer.DAILY_COLS 单源定义)
 _DAILY_COLUMNS = DAILY_COLS
+# 分钟 canonical 8 列(契约: docs/plugin-development.md get_minute)
+_MINUTE_COLUMNS = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+
+# 分钟并发(独立于日K, 避免瞬时占满连接池)与单标的根数上限
+_MINUTE_WORKERS = int(os.environ.get("ELTDX_MINUTE_WORKERS", "8"))
+_MINUTE_MAX_BARS = int(os.environ.get("ELTDX_MINUTE_MAX_BARS", "12000"))  # ~50 交易日
 
 # 实时快照: eltdx 单次请求的代码数上限(保守值; 官方未给硬上限, 分片既限并发也限单包大小)
 _SNAPSHOT_BATCH = 800
@@ -98,6 +109,41 @@ def _bar_date(value: Any) -> date | None:
             except ValueError:
                 continue
     return None
+
+
+def _bar_datetime(bar: Any) -> datetime | None:
+    """KlineBar.time → datetime(保留 tzinfo 供比较; 输出时再转 naive 北京墙钟)。
+
+    eltdx 的 ``time`` 是 Asia/Shanghai 的 aware datetime(实测 ``+08:00``),
+    与契约要求的"北京墙钟 naive"只差一次 ``replace(tzinfo=None)``。
+    """
+    value = getattr(bar, "time", None)
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value[:19], fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def _as_datetime(value: datetime | date, *, end_of_day: bool) -> datetime:
+    """date/datetime → 区间端点 datetime(end_of_day 时补齐到当日 23:59:59)。
+
+    eltdx 的 KlineBar.time 是 **aware**(Asia/Shanghai, 实测 +08:00), 而契约要求输出
+    naive 北京墙钟。若端点用 naive 去和 aware 比较会抛 TypeError, 故端点统一定位到
+    UTC+8 的 aware; 输出行时再 ``replace(tzinfo=None)`` 交给下游。
+    """
+    dt = (
+        value
+        if isinstance(value, datetime)
+        else datetime.combine(value, dtime(23, 59, 59) if end_of_day else dtime(0, 0, 0))
+    )
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=_CN_TZ)
 
 
 def _kline_row(symbol: str, bar: Any) -> dict | None:
@@ -204,6 +250,10 @@ class EltDxProvider:
 
     name = "eltdx"
     builtin = True
+    # 1m 历史深度: 实测 start 逐页可取到 17 个交易日以上(4000 根无缺口),
+    # 面板深源默认 20 日, 故不声明 minute_history_days(视为深历史)。
+    # 分钟数据源: bars.get(period='1m') 是**真 OHLC**(与日K 同一个 KlineBar 模型);
+    # minutes.history 是分时点(仅 price+volume, 无 OHLC, amount 恒 0), 不用于本契约。
 
     def __init__(self) -> None:
         self.config = _EltDxConfig()
@@ -311,6 +361,152 @@ class EltDxProvider:
                 on_chunk_done(done, total)
             yield self._daily_frame(rows)
 
+    # ---- 分钟 K ---------------------------------------------------------
+
+    def _minute_rows(
+        self, symbol: str, bars: list[Any], start_dt: datetime, end_dt: datetime
+    ) -> list[dict]:
+        """KlineBar(1m) → 面板分钟行; 区间外丢弃, 关键字段缺失丢弃(不伪造)。"""
+        rows: list[dict] = []
+        for bar in bars:
+            ts = _bar_datetime(bar)
+            if ts is None or not (start_dt <= ts <= end_dt):
+                continue
+            o = _to_float(getattr(bar, "open", None))
+            h = _to_float(getattr(bar, "high", None))
+            low = _to_float(getattr(bar, "low", None))
+            c = _to_float(getattr(bar, "close", None))
+            if o is None or h is None or low is None or c is None:
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    # 契约: 北京时间墙钟 naive; 先转 UTC+8 再抹 tzinfo(源本就是 +08:00,
+                    # 这样即使上游换了时区表示也仍是正确的北京墙钟)
+                    "datetime": ts.astimezone(_CN_TZ).replace(tzinfo=None),
+                    "open": o,
+                    "high": h,
+                    "low": low,
+                    "close": c,
+                    "volume": _to_float(getattr(bar, "volume_lots", None)),  # 手(实测与日K同源)
+                    "amount": _to_float(getattr(bar, "amount", None)),  # 元
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _minute_frame(rows: list[dict]) -> pl.DataFrame:
+        """分钟行 → 面板契约帧 [symbol, datetime, open, high, low, close, volume, amount]。"""
+        if not rows:
+            return pl.DataFrame(
+                schema={
+                    "symbol": pl.String,
+                    "datetime": pl.Datetime,
+                    "open": pl.Float64,
+                    "high": pl.Float64,
+                    "low": pl.Float64,
+                    "close": pl.Float64,
+                    "volume": pl.Float64,
+                    "amount": pl.Float64,
+                }
+            )
+        return pl.DataFrame(rows).select(_MINUTE_COLUMNS)
+
+    def _minutes_for(
+        self, symbols: list[str], start_time: datetime | date, end_time: datetime | date
+    ) -> list[dict]:
+        """按区间拉 1m 并归一化为面板分钟行(逐标的并发, 单标的软失败)。"""
+        start_dt = _as_datetime(start_time, end_of_day=False)
+        end_dt = _as_datetime(end_time, end_of_day=True)
+        span_days = max(1, (end_dt.date() - start_dt.date()).days)
+        # 1m 每日 240 根; 自然日 -> 交易日约 0.75, 留余量后向上取整
+        count = min(int(span_days * 0.8) + 10, _MINUTE_MAX_BARS) * 240 // 240
+        count = max(count, 240)
+        rows: list[dict] = []
+
+        def _one(sym: str) -> list[dict]:
+            bars = self._client.bars(sym, period="1m", count=count)
+            return self._minute_rows(sym, bars, start_dt, end_dt)
+
+        workers = min(_MINUTE_WORKERS, max(1, len(symbols)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_one, s): s for s in symbols}
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    rows.extend(fut.result())
+                except Exception as e:  # 单标的软失败: 不影响其他标的
+                    logger.warning("eltdx 分钟取数失败 %s: %s", sym, e)
+        return rows
+
+    def get_minute(
+        self,
+        symbols: list[str],
+        start_time: datetime | date,
+        end_time: datetime | date,
+        asset_type: str = "stock",
+        on_chunk_done=None,
+        freq: str = "1m",
+    ) -> pl.DataFrame:
+        """分钟 K(1m): ``[symbol, datetime(北京墙钟 naive), open, high, low, close, volume, amount]``。
+
+        ``freq`` 仅支持 1m(面板当前只消费 1m); 其他周期由本地 1m 聚合(与日K 派生链同思路)。
+        eltdx 的 1m 来自 ``bars.get``, 是真 OHLC(非分时点), volume 为手、amount 为元。
+        """
+        if freq not in ("1m", "1min", "1"):
+            logger.warning("eltdx 分钟仅提供 1m, 请求 freq=%s 原样按 1m 返回", freq)
+        rows = self._minutes_for(symbols, start_time, end_time)
+        if on_chunk_done is not None:
+            on_chunk_done(len(symbols), len(symbols))
+        return self._minute_frame(rows)
+
+    # ---- 全量分钟(full_minute): 修复轮 + 稳态增量轮 ----------------------
+
+    def get_intraday_batch(
+        self, symbols: list[str], count: int = 300, asset_type: str = "stock"
+    ) -> pl.DataFrame:
+        """全量分钟**修复轮**: 给定标的当日每只最近 ``count`` 根 1m(同日窗口)。
+
+        服务在冷启动/覆盖断档/连续空轮时调用; 返回 canonical 8 列(同 get_minute)。
+        内部自行分块并发, 不走调用方分批。
+        """
+        today = date.today()
+        rows = self._minutes_for(symbols, today, today)
+        if count and count > 0:
+            # 只保留每只标的最新 count 根(修复轮语义: 当日窗口)
+            by_sym: dict[str, list[dict]] = {}
+            for r in rows:
+                by_sym.setdefault(r["symbol"], []).append(r)
+            kept: list[dict] = []
+            for vals in by_sym.values():
+                vals.sort(key=lambda x: x["datetime"])
+                kept.extend(vals[-count:])
+            rows = kept
+        return self._minute_frame(rows)
+
+    def get_intraday_latest(self, symbols: list[str] | None = None, count: int = 3) -> pl.DataFrame:
+        """全量分钟**稳态增量轮**: 尽量单请求返回每只标的最新 ``count`` 根。
+
+        实现取舍: eltdx 无"全市场最新 N 根"批量端点(bars.get 需逐标的), 故本方法
+        对全市场逐标的拉取无法满足 6s 稳态节奏。**不实现更优路径时返回空帧**, 服务会
+        按契约自动降级为「仅修复轮」(节奏下限 60s) —— 这是文档明确允许的降级。
+        若传入受限标的池(如监控池), 则正常返回该池的最新 N 根。
+        """
+        if not symbols:
+            # 全市场: 明确返回空 → 服务降级为仅修复轮(避免拖垮轮询)
+            logger.info("eltdx get_intraday_latest: 无标的池, 返回空(服务降级为仅修复轮)")
+            return self._minute_frame([])
+        today = date.today()
+        rows = self._minutes_for(symbols, today, today)
+        by_sym: dict[str, list[dict]] = {}
+        for r in rows:
+            by_sym.setdefault(r["symbol"], []).append(r)
+        kept: list[dict] = []
+        for vals in by_sym.values():
+            vals.sort(key=lambda x: x["datetime"])
+            kept.extend(vals[-max(1, count) :])
+        return self._minute_frame(kept)
+
     # ---- 实时快照 -------------------------------------------------------
 
     def get_realtime(self) -> list[dict]:
@@ -366,6 +562,14 @@ class EltDxProvider:
             if dataset == "daily":
                 syms = [s for s in (symbols or [])][:3] or ["000001.SZ"]
                 df = self.get_daily(syms, datetime.now() - timedelta(days=30), datetime.now())
+                return self._preview(dataset, df)
+            if dataset == "minute":
+                syms = [s for s in (symbols or [])][:2] or ["000001.SZ"]
+                df = self.get_minute(syms, date.today(), date.today())
+                return self._preview(dataset, df)
+            if dataset == "full_minute":
+                syms = [s for s in (symbols or [])][:2] or ["000001.SZ"]
+                df = self.get_intraday_batch(syms, count=10)
                 return self._preview(dataset, df)
             syms = [s for s in (symbols or [])][:5]
             rows = self.get_realtime_indices(syms) or [] if syms else self.get_realtime()
