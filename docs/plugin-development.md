@@ -326,8 +326,8 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
     `server_count x connections_per_server` + 线程池并发, 实现有界分批的 `iter_daily`)、
     `realtime`(全市场快照 `quotes.get_snapshots`, 另实现 `get_realtime_indices` 供指数行情)、
     `minute`(1 分钟 K: **`bars.get(period='1m')` 是真 OHLC**, 供分时图/分钟回测)、
-    `full_minute`(`get_intraday_batch` 修复轮走当日窗口批量; `get_intraday_latest` 全市场
-    无更优批量端点时返回空帧 → 服务按契约降级为仅修复轮 60s)、
+    `full_minute`(`get_intraday_batch` 修复轮走当日窗口批量; `get_intraday_latest` 增量轮走
+    `bars.get` 批量 —— 实测 1000 只/片、全市场 5578 只约 11.7s, 节奏 ~12s)、
     `depth5`(`quotes.get_depth` 各 5 档; volume 单位为手, 封死涨跌停时量为 **0 需原样保留**,
     失败按契约**抛异常**由服务按批隔离, 不跨源回退)、
     `financial`(**只实现 `shares` 表**: `corporate.finance_batch` 的总/流通股本, eltdx 单位为
@@ -369,6 +369,8 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
       (首位 6/9→SH, 其余→SZ) 会把北交所(4xxxxx/8xxxxx/920xxx)错标成 `.SZ`
   - 实测校准: 与本地经 fuyao 写入的日 K 主档逐字段比对, OHLC / 量额完全一致;
     1m 分钟累计量与日 K 对账误差 **0.0000%**(2026-09 实测)
+  - 详见: [eltdx 能力核查结论](./eltdx-capability-audit.md)(逐项实测与判定)、
+    [eltdx 接入方案与实施记录](./eltdx-integration-plan.md)(口径公式、覆盖矩阵、未完成项)
 
 ## 路由机制(无需关心, 仅参考)
 
