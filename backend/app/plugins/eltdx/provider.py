@@ -74,8 +74,15 @@ _FINANCE_BATCH = int(os.environ.get("ELTDX_FINANCE_BATCH", "75"))
 _MINUTE_WORKERS = int(os.environ.get("ELTDX_MINUTE_WORKERS", "8"))
 _MINUTE_MAX_BARS = int(os.environ.get("ELTDX_MINUTE_MAX_BARS", "12000"))  # ~50 交易日
 
-# 实时快照: eltdx 单次请求的代码数上限(保守值; 官方未给硬上限, 分片既限并发也限单包大小)
-_SNAPSHOT_BATCH = 800
+# 全量分钟「稳态增量轮」批量参数。实测 bars.get 批量上限很高(2000 只/请求 3.9s 足额),
+# 全市场 5578 只按 1000 分片共 6 批, 一遍约 11.7s(每只 3 根)。
+_INTRADAY_LATEST_BATCH = int(os.environ.get("ELTDX_INTRADAY_LATEST_BATCH", "1000"))
+_INTRADAY_LATEST_WORKERS = int(os.environ.get("ELTDX_INTRADAY_LATEST_WORKERS", "2"))
+
+# 实时快照单次请求的代码数上限。**eltaX 硬上限为 80**(实测: 请求 81/100/400/700 均
+# 静默截断为 80 只; 请求 800/1600/3000 直接断连 os error 10054)。超限会导致
+# "每片都失败 -> 全市场 0 行", 故这里必须是 80, 不可按"包大小"放宽。
+_SNAPSHOT_BATCH = int(os.environ.get("ELTDX_SNAPSHOT_BATCH", "80"))
 # 快照分片并发上限(独立于日 K 的连接池, 避免瞬时把池占满影响其他数据集)
 _SNAPSHOT_WORKERS = int(os.environ.get("ELTDX_SNAPSHOT_WORKERS", "4"))
 
@@ -729,27 +736,49 @@ class EltDxProvider:
         return self._minute_frame(rows)
 
     def get_intraday_latest(self, symbols: list[str] | None = None, count: int = 3) -> pl.DataFrame:
-        """全量分钟**稳态增量轮**: 尽量单请求返回每只标的最新 ``count`` 根。
+        """全量分钟**稳态增量轮**: 返回标的当日每只最新 ``count`` 根 1m。
 
-        实现取舍: eltdx 无"全市场最新 N 根"批量端点(bars.get 需逐标的), 故本方法
-        对全市场逐标的拉取无法满足 6s 稳态节奏。**不实现更优路径时返回空帧**, 服务会
-        按契约自动降级为「仅修复轮」(节奏下限 60s) —— 这是文档明确允许的降级。
-        若传入受限标的池(如监控池), 则正常返回该池的最新 N 根。
+        实现依据(实测): eltdx 的 ``bars.get`` **支持批量 codes** 且上限很高 ——
+        实测 2000 只/请求 3.90s 且足额返回; 全市场 5578 只按 1000 分片共 6 批,
+        一遍约 **11.7s** 拿到 16713 根(每只 3 根)。故本方法可真正实现增量轮,
+        服务节奏将变为 ``max(3s, 单轮耗时) ≈ 12s`` —— 比仅修复轮(60s)快约 5 倍。
+
+        注意与快照的差别: ``quotes.get_snapshots`` 有 **80 只硬上限**(超出静默截断/
+        断连), 而 ``bars.get`` 批量无此限制, 故这里用 bars 而非快照。
+
+        ``symbols=None`` 表示全市场(服务当前总是这样调用: ``method(count=count)``)。
         """
-        if not symbols:
-            # 全市场: 明确返回空 → 服务降级为仅修复轮(避免拖垮轮询)
-            logger.info("eltdx get_intraday_latest: 无标的池, 返回空(服务降级为仅修复轮)")
+        syms = symbols if symbols else self._client.all_a_shares()
+        if not syms:
+            logger.warning("eltdx get_intraday_latest: 取不到代码表")
             return self._minute_frame([])
         today = date.today()
-        rows = self._minutes_for(symbols, today, today)
-        by_sym: dict[str, list[dict]] = {}
-        for r in rows:
-            by_sym.setdefault(r["symbol"], []).append(r)
-        kept: list[dict] = []
-        for vals in by_sym.values():
-            vals.sort(key=lambda x: x["datetime"])
-            kept.extend(vals[-max(1, count) :])
-        return self._minute_frame(kept)
+        start_dt = _as_datetime(today, end_of_day=False)
+        end_dt = _as_datetime(today, end_of_day=True)
+        want = max(1, int(count))
+        rows: list[dict] = []
+        # 每片取 want 根本身已是最新 N 根; 逐片并发
+        chunks = [
+            syms[i : i + _INTRADAY_LATEST_BATCH]
+            for i in range(0, len(syms), _INTRADAY_LATEST_BATCH)
+        ]
+
+        def _one(chunk: list[str]) -> list[dict]:
+            got = self._client.bars_multi(chunk, period="1m", count=want)
+            out: list[dict] = []
+            for sym, bars in got:
+                out.extend(self._minute_rows(sym, bars, start_dt, end_dt))
+            return out
+
+        workers = min(_INTRADAY_LATEST_WORKERS, max(1, len(chunks)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_one, ch) for ch in chunks]
+            for fut in as_completed(futures):
+                try:
+                    rows.extend(fut.result())
+                except Exception as e:  # 单片失败隔离: 其他片仍返回
+                    logger.warning("eltdx get_intraday_latest 分片失败(已隔离): %s", e)
+        return self._minute_frame(rows)
 
     # ---- 实时快照 -------------------------------------------------------
 

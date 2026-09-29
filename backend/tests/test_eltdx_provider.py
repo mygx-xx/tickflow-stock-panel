@@ -149,6 +149,17 @@ class _FakeClient:
             out.sort(key=lambda item: item[0])
             yield out
 
+    def bars_multi(self, symbols, *, period="day", count):
+        """批量取 K 线(真实实现一次请求多个 code); 这里按 minute_bars 返回。"""
+        self.calls.append(("bars_multi", tuple(symbols), period, count))
+        out = []
+        for s in symbols:
+            bars = self._minute_bars.get(s) if period == "1m" else self._bars.get(s)
+            bars = list(bars or [])[-max(1, count) :]
+            if bars:
+                out.append((s, bars))
+        return out
+
     def snapshots(self, symbols, *, batch_size):
         self.calls.append(("snapshots", len(symbols)))
         return list(self._snapshots)
@@ -478,6 +489,19 @@ def test_client_symbols_batch_splits() -> None:
     assert c.snapshots([], batch_size=10) == []
 
 
+def test_snapshot_batch_size_respects_eltdx_hard_limit() -> None:
+    """回归防护: 快照分片必须 <=80。
+
+    实测 eltdx 的 quotes.get_snapshots 硬上限为 **80 只/请求** —— 请求 81/100/400/700
+    均被**静默截断为 80**; 请求 800/1600/3000 直接断连(os error 10054)。
+    早期实现按"包大小"取 800, 导致每一片都超限 -> 全市场快照返回 0 行(覆盖率 0%),
+    而 realtime 数据集若被路由到本插件, 面板将拿不到任何实时行情。
+    """
+    from app.plugins.eltdx.provider import _SNAPSHOT_BATCH
+
+    assert _SNAPSHOT_BATCH <= 80, "超过 80 会被上游截断/断连, 全市场将返回空"
+
+
 def test_panel_daily_columns_single_source() -> None:
     """插件列定义复用 normalizer.DAILY_COLS(单源, 避免双份漂移)。"""
     from app.data_providers.normalizer import DAILY_COLS
@@ -595,12 +619,20 @@ def test_intraday_batch_keeps_latest_count_per_symbol() -> None:
         assert sub["datetime"][-1].minute == 40  # 保留的是最新 3 根
 
 
-def test_intraday_latest_full_market_returns_empty_for_graceful_degrade() -> None:
-    """全市场(symbols=None)无更优批量端点时返回空帧 → 服务按契约降级为仅修复轮。"""
-    fake = _FakeClient(minute_bars={"000001.SZ": [_mbar(9, 31)]})
+def test_intraday_latest_full_market_uses_batch_endpoint() -> None:
+    """全市场(symbols=None)走 `bars_multi` **批量**端点, 而非逐标的拉取。
+
+    实测依据: eltdx 的 bars.get 支持批量 codes 且上限很高(2000 只/请求 3.9s 足额),
+    全市场一遍约 11s, 可支撑稳态增量轮; 快照类接口的 80 只硬上限不适用于此路径。
+    """
+    fake = _FakeClient(
+        shares=["000001.SZ", "600000.SH"],
+        minute_bars={"000001.SZ": [_mbar(9, 31), _mbar(9, 32)]},
+    )
     df = _provider(fake).get_intraday_latest(None, count=3)
-    assert df.height == 0
-    assert not [c for c in fake.calls if c[0] == "bars"], "不应触发全市场逐标的拉取"
+
+    assert df.height > 0, "全市场应真正取数(批量端点可用), 不再降级为空帧"
+    assert [c for c in fake.calls if c[0] == "bars_multi"], "必须走 bars_multi 批量路径"
 
 
 def test_intraday_latest_works_on_bounded_pool() -> None:
