@@ -50,12 +50,20 @@ logger = logging.getLogger(__name__)
 # 北京墙钟时区(UTC+8)。用固定偏移而非 zoneinfo: 中国无夏令时, 且避免 tzdata 依赖
 _CN_TZ = timezone(timedelta(hours=8))
 
-_DATASETS = ("daily", "realtime", "minute", "full_minute", "depth5")
+_DATASETS = ("daily", "realtime", "minute", "full_minute", "depth5", "financial")
 
 # 日 K 列(面板 canonical 9 列, 含 quote_ts; 由 normalizer.DAILY_COLS 单源定义)
 _DAILY_COLUMNS = DAILY_COLS
 # 分钟 canonical 8 列(契约: docs/plugin-development.md get_minute)
 _MINUTE_COLUMNS = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+
+# 财务: 只实现 shares 表(见 get_financials docstring 的口径依据)。
+# eltdx 的财务有两个来源, 只有前者字段名明确:
+#   corporate.finance_batch -> FinanceRecord(总股本/流通股本/净资产/净利润/公告日, 字段名明确)
+#   f10.finance_report(zcfzb/lrb/xjllb) -> 不透明 T*** 代码, **包内无代码→名称字典**, 故不接。
+_SHARES_COLUMNS = ["symbol", "period_end", "announce_date", "total_shares", "float_shares"]
+# finance_batch 单次请求标的数(eltdx 默认 batch_size=75, 这里对齐官方默认值)
+_FINANCE_BATCH = int(os.environ.get("ELTDX_FINANCE_BATCH", "75"))
 
 # 分钟并发(独立于日K, 避免瞬时占满连接池)与单标的根数上限
 _MINUTE_WORKERS = int(os.environ.get("ELTDX_MINUTE_WORKERS", "8"))
@@ -222,6 +230,52 @@ def _hhmmss_ts(raw: Any) -> int | None:
     except ValueError:
         return None
     return int(dt.timestamp() * 1000)
+
+
+def _shares_row(rec: Any) -> dict | None:
+    """``corporate.finance_batch`` 的 FinanceRecord → 面板 shares 行。
+
+    单位: eltdx 的股本为**万股**(实测茅台 125008.15625 万股 = 12.5 亿股),
+    面板契约要**股**(``float_shares > 0`` 才参与 join_asof), 故 x10000。
+    缺失/非正值的流通股本返回 None(下游会丢弃 0 值, 这里提前剔除更干净)。
+
+    symbol 解析**必须优先用显式 ``exchange``**: 裸 6 位代码走 ``to_panel_symbol`` 的
+    交易所推断(首位 6/9→SH, 其余→SZ)会把北交所(4xxxxx/8xxxxx/920xxx)误判成 .SZ
+    (实测 ``exchange='bj', code='430047'`` 会得到错误的 ``430047.SZ``)。
+    """
+    code = getattr(rec, "code", None)
+    exchange = getattr(rec, "exchange", None)
+    symbol = None
+    if code and exchange:
+        symbol = to_panel_symbol(f"{exchange}{code}")  # 显式交易所优先, 唯一可靠的路径
+    if symbol is None:
+        symbol = to_panel_symbol(getattr(rec, "full_code", None) or code)
+    if symbol is None:
+        return None
+
+    def _shares(value: Any) -> float | None:
+        v = _to_float(value)
+        if v is None or v <= 0:
+            return None
+        return v * 10_000.0  # 万股 → 股
+
+    total = _shares(getattr(rec, "zong_gu_ben_raw_float", None))
+    float_sh = _shares(getattr(rec, "liu_tong_gu_ben_raw_float", None))
+    if float_sh is None:
+        return None  # 面板按 float_shares 驱动换手率, 无此值则该行无意义
+    period = getattr(rec, "updated_date", None)
+    period_str = (
+        period.isoformat() if isinstance(period, date) else (str(period) if period else None)
+    )
+    if not period_str:
+        return None  # 无报告期/公告期会让面板合并逻辑丢弃该帧
+    return {
+        "symbol": symbol,
+        "period_end": period_str,
+        "announce_date": period_str,
+        "total_shares": total if total is not None else float_sh,
+        "float_shares": float_sh,
+    }
 
 
 def _snapshot_row(snap: Any) -> dict | None:
@@ -641,6 +695,62 @@ class EltDxProvider:
                 out[symbol] = row
         return out
 
+    # ---- 财务(shares 表) -------------------------------------------------
+
+    def get_financials(
+        self, table: str, symbols: list[str], latest_only: bool = False
+    ) -> pl.DataFrame:
+        """财务数据。**只实现 ``shares`` 表**; 其余表返回空帧(由面板多源合并保留 TickFlow 值)。
+
+        ## 为什么只接 shares
+        面板要 5 张表(metrics/income/balance_sheet/cash_flow/shares):
+
+        * ``shares`` ← ``corporate.finance_batch`` 的 ``zong_gu_ben`` / ``liu_tong_gu_ben``,
+          字段名**明确**且面板有真实下游(``share_capital.apply_historical_float_shares``
+          驱动历史换手率 ``turnover_rate = volume x 10000 / float_shares``)。
+        * ``metrics`` / 三大报表 ← ``f10.finance_report`` 返回的是**不透明代码**
+          (``T007`` / ``T039`` / ``N000``…), eltdx 包内**不含代码→名称字典**。会计恒等式
+          虽自洽(T039-T077≈总负债), 但 40+ 字段只能靠算术反推, 错位会静默产出错误财务因子,
+          且合并逻辑用 ``drop_nulls().last()`` **无法用 null 修正**。按"口径不明确不接"原则跳过。
+
+        ## 单位(实测 eltdx 3.2.2)
+        ``FinanceRecord`` 的 ``*_raw_float`` 以**万股 / 万元**计(茅台总股本 125008.15625
+        万股 = 12.5 亿股; 净资产 251253600 万元 = 2.51 万亿元)。面板契约要**股**(且
+        ``float_shares > 0`` 才有效), 故这里 x10000。
+
+        ``period_end``: ``FinanceRecord`` 只给 ``updated_date``(实测 2026-08-15, 是**公告日**),
+        无报告期字段 —— 但面板的 PIT 逻辑正是 ``available_date = announce_date or period_end``,
+        故以 ``updated_date`` 作 ``period_end`` 与 ``announce_date`` 同值, 语义等价且不引入
+        未来函数(该期数据在公告日才可用)。
+        """
+        if table != "shares":
+            logger.info(
+                "eltdx get_financials: 表 %s 未接入(仅 shares), 返回空帧交由多源合并保留原值", table
+            )
+            return pl.DataFrame()
+        codes = [s for s in symbols if to_eltdx_code(s)]
+        if not codes:
+            return pl.DataFrame()
+        rows: list[dict] = []
+        batch = max(1, _FINANCE_BATCH)
+        for i in range(0, len(codes), batch):
+            chunk = codes[i : i + batch]
+            try:
+                resp = self._client.finance_batch([to_eltdx_code(c) for c in chunk])
+            except Exception as e:  # 单批失败不拖垮整表(与面板"无数据返回空"语义一致)
+                logger.warning("eltdx finance_batch 失败(批 %d): %s", i // batch, e)
+                continue
+            for rec in list(getattr(resp, "records", ()) or ()):
+                row = _shares_row(rec)
+                if row is not None:
+                    rows.append(row)
+        if not rows:
+            logger.warning("eltdx get_financials(shares): 未取到有效行(请求 %d 只)", len(codes))
+            return pl.DataFrame()
+        df = pl.DataFrame(rows, infer_schema_length=None)
+        keep = [c for c in _SHARES_COLUMNS if c in df.columns]
+        return df.select(keep).unique(subset=["symbol", "period_end"], keep="last")
+
     # ---- 设置页「试拉」 -------------------------------------------------
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
@@ -680,6 +790,12 @@ class EltDxProvider:
                 ]
                 df = pl.DataFrame(rows) if rows else pl.DataFrame()
                 return self._preview(dataset, df)
+            if dataset == "financial":
+                syms = [s for s in (symbols or [])][:3] or ["600519.SH"]
+                df = self.get_financials("shares", syms)
+                out = self._preview(dataset, df)
+                out["note"] = "eltdx 财务只实现 shares 表; metrics/三大报表回退 TickFlow"
+                return out
             syms = [s for s in (symbols or [])][:5]
             rows = self.get_realtime_indices(syms) or [] if syms else self.get_realtime()
             df = pl.DataFrame(rows[:20]) if rows else pl.DataFrame()

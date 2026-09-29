@@ -157,6 +157,11 @@ class _FakeClient:
         self.calls.append(("depth", tuple(symbols)))
         return None  # 默认无盘口(需要盘口的用例自行覆写)
 
+    def finance_batch(self, codes):
+        """默认无财务数据(返回 None); 财务用例通过子类覆写本方法。"""
+        self.calls.append(("finance_batch", tuple(codes)))
+        return None
+
     def close(self):
         self.calls.append(("close",))
 
@@ -359,8 +364,8 @@ def test_declared_datasets_only() -> None:
     """只声明已实现的数据集; 未声明的 provider_has_dataset 语义为 False(回退 TickFlow)。"""
     p = EltDxProvider()
     ds = p.config.datasets
-    assert set(ds) == {"daily", "realtime", "minute", "full_minute", "depth5"}
-    for not_supported in ("adj_factor", "financial"):
+    assert set(ds) == {"daily", "realtime", "minute", "full_minute", "depth5", "financial"}
+    for not_supported in ("adj_factor",):
         assert not_supported not in ds, f"{not_supported} 尚未接入, 不应声明"
 
 
@@ -414,7 +419,14 @@ def test_manifest_parses_and_entry_loads() -> None:
     assert manifest is not None, "plugin.yaml 未被识别"
     assert manifest["name"] == "eltdx"
     assert manifest["runtime"] == "python"
-    assert set(manifest["datasets"]) == {"daily", "realtime", "minute", "full_minute", "depth5"}
+    assert set(manifest["datasets"]) == {
+        "daily",
+        "realtime",
+        "minute",
+        "full_minute",
+        "depth5",
+        "financial",
+    }
     assert manifest["install_hint"]
     # entry/check 可解析到真实对象
     from app.data_providers.custom.loader import _load_entry
@@ -720,3 +732,241 @@ def test_hhmmss_ts_parses_both_widths(raw, expect_hm) -> None:
 def test_depth5_declared_in_datasets() -> None:
     """depth5 必须已声明(否则服务层 provider_has_dataset 判 False 而回退)。"""
     assert "depth5" in EltDxProvider().config.datasets
+
+
+# ---------------------------------------------------------------------------
+# 财务(shares 表): 单位换算 / 非正值剔除 / 未接入表返回空帧
+# ---------------------------------------------------------------------------
+
+# 面板 shares 契约列序(与 provider._SHARES_COLUMNS 一致)
+_SHARES_COLS = ["symbol", "period_end", "announce_date", "total_shares", "float_shares"]
+
+
+def _fin(
+    code: str,
+    exchange: str,
+    *,
+    total: float | None = 125008.15625,
+    float_: float | None = 125008.15625,
+    updated=date(2026, 8, 15),
+) -> SimpleNamespace:
+    """FinanceRecord 替身: 股本字段为 eltdx 的**万股**原始值。"""
+    return SimpleNamespace(
+        code=code,
+        exchange=exchange,
+        zong_gu_ben_raw_float=total,
+        liu_tong_gu_ben_raw_float=float_,
+        updated_date=updated,
+    )
+
+
+class _FinPage:
+    """corporate.finance_batch 响应替身(只用到 records)。"""
+
+    def __init__(self, records):
+        self.records = tuple(records)
+
+
+class _FinClient(_FakeClient):
+    """财务假 client: finance_batch 返回给定记录。"""
+
+    def __init__(self, records=()):
+        super().__init__()
+        self._records = list(records)
+
+    def finance_batch(self, codes):
+        self.calls.append(("finance_batch", tuple(codes)))
+        return _FinPage(self._records)
+
+
+def _fin_full_code(full_code: str) -> SimpleNamespace:
+    """FinanceRecord 替身: 只带 ``full_code``(无 code/exchange)的记录。"""
+    return SimpleNamespace(
+        full_code=full_code,
+        zong_gu_ben_raw_float=125008.15625,
+        liu_tong_gu_ben_raw_float=125008.15625,
+        updated_date=date(2026, 8, 15),
+    )
+
+
+def test_financials_shares_column_contract_and_order() -> None:
+    """shares 表列必须**恰好**是契约 5 列且顺序一致(实现走 .select(keep))。"""
+    p = _provider(_FinClient([_fin("600519", "sh")]))
+    df = p.get_financials("shares", ["600519.SH"])
+
+    assert isinstance(df, pl.DataFrame)
+    assert df.columns == _SHARES_COLS, "列序即契约, 下游按下标/列名双消费"
+
+
+def test_financials_shares_converts_wan_to_ge() -> None:
+    """契约红线: eltdx 股本单位为**万股**, 面板要**股** → 必须 x10000。"""
+    p = _provider(_FinClient([_fin("600519", "sh", total=125008.15625, float_=125008.15625)]))
+    df = p.get_financials("shares", ["600519.SH"])
+
+    row = df.row(0, named=True)
+    # 茅台: 125008.15625 万股 = 1,250,081,562.5 股
+    assert row["total_shares"] == pytest.approx(1250081562.5)
+    assert row["float_shares"] == pytest.approx(1250081562.5)
+
+
+def test_financials_shares_drops_non_positive_float_shares() -> None:
+    """float_shares <= 0 或缺失 → 整行丢弃(面板 apply_historical_float_shares 会丢)。"""
+    recs = [
+        _fin("000001", "sz", total=1940591.0, float_=0.0),  # 0 → 丢
+        _fin("600000", "sh", total=2935208.0, float_=-1.0),  # 负 → 丢
+        _fin("000002", "sz", total=1000.0, float_=None),  # 缺失 → 丢
+        _fin("600519", "sh"),  # 唯一有效
+    ]
+    df = _provider(_FinClient(recs)).get_financials("shares", ["000001.SZ", "600519.SH"])
+
+    assert df["symbol"].to_list() == ["600519.SH"], "非正/缺失流通股本的行必须整行消失"
+
+
+def test_financials_shares_total_falls_back_to_float() -> None:
+    """总股本缺失或非正 → 回退用流通股本(不留 null, 下游免二次兜底)。"""
+    recs = [
+        _fin("000001", "sz", total=None, float_=1940591.0),  # 缺失
+        _fin("600000", "sh", total=0.0, float_=2935208.0),  # 非正值
+    ]
+    df = _provider(_FinClient(recs)).get_financials("shares", ["000001.SZ", "600000.SH"])
+
+    assert df.height == 2
+    for row in df.to_dicts():
+        assert row["total_shares"] is not None
+        assert row["total_shares"] == pytest.approx(row["float_shares"])
+
+
+def test_financials_shares_period_and_announce_from_updated_date() -> None:
+    """period_end / announce_date 同取 updated_date, 序列化为 ISO ``YYYY-MM-DD`` 字符串。"""
+    p = _provider(_FinClient([_fin("600519", "sh", updated=date(2026, 8, 15))]))
+    row = p.get_financials("shares", ["600519.SH"]).row(0, named=True)
+
+    assert row["period_end"] == "2026-08-15"
+    assert row["announce_date"] == "2026-08-15"
+    assert isinstance(row["period_end"], str), "必须是 ISO 字符串(不是 date 对象)"
+
+
+def test_financials_shares_drops_row_without_updated_date() -> None:
+    """无可用 updated_date → 丢弃(无 period_end 会被面板合并逻辑判为无效帧)。"""
+    recs = [
+        _fin("000001", "sz", updated=None),
+        _fin("600000", "sh", updated=""),  # 空串同样不可用
+        _fin("600519", "sh", updated=date(2026, 8, 15)),
+    ]
+    df = _provider(_FinClient(recs)).get_financials("shares", ["000001.SZ", "600519.SH"])
+
+    assert df["symbol"].to_list() == ["600519.SH"]
+
+
+@pytest.mark.parametrize(
+    ("code", "exchange", "expected"),
+    [
+        ("600519", "sh", "600519.SH"),
+        ("000001", "sz", "000001.SZ"),
+        ("300750", "sz", "300750.SZ"),
+        ("688981", "sh", "688981.SH"),
+    ],
+)
+def test_financials_shares_symbol_normalization(code, exchange, expected) -> None:
+    """记录只带 code(6 位) + exchange('sh'/'sz'/'bj') → 归一为 ``600519.SH`` 形态。"""
+    p = _provider(_FinClient([_fin(code, exchange)]))
+    df = p.get_financials("shares", [expected])
+
+    assert df["symbol"].to_list() == [expected]
+
+
+def test_financials_shares_normalizes_from_full_code() -> None:
+    """记录带 ``full_code``(``bj430047`` 形态)时同样归一为面板格式。"""
+    p = _provider(_FinClient([_fin_full_code("bj430047")]))
+    df = p.get_financials("shares", ["430047.BJ"])
+
+    assert df["symbol"].to_list() == ["430047.BJ"]
+
+
+@pytest.mark.parametrize(
+    ("code", "exchange", "want"),
+    [
+        ("430047", "bj", "430047.BJ"),
+        ("830799", "bj", "830799.BJ"),
+        ("920012", "bj", "920012.BJ"),
+        ("600519", "sh", "600519.SH"),
+        ("000001", "sz", "000001.SZ"),
+    ],
+)
+def test_financials_shares_symbol_honours_explicit_exchange(code, exchange, want) -> None:
+    """契约: 显式 ``exchange`` 必须优先于裸代码的交易所推断。
+
+    回归防护(曾实测到的缺陷): 早期实现先用裸 ``code`` 调 ``to_panel_symbol``, 该函数
+    按首位数字猜交易所(6/9 → SH, 其余 → SZ), 于是北交所(4xxxxx/8xxxxx/920xxx)被错标
+    成 ``.SZ``, 而 ``exchange='bj'`` 分支成了不可达代码。沪/深因启发式恰好一致而掩盖
+    了该缺陷, 故这里三市一并钉死。
+    """
+    p = _provider(_FinClient([_fin(code, exchange)]))
+    df = p.get_financials("shares", [want])
+
+    assert df["symbol"].to_list() == [want]
+
+
+@pytest.mark.parametrize("table", ["metrics", "income", "balance_sheet", "cash_flow"])
+def test_financials_unimplemented_tables_return_empty_frame(table) -> None:
+    """契约红线: 未接入的表返回**空帧**(空 = 无意见), 让多源合并保留 TickFlow 值。"""
+    fake = _FinClient([_fin("600519", "sh")])
+    df = _provider(fake).get_financials(table, ["600519.SH"])
+
+    assert isinstance(df, pl.DataFrame)
+    assert df.is_empty()
+    assert not [c for c in fake.calls if c[0] == "finance_batch"], "未接入的表不应发起请求"
+
+
+def test_financials_shares_empty_symbols_no_request() -> None:
+    """空标的列表 → 直接返回空帧, 不调用 client(避免无谓网络往返)。"""
+    fake = _FinClient([_fin("600519", "sh")])
+    df = _provider(fake).get_financials("shares", [])
+
+    assert df.is_empty()
+    assert not [c for c in fake.calls if c[0] == "finance_batch"]
+
+
+def test_financials_shares_batch_exception_keeps_partial_result() -> None:
+    """单批失败不拖垮整表: 返回已取到的行, 绝不向上抛异常。"""
+    batch_size = 75  # provider._FINANCE_BATCH 默认值
+    seen: list[list[str]] = []
+
+    class _Flaky(_FakeClient):
+        def finance_batch(self, codes):
+            seen.append(list(codes))
+            if len(seen) == 1:
+                return _FinPage([_fin("000001", "sz")])  # 首批成功
+            raise RuntimeError("station down")  # 次批炸
+
+    # 76 只标的 → 2 批(75 + 1)
+    symbols = [f"{i:06d}.SZ" for i in range(1, batch_size + 2)]
+    df = _provider(_Flaky()).get_financials("shares", symbols)
+
+    assert len(seen) == 2, "应切成 2 批请求"
+    assert df.height == 1, "首批结果必须保留"
+    assert df["symbol"].to_list() == ["000001.SZ"]
+    assert df.columns == _SHARES_COLS
+
+
+def test_financials_shares_all_batches_fail_returns_empty_not_raise() -> None:
+    """全部批次失败 → 返回空帧(软失败), 不抛异常。"""
+
+    class _Dead(_FakeClient):
+        def finance_batch(self, codes):
+            raise RuntimeError("station down")
+
+    df = _provider(_Dead()).get_financials("shares", ["600519.SH"])
+    assert isinstance(df, pl.DataFrame)
+    assert df.is_empty()
+
+
+def test_financials_shares_none_response_returns_empty() -> None:
+    """client 返回 None(无 records 属性) → 空帧, 不 AttributeError。"""
+    df = _provider(_FakeClient()).get_financials("shares", ["600519.SH"])
+    assert df.is_empty()
+
+
+def test_financial_declared_in_datasets() -> None:
+    """financial 必须在 config.datasets 中(否则 provider_has_dataset 判 False 而回退)。"""
+    assert "financial" in EltDxProvider().config.datasets

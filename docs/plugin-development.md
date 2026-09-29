@@ -329,13 +329,16 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
     `full_minute`(`get_intraday_batch` 修复轮走当日窗口批量; `get_intraday_latest` 全市场
     无更优批量端点时返回空帧 → 服务按契约降级为仅修复轮 60s)、
     `depth5`(`quotes.get_depth` 各 5 档; volume 单位为手, 封死涨跌停时量为 **0 需原样保留**,
-    失败按契约**抛异常**由服务按批隔离, 不跨源回退)
-  - **未接入** `adj_factor` / `financial`(未声明即自动回退 TickFlow; `adj_factor`
-    的口径障碍见下)
+    失败按契约**抛异常**由服务按批隔离, 不跨源回退)、
+    `financial`(**只实现 `shares` 表**: `corporate.finance_batch` 的总/流通股本, eltdx 单位为
+    **万股**故 provider 内 x10000; `period_end`/`announce_date` 取 `updated_date`。
+    下游驱动 `share_capital` 的历史换手率 `volume x 10000 / float_shares`)
+  - **未接入** `adj_factor`(口径障碍见下), 与 `metrics` / `income` / `balance_sheet` /
+    `cash_flow` 四张财务表(f10 报表字段见下, 未声明即回退或由多源合并保留 TickFlow 值)
   - `client.py` — 连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
     **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败
   - `provider.py` — 字段映射与单位换算(见下「eltdx 口径要点」)+ 试拉 + 可用性自检
-  - `tests/test_eltdx_provider.py` — 61 个契约测试(假 client 注入, 不连主站)
+  - `tests/test_eltdx_provider.py` — 86 个契约测试(假 client 注入, 不连主站)
   - **eltdx 口径要点**(eltdx 3.2.2 实测基线, 改动前务必复测):
     - `change_pct` 是**百分数制**(`0.442478` = 0.4425%), 面板契约要小数制 → provider 内 **/100**
     - `total_hand` / `volume_lots` 单位是**手**(自验 `amount/(last x hand) ≈ 100`), 面板同为手 → 直用
@@ -348,6 +351,14 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
       offset 管现金分红), 面板 `ex_factor` 是**单事件比值**。实测 `002818.SZ` 在 2026-09-29
       是真实除权日, 但 `hfq_scale` 前后均为 1.70(变化只在 offset), 故**不能只取 scale 比值**,
       需专门推导等效 ratio 并对账后才可接入
+    - **财务表不接的原因**: `f10.finance_report(zcfzb/lrb/xjllb)` 返回的是**不透明代码**
+      (`T007`/`T039`/`N000`…), eltdx 包内**不含代码→名称字典**(已全包搜索确认)。
+      会计恒等式虽自洽(`T039-T077 ≈ 总负债`), 但 40+ 字段只能靠算术反推; 而面板的财务合并
+      用逐列 `drop_nulls().last()`, **无法用 null 修正错误值**, 故按"口径不明确不接"跳过
+    - **股本单位**: `FinanceRecord` 的 `*_raw_float` 为**万股**(实测茅台 125008.15625 万股
+      = 12.5 亿股); 面板要**股**且要求 `float_shares > 0`
+    - **symbol 必须用显式 `exchange`**: 裸 6 位代码走 `to_panel_symbol` 的推断
+      (首位 6/9→SH, 其余→SZ) 会把北交所(4xxxxx/8xxxxx/920xxx)错标成 `.SZ`
   - 实测校准: 与本地经 fuyao 写入的日 K 主档逐字段比对, OHLC / 量额完全一致;
     1m 分钟累计量与日 K 对账误差 **0.0000%**(2026-09 实测)
 

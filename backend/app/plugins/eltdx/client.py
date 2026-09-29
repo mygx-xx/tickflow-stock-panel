@@ -275,6 +275,17 @@ class EltDxClient:
             logger.warning("eltdx snapshots 返回空(symbols=%d)", len(symbols))
         return out
 
+    # ---- 财务(基础财务信息) ---------------------------------------------
+
+    def finance_batch(self, codes: list[str]) -> Any:
+        """批量基础财务信息(``FinanceBatch``, 取 ``.records``)。
+
+        ``codes`` 为 eltdx 代码(如 ``sh600519``)。失败抛异常, 由调用方按批隔离。
+        """
+        if not codes:
+            return None
+        return self._ensure().corporate.finance_batch(list(codes))
+
     # ---- 五档盘口 -------------------------------------------------------
 
     def depth(self, symbols: list[str]) -> Any:
