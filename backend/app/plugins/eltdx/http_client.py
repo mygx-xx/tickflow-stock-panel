@@ -41,8 +41,10 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from typing import Any
 
+from app.market_time import cn_today
 from app.plugins.eltdx.client import (
     _MAX_PAGE_SIZE,
     to_eltdx_code,
@@ -54,6 +56,34 @@ logger = logging.getLogger(__name__)
 DEFAULT_HTTP_URL = "http://127.0.0.1:8000"
 # 网关侧上游超时默认 8s; 但全市场批量(1000 只)本身要 ~2.7s, 大请求要留足余量。
 DEFAULT_HTTP_TIMEOUT_S = 120.0
+
+# 代码表缓存 TTL(秒)。依据(实测): 全市场 5578 只快照并发 8 约 1.4s, 而
+# codes.all_a_shares 每次 2.1~6.5s(中位 4.3s), 占单轮总耗时(5.6~7.9s)七成以上;
+# 代码表当日几乎不变(实测连续多次集合完全一致), 故按 TTL 缓存。
+# 取 5 分钟: 覆盖数十轮刷新, 同时把盘中新上市/退市的可见滞后限制在 5 分钟内。
+# 另按「北京日期」跨日强制失效(见 all_a_shares), 不依赖 TTL。
+_CODE_CACHE_TTL_S = 300.0
+
+
+def _code_entry_symbol(item: Any) -> str | None:
+    """代码表条目 → 面板 symbol; 无法确定交易所时返回 None(**不推断**)。
+
+    条目有两种形态: ``"sz000001"``(带 2 位前缀)或 ``{"code","exchange"}``。
+    两者都拿不到交易所信息时拒绝按首位猜 —— 沪市指数 000001 会被猜成
+    ``000001.SZ``, 北交所 920000 会被猜成 ``920000.SH``, 这些错码会被当作
+    股票写进 kline_daily, 与真实标的撞成重复行。
+    """
+    if isinstance(item, str):
+        raw = item.strip()
+        # 已带交易所标识: 前缀式(sz000001, 8 位) 或后缀式(000001.SZ)
+        if "." in raw or len(raw) == 8:
+            return to_panel_symbol(raw)
+        return None
+    ex = getattr(item, "exchange", None)
+    num = getattr(item, "code", None)
+    if ex and num:
+        return to_panel_symbol(f"{ex}{num}")
+    return None
 
 
 class _Obj:
@@ -188,6 +218,13 @@ class HttpTransport:
         self._max_workers = max(1, int(max_workers))
         self._lock = threading.Lock()
         self._seq = 0
+        # 代码表缓存: 由 quote 线程与 minute-refresh 线程共享(provider 为模块级单例),
+        # 故读写与「单飞」都需加锁。网络请求严格在锁外(见 all_a_shares)。
+        self._code_lock = threading.Lock()
+        self._code_symbols: list[str] | None = None
+        self._code_day: date | None = None
+        self._code_at: float = 0.0
+        self._code_fetching = False
         host, port = self._host_port()
         self._pool = _ConnPool(
             host=host,
@@ -273,8 +310,18 @@ class HttpTransport:
     # ---- 连接管理(与进程内同形, 供 loader/provider 无感复用) ------------
 
     def close(self) -> None:
-        """关闭全部 keep-alive 连接(与 EltDxClient 同接口)。"""
+        """关闭全部 keep-alive 连接并清空代码表缓存(与 EltDxClient 同接口)。
+
+        清缓存是必需的: loader 重建 provider 时会先 close 再丢弃实例, 但同一
+        provider 若被复用于不同配置(如数据源切换), 残留的旧清单会指向已变更的
+        标的集合。
+        """
         self._pool.close_all()
+        with self._code_lock:
+            self._code_symbols = None
+            self._code_day = None
+            self._code_at = 0.0
+            self._code_fetching = False
 
     def reset(self, *, reason: str = "") -> None:
         """丢弃现有 keep-alive 连接, 下次调用重建(网关重启后的自愈)。"""
@@ -289,7 +336,74 @@ class HttpTransport:
     # ---- 代码表 ---------------------------------------------------------
 
     def all_a_shares(self) -> list[str]:
-        """全市场 A 股(面板格式); 失败返回 []。"""
+        """全市场 A 股(面板格式); 失败返回 []。
+
+        带 TTL 缓存(见 ``_CODE_CACHE_TTL_S``): 命中直接返回副本, 未命中回源。
+        失效条件 = 北京日期变化 或 TTL 过期 —— 跨日必须重拉, 不靠 TTL 兜底。
+
+        并发: provider 是模块级单例, quote 线程与 minute-refresh 线程共用本实例。
+        锁只保护缓存读写与「单飞」占位, **网络请求在锁外**(避免持锁做 IO 阻塞
+        另一个线程的实时路径)。
+        """
+        cached = self._cached_code_symbols()
+        if cached is not None:
+            return cached
+        return self._fetch_and_cache_code_symbols()
+
+    def _cached_code_symbols(self) -> list[str] | None:
+        """命中则返回**副本**(防止调用方原地修改污染缓存); 未命中返回 None。"""
+        with self._code_lock:
+            if self._code_symbols is None or self._code_day is None:
+                return None
+            if self._code_day != cn_today():
+                return None  # 跨日: 立即失效, 不等 TTL
+            if (time.monotonic() - self._code_at) >= _CODE_CACHE_TTL_S:
+                return None
+            logger.debug("eltdx-http 代码表缓存命中: %d 只", len(self._code_symbols))
+            return list(self._code_symbols)
+
+    def _fetch_and_cache_code_symbols(self) -> list[str]:
+        """回源拉代码表并写缓存; 单飞语义: 并发时只放行一个请求, 其余等结果。"""
+        with self._code_lock:
+            if self._code_fetching:
+                # 已有线程在拉: 等它写完缓存(不重复回源), 超时则自行回源。
+                wait_for_other = True
+            else:
+                self._code_fetching = True
+                wait_for_other = False
+
+        if wait_for_other:
+            deadline = time.monotonic() + self._timeout
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                cached = self._cached_code_symbols()
+                if cached is not None:
+                    return cached
+                with self._code_lock:
+                    if not self._code_fetching:
+                        break  # 对方已结束但仍未写入(失败) → 由本线程回源
+            return self._fetch_and_cache_code_symbols()
+
+        try:
+            started = time.perf_counter()
+            symbols = self._request_a_shares()
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if symbols:
+                with self._code_lock:
+                    self._code_symbols = list(symbols)
+                    self._code_day = cn_today()
+                    self._code_at = time.monotonic()
+                logger.info(
+                    "eltdx-http 代码表回源: %d 只, 耗时 %.0fms (缓存 %.0fs)",
+                    len(symbols), elapsed_ms, _CODE_CACHE_TTL_S,
+                )
+            return symbols
+        finally:
+            with self._code_lock:
+                self._code_fetching = False
+
+    def _request_a_shares(self) -> list[str]:
+        """真正发起一次代码表请求(软失败返回 [], 失败**不写缓存**以便下轮重试)。"""
         try:
             raw = self._rpc("codes.all_a_shares", {})
         except Exception as e:
@@ -298,14 +412,7 @@ class HttpTransport:
         # 网关可能返回 ["sz000001",...] 或 [{"code":..,"exchange":..},...]
         out: list[str] = []
         for item in raw or []:
-            code = item if isinstance(item, str) else getattr(item, "code", None)
-            sym = to_panel_symbol(code)
-            if sym is None and not isinstance(item, str):
-                # dict 形式: code 不带交易所前缀, 需用 exchange 拼
-                ex = getattr(item, "exchange", None)
-                num = getattr(item, "code", None)
-                if ex and num:
-                    sym = to_panel_symbol(f"{ex}{num}")
+            sym = _code_entry_symbol(item)
             if sym:
                 out.append(sym)
         if not out:
@@ -321,12 +428,7 @@ class HttpTransport:
             return []
         out: list[str] = []
         for item in raw or []:
-            code = item if isinstance(item, str) else getattr(item, "code", None)
-            sym = to_panel_symbol(code)
-            if sym is None and not isinstance(item, str):
-                ex = getattr(item, "exchange", None)
-                if ex and code:
-                    sym = to_panel_symbol(f"{ex}{code}")
+            sym = _code_entry_symbol(item)
             if sym:
                 out.append(sym)
         return out

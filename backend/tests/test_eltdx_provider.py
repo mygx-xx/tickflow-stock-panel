@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY
@@ -311,6 +313,60 @@ def test_realtime_snapshot_row_without_symbol_is_dropped() -> None:
     rows = _provider(fake).get_realtime_indices(["000001.SZ"])
     assert rows is not None
     assert [r["symbol"] for r in rows] == ["000001.SZ"]
+
+
+def test_realtime_snapshot_bare_code_without_exchange_is_dropped() -> None:
+    """交易所缺失时**不得**按首位猜后缀。
+
+    回归防护(实测缺陷): 快照的 ``exchange`` 为空时, ``full_code`` 退化成裸 6 位
+    代码(如 "000001"), 早期实现直接交给 ``to_panel_symbol`` 按首位推断 —— 上证指数
+    ``000001.SH`` 于是被写成 ``000001.SZ``, 与真实的平安银行撞在同一个 symbol 上,
+    在 kline_daily 留下重复行, 令矩阵构建报
+    "MarketDataMatrix requires unique timestamp/symbol rows"。
+    正确行为: 丢弃该行(少一行好过把指数值写成股票价)。
+    """
+    bare = SimpleNamespace(
+        full_code="000001",  # exchange 为空 → full_code 无交易所标识
+        last_price=3840.83,
+        pre_close_price=3820.0,
+        open_price=3839.25,
+        high_price=3847.68,
+        low_price=3833.09,
+        change_pct=0.5,
+        change=20.83,
+        total_hand=100,
+        amount=1.0,
+        time_raw=15330366,
+    )
+    fake = _FakeClient(snapshots=[bare, _snap("sz000001")])
+    rows = _provider(fake).get_realtime_indices(["000001.SZ"])
+
+    assert rows is not None
+    # 裸代码行被丢弃, 只留带交易所信息的真实深市标的
+    assert [r["symbol"] for r in rows] == ["000001.SZ"]
+
+
+def test_realtime_snapshot_honours_explicit_exchange() -> None:
+    """显式 ``exchange`` 优先: 沪市指数在 exchange='sh' 时必须得到 .SH。"""
+    snap = SimpleNamespace(
+        exchange="sh",
+        code="000001",
+        last_price=3840.83,
+        pre_close_price=3820.0,
+        open_price=3839.25,
+        high_price=3847.68,
+        low_price=3833.09,
+        change_pct=0.5,
+        change=20.83,
+        total_hand=100,
+        amount=1.0,
+        time_raw=15330366,
+    )
+    fake = _FakeClient(snapshots=[snap])
+    rows = _provider(fake).get_realtime_indices(["000001.SH"])
+
+    assert rows is not None
+    assert [r["symbol"] for r in rows] == ["000001.SH"]
 
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1243,52 @@ def test_adj_factors_symbol_normalization_roundtrip() -> None:
     assert df["symbol"].to_list() == [_SYM]
 
 
+def test_adj_factors_accepts_gateway_string_dates() -> None:
+    """事件 ``date`` 为 ISO 字符串时(HTTP 网关形态)必须仍能推导, 不得整批失败。
+
+    回归防护(实测缺陷): 网关把 ``AdjustmentFactor.date`` 序列化成 ``'2002-07-25'``
+    字符串, 而实现直接写 ``start_d <= cur.date <= end_d`` 与 date 端点比较, 抛
+    ``TypeError: '<=' not supported between instances of 'datetime.date' and 'str'``。
+    该异常被单标的软失败吞掉, 表现为**全市场 5584 只逐条 warning、sync_adj 报告
+    "no new factors"**, 除权因子静默停更而管道仍报成功 —— 最难发现的一类失败。
+    """
+    events = {
+        _SYM: [
+            _adj_event(_ADJ_PREV_DAY.isoformat(), offset=0.0),
+            _adj_event(_ADJ_EVENT_DAY.isoformat(), offset=0.5),
+        ]
+    }
+    fake = _adj_client(events, bars=_adj_bars(_SYM, prev_close=10.0))
+    df = _provider(fake).get_adj_factors([_SYM], _ADJ_START, _ADJ_END)
+
+    assert df.height == 1, "字符串事件日必须与 date 端点同样被接受"
+    assert df["trade_date"].to_list() == [_ADJ_EVENT_DAY]
+    # 与 date 形态产出**同值**, 证明只是类型收口而非公式变化
+    events_date = {
+        _SYM: [_adj_event(_ADJ_PREV_DAY, offset=0.0), _adj_event(_ADJ_EVENT_DAY, offset=0.5)]
+    }
+    df_date = _provider(_adj_client(events_date, bars=_adj_bars(_SYM, prev_close=10.0))).get_adj_factors(
+        [_SYM], _ADJ_START, _ADJ_END
+    )
+    assert df["ex_factor"].to_list() == df_date["ex_factor"].to_list()
+
+
+def test_adj_factors_string_dates_still_filtered_by_range() -> None:
+    """字符串事件日同样要受区间过滤, 不能因类型收口而全部放行。"""
+    events = {
+        _SYM: [
+            _adj_event(date(2025, 12, 1).isoformat(), offset=0.0),  # 区间外(首个事件)
+            _adj_event(_ADJ_EVENT_DAY.isoformat(), offset=0.2),     # 区间内
+            _adj_event(date(2027, 3, 1).isoformat(), offset=0.4),   # 区间外
+        ]
+    }
+    df = _provider(_adj_client(events, bars=_adj_bars(_SYM))).get_adj_factors(
+        [_SYM], _ADJ_START, _ADJ_END
+    )
+
+    assert df["trade_date"].to_list() == [_ADJ_EVENT_DAY]
+
+
 def test_adj_factors_sorted_by_symbol_and_trade_date() -> None:
     """输出按 (symbol, trade_date) 升序(下游 join_asof 依赖有序)。"""
     later = date(2026, 6, 20)
@@ -1863,6 +1965,155 @@ def test_http_transport_all_a_shares_soft_fails() -> None:
 
     t, _ = _http_transport(h)
     assert t.all_a_shares() == []
+
+
+# ---------------------------------------------------------------------------
+# 代码表 TTL 缓存(单轮 5.6~7.9s 中约 4.3s 花在 codes.all_a_shares 上)
+# ---------------------------------------------------------------------------
+
+
+def _codes_transport(symbols: list[str] | None = None):
+    """代码表专用替身: 记录 codes.all_a_shares 的调用次数。"""
+    payload = symbols if symbols is not None else ["sz000001", "sh600000"]
+    counter = {"n": 0}
+
+    def h(method, params):
+        assert method == "codes.all_a_shares"
+        counter["n"] += 1
+        return payload
+
+    t, _ = _http_transport(h)
+    return t, counter
+
+
+def test_code_table_cached_across_calls() -> None:
+    """本改动的核心断言: 连续调用只回源**一次**。
+
+    回归防护(实测): 每次调用 all_a_shares 都真拉上游, 耗时 2.1~6.5s(中位 4.3s),
+    而同一份清单从内存读取仅需 0.011ms。实时轮询每 6s 一拍、分钟增量每 ~12s 一拍,
+    不清缓存等于每轮都把大部分时间花在一份几乎不变的全市场清单上。
+    """
+    t, counter = _codes_transport()
+    first = t.all_a_shares()
+    second = t.all_a_shares()
+    third = t.all_a_shares()
+
+    assert counter["n"] == 1, f"应只回源 1 次, 实际 {counter['n']} 次"
+    assert first == second == third == ["000001.SZ", "600000.SH"]
+
+
+def test_code_table_returns_copy_not_cache_itself() -> None:
+    """返回的必须是副本: 调用方原地修改不得污染缓存。
+
+    get_intraday_latest 会对 syms 做切片, get_realtime 会把它传给 snapshots;
+    共享同一个 list 对象会让"某个调用方的就地改动"影响另一个线程的后续轮次。
+    """
+    t, counter = _codes_transport()
+    first = t.all_a_shares()
+    first.append("FAKE.SH")
+    first.clear()  # 恶意清空
+
+    again = t.all_a_shares()
+    assert again == ["000001.SZ", "600000.SH"], "缓存被调用方污染"
+    assert counter["n"] == 1, "污染检查不应触发额外回源"
+
+
+def test_code_table_invalidated_on_new_day(monkeypatch) -> None:
+    """跨北京日期必须立即失效(不依赖 TTL)。"""
+    from app.plugins.eltdx import http_client as hc
+
+    t, counter = _codes_transport()
+    t.all_a_shares()
+    assert counter["n"] == 1
+
+    # 同一天内仍命中
+    t.all_a_shares()
+    assert counter["n"] == 1
+
+    # 跨日 -> 重拉
+    monkeypatch.setattr(hc, "cn_today", lambda: date(2026, 10, 1))
+    t.all_a_shares()
+    assert counter["n"] == 2, "跨日未失效"
+
+
+def test_code_table_invalidated_after_ttl(monkeypatch) -> None:
+    """TTL 过期后必须重拉, 以限制盘中新上市/退市的可见滞后。"""
+    from app.plugins.eltdx import http_client as hc
+
+    t, counter = _codes_transport()
+    t.all_a_shares()
+    assert counter["n"] == 1
+
+    # 推进到 TTL 之内: 仍命中
+    base = time.monotonic()
+    monkeypatch.setattr(hc.time, "monotonic", lambda: base + hc._CODE_CACHE_TTL_S - 1)
+    t.all_a_shares()
+    assert counter["n"] == 1, "TTL 未到不应回源"
+
+    # 超过 TTL: 重拉
+    monkeypatch.setattr(hc.time, "monotonic", lambda: base + hc._CODE_CACHE_TTL_S + 1)
+    t.all_a_shares()
+    assert counter["n"] == 2, "TTL 过期未失效"
+
+
+def test_code_table_failure_is_not_cached() -> None:
+    """失败**不得写入缓存**: 否则一次上游抖动会让清单空到 TTL 结束。"""
+    state = {"fail": True, "n": 0}
+
+    def h(method, params):
+        state["n"] += 1
+        if state["fail"]:
+            raise RuntimeError("gateway down")
+        return ["sz000001"]
+
+    t, _ = _http_transport(h)
+    assert t.all_a_shares() == [], "失败应软返回 []"
+
+    state["fail"] = False
+    assert t.all_a_shares() == ["000001.SZ"], "失败结果被缓存了, 未能重试"
+    assert state["n"] == 2
+
+
+def test_code_table_concurrent_callers_fetch_once() -> None:
+    """单飞: 多线程并发时只放行一次回源(provider 是模块级单例, 两线程共享实例)。"""
+    started = threading.Event()
+    counter = {"n": 0}
+
+    def h(method, params):
+        counter["n"] += 1
+        started.set()
+        time.sleep(0.2)  # 拉长窗口, 让其他线程有机会并发进入
+        return ["sz000001", "sh600000"]
+
+    t, _ = _http_transport(h)
+    results: list[list[str]] = []
+    lock = threading.Lock()
+
+    def worker():
+        out = t.all_a_shares()
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=10)
+
+    assert counter["n"] == 1, f"并发下应只回源 1 次, 实际 {counter['n']} 次"
+    assert len(results) == 6
+    assert all(r == ["000001.SZ", "600000.SH"] for r in results)
+
+
+def test_code_table_cache_cleared_on_close() -> None:
+    """close() 必须清缓存: provider 重建/数据源切换后不得残留旧清单。"""
+    t, counter = _codes_transport()
+    t.all_a_shares()
+    assert counter["n"] == 1
+
+    t.close()
+    t.all_a_shares()
+    assert counter["n"] == 2, "close 后仍命中旧缓存"
 
 
 def test_transport_factory_defaults_to_http_and_never_falls_back(monkeypatch) -> None:
