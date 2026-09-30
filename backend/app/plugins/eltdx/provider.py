@@ -45,6 +45,11 @@ from app.plugins.eltdx.client import (
     to_eltdx_code,
     to_panel_symbol,
 )
+from app.plugins.eltdx.http_client import (
+    DEFAULT_HTTP_TIMEOUT_S,
+    DEFAULT_HTTP_URL,
+    HttpTransport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,16 +117,35 @@ _DAILY_BATCH = int(os.environ.get("ELTDX_DAILY_BATCH", "200"))
 
 
 def availability() -> tuple[bool, str]:
-    """插件可用性自检(后端启动时调用): eltdx 依赖是否可 import。
+    """插件可用性自检(后端启动时调用)。
 
     契约: 返回 ``(是否可用, 原因)``, 不抛异常。不可用时设置页灰显并展示 install_hint。
+
+    两种传输的检查口径不同:
+    * ``http``(默认): 还需探测网关 ``/health`` —— 因为连接池归网关所有,
+      网关不可达时插件实际不可用(且**不会**自动回退进程内, 故必须显式暴露)。
+    * ``inproc``: 只需 eltdx 依赖可 import。
     """
+    mode = os.environ.get("ELTDX_TRANSPORT", "http").strip().lower()
+    if mode == "http":
+        base = os.environ.get("ELTDX_HTTP_URL", DEFAULT_HTTP_URL)
+        try:
+            info = HttpTransport(
+                base_url=base,
+                timeout=float(os.environ.get("ELTDX_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_S)),
+            ).health()
+        except Exception as e:  # 网关不可达: 记录原因供设置页展示, 不上抛
+            return False, (
+                f"eltaX HTTP 网关不可达({base}): {str(e)[:80]}; "
+                f"请先启动网关 `eltdx-http`(见 docs/HTTP_GATEWAY.md)"
+            )
+        return True, f"ok (eltaX 网关 {info.get('version', '?')} @ {base})"
     try:
         import eltdx
     except Exception as e:  # 依赖缺失: 记录原因供设置页灰显, 不上抛
         return False, f"未安装 eltdx 依赖({e}); 请点击卡片「安装依赖」按钮"
     version = getattr(eltdx, "__version__", "unknown")
-    return True, f"ok (eltdx {version})"
+    return True, f"ok (eltdx {version}, 进程内模式)"
 
 
 def _to_float(value: Any) -> float | None:
@@ -138,39 +162,55 @@ def _to_float(value: Any) -> float | None:
     return out
 
 
-def _bar_date(value: Any) -> date | None:
-    """KlineBar.time → ``date``(北京墙钟 aware datetime, 取日期部分)。"""
+def _parse_time_value(value: Any) -> datetime | None:
+    """把 K 线 ``time`` 解析成 aware/naive datetime —— **两种传输都要兼容**。
+
+    两种传输的 ``time`` 形态不同(这是 HTTP 网关接入时必须处理的关键差异):
+
+    * **进程内**: eltdx 返回 aware ``datetime``(Asia/Shanghai), 直接可用。
+    * **HTTP 网关**: 序列化成 ISO8601 **字符串** ``'2026-09-30T11:25:00+08:00'``。
+
+    旧实现只认 ``'%Y-%m-%d %H:%M:%S'``(空格分隔), 遇到 ISO 的 ``T`` 与 ``+08:00``
+    偏移会**静默返回 None** —— 后果是所有分钟行被区间过滤掉, 表现为
+    ``get_intraday_batch`` 全市场返回 **0 行**(实测 2026-09-30 切 HTTP 后复现)。
+
+    故这里统一走 ``fromisoformat``(Python 3.11+ 支持 ``Z`` 与各种偏移), 并保留
+    原有的空格格式兜底。
+    """
     if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
         return value
-    if isinstance(value, str):
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(value[:19], fmt).date()
-            except ValueError:
-                continue
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    # ISO8601(HTTP 网关): '2026-09-30T11:25:00+08:00' / '...Z' / '2026-09-30'
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    # 空格分隔(进程内字符串变体): '2026-09-30 11:25:00'
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except ValueError:
+            continue
     return None
+
+
+def _bar_date(value: Any) -> date | None:
+    """KlineBar.time → ``date``(北京墙钟, 取日期部分); 兼容 ISO8601 字符串。"""
+    dt = _parse_time_value(value)
+    return dt.date() if dt is not None else None
 
 
 def _bar_datetime(bar: Any) -> datetime | None:
     """KlineBar.time → datetime(保留 tzinfo 供比较; 输出时再转 naive 北京墙钟)。
 
-    eltdx 的 ``time`` 是 Asia/Shanghai 的 aware datetime(实测 ``+08:00``),
-    与契约要求的"北京墙钟 naive"只差一次 ``replace(tzinfo=None)``。
+    eltdx 的 ``time`` 是 Asia/Shanghai 的 aware datetime(实测 ``+08:00``);
+    HTTP 网关则给同值的 ISO8601 字符串 —— 两者都经 :func:`_parse_time_value` 收口。
     """
-    value = getattr(bar, "time", None)
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, date):
-        return datetime(value.year, value.month, value.day)
-    if isinstance(value, str):
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(value[:19], fmt)
-            except ValueError:
-                continue
-    return None
+    return _parse_time_value(getattr(bar, "time", None))
 
 
 def _as_datetime(value: datetime | date, *, end_of_day: bool) -> datetime:
@@ -411,6 +451,38 @@ class _EltDxConfig:
         self.display_name = "eltdx (通达信)"
 
 
+def _make_transport() -> Any:
+    """按 ``ELTDX_TRANSPORT`` 构造传输层。
+
+    * ``http``(**默认**) → :class:`HttpTransport`, 走独立进程的 ``eltdx-http`` 网关。
+      这是**唯一推荐**方式: 连接池/运行时归网关所有, 后端重启不影响 eltdx,
+      外部脚本也无法再与服务互相踩踏(见 http_client 模块 docstring 的事故记录)。
+    * ``inproc`` → :class:`EltDxClient`, 进程内直连。**仅作诊断/离线场景**,
+      存在"运行时崩溃牵连全部数据集""多进程踩踏"的结构性风险。
+
+    注意: ``http`` 模式**不自动回退** ``inproc`` —— 网关不可达时按失败处理,
+    避免静默退回已知有进程级风险的路径(需回退请显式设 ``ELTDX_TRANSPORT=inproc``)。
+    """
+    mode = os.environ.get("ELTDX_TRANSPORT", "http").strip().lower()
+    if mode == "inproc":
+        logger.warning(
+            "eltdx 使用**进程内**传输(ELTDX_TRANSPORT=inproc) —— 存在运行时崩溃牵连"
+            "全部数据集、以及多进程互相踩踏的风险, 建议改用 http 网关"
+        )
+        return EltDxClient(
+            server_count=int(os.environ.get("ELTDX_SERVER_COUNT", DEFAULT_SERVER_COUNT)),
+            connections_per_server=int(
+                os.environ.get("ELTDX_CONNECTIONS_PER_SERVER", DEFAULT_CONNECTIONS_PER_SERVER)
+            ),
+            timeout=float(os.environ.get("ELTDX_TIMEOUT", DEFAULT_TIMEOUT_S)),
+        )
+    base_url = os.environ.get("ELTDX_HTTP_URL", DEFAULT_HTTP_URL)
+    timeout = float(os.environ.get("ELTDX_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_S))
+    workers = int(os.environ.get("ELTDX_HTTP_WORKERS", str(_INTRADAY_LATEST_WORKERS)))
+    logger.info("eltdx 使用 HTTP 网关传输: %s (timeout=%.0fs)", base_url, timeout)
+    return HttpTransport(base_url=base_url, timeout=timeout, max_workers=workers)
+
+
 class EltDxProvider:
     """eltdx 数据源 Provider(无需继承基类, 方法签名对齐 GenericHTTPProvider)。"""
 
@@ -423,13 +495,7 @@ class EltDxProvider:
 
     def __init__(self) -> None:
         self.config = _EltDxConfig()
-        self._client = EltDxClient(
-            server_count=int(os.environ.get("ELTDX_SERVER_COUNT", DEFAULT_SERVER_COUNT)),
-            connections_per_server=int(
-                os.environ.get("ELTDX_CONNECTIONS_PER_SERVER", DEFAULT_CONNECTIONS_PER_SERVER)
-            ),
-            timeout=float(os.environ.get("ELTDX_TIMEOUT", DEFAULT_TIMEOUT_S)),
-        )
+        self._client = _make_transport()
 
     # ---- 生命周期 -------------------------------------------------------
 

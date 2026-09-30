@@ -410,16 +410,19 @@ def test_test_dataset_reports_error_for_undeclared() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_availability_ok_when_eltdx_installed() -> None:
+def test_availability_ok_when_eltdx_installed(monkeypatch) -> None:
+    """inproc 模式: 依赖可 import 即可用。"""
+    monkeypatch.setenv("ELTDX_TRANSPORT", "inproc")
     ok, reason = availability()
     assert ok is True
     assert "eltdx" in reason
 
 
 def test_availability_false_when_import_fails(monkeypatch) -> None:
-    """依赖缺失 → (False, 安装提示), 不抛异常。"""
+    """inproc 模式: 依赖缺失 → (False, 安装提示), 不抛异常。"""
     import builtins
 
+    monkeypatch.setenv("ELTDX_TRANSPORT", "inproc")
     real_import = builtins.__import__
 
     def _fake_import(name, *args, **kwargs):
@@ -431,6 +434,21 @@ def test_availability_false_when_import_fails(monkeypatch) -> None:
     ok, reason = availability()
     assert ok is False
     assert "安装依赖" in reason
+
+
+def test_availability_http_mode_requires_reachable_gateway(monkeypatch) -> None:
+    """http 模式: 网关不可达必须判为**不可用**(因为不会自动回退进程内)。
+
+    这是刻意的严格口径: 若网关挂了却仍报"可用", 用户会看到面板静默无数据,
+    与本次事故的观感完全一样。
+    """
+    monkeypatch.setenv("ELTDX_TRANSPORT", "http")
+    monkeypatch.setenv("ELTDX_HTTP_URL", "http://127.0.0.1:9")  # 必然拒连
+    monkeypatch.setenv("ELTDX_HTTP_TIMEOUT", "2")
+    ok, reason = availability()
+    assert ok is False
+    assert "网关不可达" in reason
+    assert "eltdx-http" in reason, "提示里要告诉用户怎么启动网关"
 
 
 # ---------------------------------------------------------------------------
@@ -1740,3 +1758,287 @@ def test_call_does_not_retry_business_errors() -> None:
         c._call(_biz_error)
     assert len(calls) == 1, "业务错误不得重试"
     assert c._client is sentinel, "业务错误不得作废连接池"
+
+
+# ---------------------------------------------------------------------------
+# HTTP 网关传输(进程隔离; 2026-09-30 事故后的架构收敛)
+# ---------------------------------------------------------------------------
+
+
+def _http_transport(handler):
+    """构造一个把 /rpc 交给 handler 的 HttpTransport(不真连网络)。
+
+    handler 返回**原始 JSON 结构**; 这里按真实 ``_rpc`` 的行为做 ``_wrap``,
+    以便测试覆盖"JSON dict -> 属性对象"这层转换。
+    """
+    from app.plugins.eltdx.http_client import HttpTransport, _wrap
+
+    t = HttpTransport(base_url="http://test.local", timeout=5)
+    calls: list[tuple[str, dict]] = []
+
+    def _rpc(method, params):
+        calls.append((method, params))
+        return _wrap(handler(method, params))
+
+    t._rpc = _rpc  # type: ignore[method-assign]
+    return t, calls
+
+
+def test_http_transport_wraps_json_into_attribute_objects() -> None:
+    """JSON dict 必须包装成**属性可访问**的对象, 以复用 provider 的解析逻辑。
+
+    网关把 dataclass 序列化成同名字段的 JSON(实测 volume_lots / amount /
+    buy_levels 等与进程内对象一致), provider 侧却是按属性访问的 —— 这层包装
+    是"两套传输共用同一份 provider 代码"的前提。
+    """
+    from app.plugins.eltdx.http_client import _wrap
+
+    o = _wrap({"volume_lots": 707.0, "nested": {"price": 11.48}, "items": [{"volume": 1}]})
+    assert o.volume_lots == 707.0
+    assert o.nested.price == 11.48
+    assert o.items[0].volume == 1
+    assert o.not_there is None, "缺失字段必须返回 None(对应契约的缺失语义)"
+
+
+def test_http_transport_bars_uses_paging_and_stops_on_short_page() -> None:
+    """单标的 bars 必须自管分页(单页上限 800), 且短页即终止。"""
+    pages = {
+        0: [{"time": f"2026-09-30T10:{i:02d}:00+08:00", "close": 1.0} for i in range(800)],
+        800: [{"time": "2026-09-30T11:00:00+08:00", "close": 2.0}],  # 短页 -> 终止
+    }
+
+    def h(method, params):
+        assert method == "bars.get"
+        assert params["adjust"] is None, "面板契约: K 线必须不复权"
+        return {"bars": pages.get(params["start"], [])}
+
+    t, calls = _http_transport(h)
+    out = t.bars("000001.SZ", period="day", count=2000)
+    assert len(out) == 801, "800 满页 + 1 短页"
+    assert [c[1]["start"] for c in calls] == [0, 800], "短页后不得继续翻页"
+
+
+def test_http_transport_bars_multi_maps_codes_back_to_panel_symbols() -> None:
+    """批量返回必须按请求顺序还原成面板 symbol(网关返回的 key 是 eltdx 代码)。"""
+
+    def h(method, params):
+        assert method == "bars.get"
+        return {
+            "sz000001": {"bars": [{"close": 11.5}]},
+            "sh600519": {"bars": [{"close": 1238.0}, {"close": 1239.0}]},
+        }
+
+    t, _ = _http_transport(h)
+    got = t.bars_multi(["000001.SZ", "600519.SH"], period="1m", count=3)
+    assert [s for s, _ in got] == ["000001.SZ", "600519.SH"]
+    assert [len(b) for _, b in got] == [1, 2]
+
+
+def test_http_transport_snapshots_soft_fails() -> None:
+    """快照必须**软失败**(返回 [] 不抛), 否则会打断面板轮询线程。"""
+
+    def h(method, params):
+        raise RuntimeError("HTTP 502 on quotes.get_snapshots")
+
+    t, _ = _http_transport(h)
+    assert t.snapshots(["000001.SZ"], batch_size=80) == []
+
+
+def test_http_transport_depth_hard_fails() -> None:
+    """盘口契约相反: 必须**抛异常**(由服务层按批隔离, 不跨源回退)。"""
+
+    def h(method, params):
+        raise RuntimeError("HTTP 502 on quotes.get_depth")
+
+    t, _ = _http_transport(h)
+    with pytest.raises(RuntimeError):
+        t.depth(["000001.SZ"])
+
+
+def test_http_transport_all_a_shares_soft_fails() -> None:
+    """代码表失败软返回 [](与进程内同语义)。"""
+
+    def h(method, params):
+        raise RuntimeError("gateway down")
+
+    t, _ = _http_transport(h)
+    assert t.all_a_shares() == []
+
+
+def test_transport_factory_defaults_to_http_and_never_falls_back(monkeypatch) -> None:
+    """默认必须走 HTTP 网关; 且 **http 模式不因网关不可达而回退 inproc**。
+
+    回退会静默退回"运行时崩溃牵连全部数据集 + 多进程踩踏"的已知风险路径,
+    这正是本次事故要消除的东西 —— 故宁可显式失败。
+    """
+    from app.plugins.eltdx import provider as pv
+    from app.plugins.eltdx.http_client import HttpTransport
+
+    monkeypatch.delenv("ELTDX_TRANSPORT", raising=False)
+    assert isinstance(pv._make_transport(), HttpTransport), "默认必须是 HTTP 网关"
+
+    monkeypatch.setenv("ELTDX_HTTP_URL", "http://127.0.0.1:9999")
+    t = pv._make_transport()
+    assert isinstance(t, HttpTransport), "网关不可达也不得回退 inproc"
+    assert t._base_url == "http://127.0.0.1:9999"
+
+
+def test_transport_factory_inproc_is_explicit_opt_in(monkeypatch) -> None:
+    """inproc 必须**显式选择**(诊断/离线用), 且会打印风险警告。"""
+    from app.plugins.eltdx import provider as pv
+    from app.plugins.eltdx.client import EltDxClient
+
+    monkeypatch.setenv("ELTDX_TRANSPORT", "inproc")
+    assert isinstance(pv._make_transport(), EltDxClient)
+
+
+# ---------------------------------------------------------------------------
+# HTTP 连接池: 两个实测踩到的坑(端口耗尽 / keep-alive 竞态)
+# ---------------------------------------------------------------------------
+
+
+def _pool(size=4, ttl=None):
+    from app.plugins.eltdx.http_client import _ConnPool
+
+    p = _ConnPool(host="127.0.0.1", port=1, size=size, timeout=1)
+    if ttl is not None:
+        p._IDLE_TTL_S = ttl
+    return p
+
+
+def test_conn_pool_reuses_connection_instead_of_new_tcp() -> None:
+    """必须复用连接: urllib 式"每请求新建 TCP"会耗尽动态端口。
+
+    实测事故: 高频轮询下 TIME_WAIT 累积 3269 条(Windows 动态端口仅 16384),
+    触发 ``WinError 10055 由于系统缓冲区空间不足或队列已满``。
+    """
+    p = _pool(size=2)
+    c1 = p.acquire()
+    p.release(c1, reusable=True)
+    c2 = p.acquire()
+    assert c2 is c1, "空闲连接必须被复用, 而不是新建"
+    assert p._created == 1, "复用不应增加连接计数"
+
+
+def test_conn_pool_discards_stale_idle_connections() -> None:
+    """空闲超过 TTL 的连接必须被丢弃 —— 网关(uvicorn)默认 5s 就单方面关闭它。
+
+    实测: 面板轮询间隔 6~12s > keep-alive 5s, 几乎每次复用都撞上死连接
+    (``WinError 10053 你的主机中的软件中止了一个已建立的连接``)。
+    """
+    p = _pool(size=2, ttl=0.05)
+    c1 = p.acquire()
+    p.release(c1, reusable=True)
+    import time as _t
+
+    _t.sleep(0.12)
+    c2 = p.acquire()
+    assert c2 is not c1, "过期连接必须被丢弃, 不得复用"
+    assert p._created == 1, "丢弃过期连接后计数应回到 1(新连接)"
+
+
+def test_conn_pool_drops_broken_connection() -> None:
+    """出错连接不得归还(``reusable=False``), 否则后续请求继续踩雷。"""
+    p = _pool(size=2)
+    c1 = p.acquire()
+    p.release(c1, reusable=False)
+    assert p._created == 0, "坏连接必须销毁并减计数"
+    c2 = p.acquire()
+    assert c2 is not c1
+
+
+def test_request_retries_once_on_stale_connection(monkeypatch) -> None:
+    """keep-alive 竞态: 连接可能在"取出到发出"之间死掉 → 必须换新连接重试一次。
+
+    空闲过期只能挡住"放置很久"的情况; 竞态下仍需重试兜底。
+    """
+    from app.plugins.eltdx.http_client import HttpTransport
+
+    t = HttpTransport(base_url="http://127.0.0.1:1", timeout=1)
+    attempts: list[int] = []
+
+    class _FlakyConn:
+        def __init__(self, n):
+            self._n = n
+
+        def request(self, *a, **k):
+            attempts.append(self._n)
+            if self._n == 1:
+                raise ConnectionAbortedError("软件中止了一个已建立的连接")
+
+        def getresponse(self):
+            class _R:
+                status = 200
+                will_close = False
+
+                def read(self):
+                    return b'{"ok":true,"result":{"v":42}}'
+
+            return _R()
+
+        def close(self):
+            pass
+
+    seq = iter([_FlakyConn(1), _FlakyConn(2)])
+    monkeypatch.setattr(t._pool, "acquire", lambda: next(seq))
+    monkeypatch.setattr(t._pool, "release", lambda c, *, reusable: None)
+
+    assert t._request("POST", "/rpc", b"{}") == {"ok": True, "result": {"v": 42}}
+    assert attempts == [1, 2], "必须用新连接重试一次"
+
+
+# ---------------------------------------------------------------------------
+# K 线时间解析: 必须同时认 ISO8601(HTTP 网关)与 datetime(进程内)
+# ---------------------------------------------------------------------------
+
+
+def test_bar_time_parsing_accepts_gateway_iso8601() -> None:
+    """回归防护: HTTP 网关把 time 序列化成 ISO8601 **字符串**, 必须解析成功。
+
+    实测事故(2026-09-30 切 HTTP 后): 旧实现只认 ``'%Y-%m-%d %H:%M:%S'``(空格分隔),
+    对 ISO 的 ``T`` + ``+08:00`` 偏移**静默返回 None** → 所有分钟行被区间过滤掉
+    → ``get_intraday_batch`` 全市场返回 **0 行**, 服务无限"返回空数据"空转。
+
+    两种传输的 time 形态:
+      * 进程内: aware ``datetime``
+      * HTTP  : ``'2026-09-30T11:25:00+08:00'``
+    """
+    from app.plugins.eltdx.provider import _bar_date, _bar_datetime
+
+    iso = "2026-09-30T11:25:00+08:00"
+    assert _bar_date(iso) == date(2026, 9, 30), "ISO8601 必须能取到日期"
+    dt = _bar_datetime(SimpleNamespace(time=iso))
+    assert dt is not None and (dt.year, dt.month, dt.day, dt.hour) == (2026, 9, 30, 11)
+
+    # ISO 无偏移 / 空格分隔 / aware datetime 都不得回归
+    assert _bar_date("2026-09-30T11:25:00") == date(2026, 9, 30)
+    assert _bar_date("2026-09-30 11:25:00") == date(2026, 9, 30)
+    assert _bar_date(datetime(2026, 9, 30, 11, 25)) == date(2026, 9, 30)
+    # 无法解析的输入仍返回 None(不得伪造)
+    assert _bar_date("not-a-time") is None
+    assert _bar_date(None) is None
+
+
+def test_get_intraday_batch_accepts_iso8601_bars() -> None:
+    """端到端: bars 的 time 为 ISO 字符串时, get_intraday_batch 仍须返回数据。
+
+    这是把上面那个"0 行"缺陷钉死在接口层 —— 单测 _bar_date 还不够,
+    必须证明整个修复轮的取数路径不再被过滤空。
+    """
+    today = date.today().isoformat()
+    fake = _FakeClient(
+        minute_bars={
+            "000001.SZ": [
+                _bar(datetime.fromisoformat(f"{today}T09:31:00+08:00")),
+                _bar(datetime.fromisoformat(f"{today}T09:32:00+08:00")),
+            ]
+        }
+    )
+    # 模拟 HTTP 网关: 把 time 换成 ISO 字符串
+    for bars in fake._minute_bars.values():
+        for b in bars:
+            b.time = b.time.isoformat()
+
+    df = _provider(fake).get_intraday_batch(["000001.SZ"], count=240)
+    assert df.height == 2, "ISO8601 时间不得被区间过滤掉"
+    assert df["datetime"][0].hour == 9
