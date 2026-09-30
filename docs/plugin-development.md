@@ -322,12 +322,31 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `provider.py` — Provider 实现(归一化、分批、错误降级)
 - **`backend/app/plugins/eltdx/`** — 通达信在线行情协议直连(runtime: python, 依赖 `eltdx>=3.2.2`)
   - ⚠️ eltdx 为 **Research-Only License**(仅限研究, 禁用商业用途); 数据取自通达信公开行情主站, 启用即视为自行承担合规责任
+  - **默认走 HTTP 网关(进程隔离)**: `ELTDX_TRANSPORT=http`(默认)时使用独立进程的
+    `eltdx-http` 网关(FastAPI JSON-RPC, `POST /rpc`), 由 `http_client.py` 实现;
+    `ELTDX_TRANSPORT=inproc` 才走进程内 `TdxClient`(**仅诊断/离线**, 有进程级风险)。
+    - **为什么默认 http**: 进程内直连有两个结构性风险 —— ① eltaX 运行时是**进程级单例**,
+      内部运行时一旦 closed, 本进程内**所有**数据集一起失效; ② **多进程互相踩踏**,
+      服务运行期间任何独立 eltdx 脚本都会与服务争夺同一运行时(实测把服务连接打死)。
+      HTTP 模式下连接池/运行时归网关所有, 后端重启不影响 eltdx, 网关可独立重启。
+    - **http 模式不自动回退 inproc**(`availability()` 会探测网关 `/health`, 不可达即判不可用),
+      避免静默退回已知有风险的路径。
+    - 启动网关: `eltdx-http --host 127.0.0.1 --port 8000`(见 eltdx 的 `docs/HTTP_GATEWAY.md`;
+      网关**必须单进程**, 多 uvicorn worker 会各自建一套连接池)。
+    - **HTTP 接入的三个已踩坑**(`http_client.py` 内已处理, 改动前务必看注释):
+      ① **必须复用连接** —— urllib 式每请求新建 TCP 会让 TIME_WAIT 累积耗尽动态端口
+      (`WinError 10055 缓冲区空间不足`, 实测 3269 条 vs 16384 上限); 现用自管 keep-alive 池。
+      ② **空闲连接会过期** —— 网关(uvicorn)`timeout_keep_alive=5s` 而轮询间隔 6~12s,
+      死连接复用会报 `WinError 10053`; 现空闲 4s 即丢弃 + 出错换新连接重试一次。
+      ③ **K 线 `time` 是 ISO8601 字符串**(如 `2026-09-30T11:25:00+08:00`), 与进程内的
+      aware datetime 不同; `_parse_time_value` 统一用 `fromisoformat` 收口 ——
+      若只认空格格式会**静默返回 None**, 导致分钟行被区间过滤、全市场取数变 **0 行**。
   - 提供 `daily`(**不复权原始价**, `bars.get(adjust=None)`; eltdx 是逐标的接口, 故用连接池
     `server_count x connections_per_server` + 线程池并发, 实现有界分批的 `iter_daily`)、
     `realtime`(全市场快照 `quotes.get_snapshots`, 另实现 `get_realtime_indices` 供指数行情)、
     `minute`(1 分钟 K: **`bars.get(period='1m')` 是真 OHLC**, 供分时图/分钟回测)、
     `full_minute`(`get_intraday_batch` 修复轮走当日窗口批量; `get_intraday_latest` 增量轮走
-    `bars.get` 批量 —— 实测 1000 只/片、全市场 5578 只约 11.7s, 节奏 ~12s)、
+    `bars.get` 批量 —— 实测 1000 只/片、全市场 5578 只约 10s, 节奏 ~12s)、
     `depth5`(`quotes.get_depth` 各 5 档; volume 单位为手, 封死涨跌停时量为 **0 需原样保留**,
     失败按契约**抛异常**由服务按批隔离, 不跨源回退)、
     `financial`(**只实现 `shares` 表**: `corporate.finance_batch` 的总/流通股本, eltdx 单位为
@@ -336,15 +355,21 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
     `adj_factor`(除权因子**单事件比值**: 由 `(hfq_scale, hfq_offset)` 推导, 公式与标定见下)
   - **未接入** `metrics` / `income` / `balance_sheet` / `cash_flow` 四张财务表
     (f10 报表字段见下, 未声明即回退或由多源合并保留 TickFlow 值)
-  - `client.py` — 连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
-    **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败
-  - `provider.py` — 字段映射与单位换算(见下「eltdx 口径要点」)+ 试拉 + 可用性自检
-  - `tests/test_eltdx_provider.py` — 112 个契约测试(假 client 注入, 不连主站)
+  - `client.py` — 进程内连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
+    **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败 +
+    **运行时崩溃自愈**(`_call`: 命中 `runtime command channel is closed` 即重建池并重试一次)
+  - `http_client.py` — HTTP 网关传输(与 `EltDxClient` 同接口): keep-alive 连接池、
+    空闲过期、竞态重试、JSON→属性对象包装(使 provider 解析逻辑零改动)
+  - `provider.py` — 字段映射与单位换算(见下「eltdx 口径要点」)+ 传输选择 + 试拉 + 可用性自检
+  - `tests/test_eltdx_provider.py` — 137 个契约测试(假 client / 假 HTTP 注入, 不连主站)
   - **eltdx 口径要点**(eltdx 3.2.2 实测基线, 改动前务必复测):
     - `change_pct` 是**百分数制**(`0.442478` = 0.4425%), 面板契约要小数制 → provider 内 **/100**
     - `total_hand` / `volume_lots` 单位是**手**(自验 `amount/(last x hand) ≈ 100`), 面板同为手 → 直用
     - `amount` 单位元; K 线 `time` 是 Asia/Shanghai **aware** datetime → 日 K 取 `.date()`,
-      分钟须 `astimezone(+08:00).replace(tzinfo=None)` 转**北京墙钟 naive**(契约红线)
+      分钟须 `astimezone(+08:00).replace(tzinfo=None)` 转**北京墙钟 naive**(契约红线)。
+      ⚠️ **HTTP 网关下 `time` 是 ISO8601 字符串**(`'2026-09-30T11:25:00+08:00'`)而非 datetime,
+      故必须经 `_parse_time_value` 用 `fromisoformat` 解析 —— 只认 `'%Y-%m-%d %H:%M:%S'`
+      会静默得到 `None` 并让整批分钟行被过滤(表现为全市场取数 **0 行**)。
     - 快照 `time_raw` 是当日 `HHMMSScc` 紧凑整数(8 位, 末 2 位百分秒; 实测 `15330366` = 15:33:03.66)
     - **分钟要用 `bars.get(period='1m')` 而非 `minutes.history`**: 后者是**分时点**
       (仅 `price`+`volume`, 无 OHLC 且 `amount` 恒 0), 不满足分钟 K 契约
