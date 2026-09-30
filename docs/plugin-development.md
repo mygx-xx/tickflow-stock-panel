@@ -341,6 +341,21 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
       ③ **K 线 `time` 是 ISO8601 字符串**(如 `2026-09-30T11:25:00+08:00`), 与进程内的
       aware datetime 不同; `_parse_time_value` 统一用 `fromisoformat` 收口 ——
       若只认空格格式会**静默返回 None**, 导致分钟行被区间过滤、全市场取数变 **0 行**。
+    - **代码表缓存与单飞**(`all_a_shares`, 见 `http_client.py` 注释):
+      `codes.all_a_shares` 实测每次回源约 1.5s(全市场 5578 只), 而缓存命中仅 0.015ms,
+      故按 TTL 缓存(默认 300s, `ELTDX_CODE_TTL` 可配, 设为 0 即**每轮都回源**),
+      并按**北京日期**跨日强制失效。并发用「条件变量 + 世代号」实现单飞:
+      - **有界**: 任何调用都在 `timeout` 内返回, 绝不无限阻塞(等待者不递归重入);
+      - **降级**: 回源失败/超时时, 若当日旧清单仍在**陈旧上界**内
+        (`ELTDX_CODE_STALE_MAX`, 默认 `2xTTL` = 600s), 返回旧清单而非空 ——
+        代码表只决定"拉哪些标的", 旧清单的后果仅是覆盖面略窄(退市标的快照会被
+        `_snapshot_row` 丢弃, 新标的下一轮补上), 不产生错误行; 返回空则会让整轮
+        行情/分钟为空。降级后会**刷新缓存有效期**以退避(否则上游持续故障时每轮都
+        真打网关)。两道硬约束: **必须当日**(隔夜有上市/退市/代码变更)且
+        **不得超过陈旧上界**(否则长时间故障会一直用数小时前的清单)。
+      - `close()` / `reset()` 都会清缓存并作废在途回源(`reset` 是网关重启后的自愈入口,
+        必须能解除卡住的单飞占位)。打断在途回源时该次调用返回空 —— 即便上游已
+        成功返回, 结果也按"世代已作废"丢弃, 属预期语义。
   - 提供 `daily`(**不复权原始价**, `bars.get(adjust=None)`; eltdx 是逐标的接口, 故用连接池
     `server_count x connections_per_server` + 线程池并发, 实现有界分批的 `iter_daily`)、
     `realtime`(全市场快照 `quotes.get_snapshots`, 另实现 `get_realtime_indices` 供指数行情)、

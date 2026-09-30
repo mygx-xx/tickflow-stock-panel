@@ -318,12 +318,16 @@ def test_realtime_snapshot_row_without_symbol_is_dropped() -> None:
 def test_realtime_snapshot_bare_code_without_exchange_is_dropped() -> None:
     """交易所缺失时**不得**按首位猜后缀。
 
-    回归防护(实测缺陷): 快照的 ``exchange`` 为空时, ``full_code`` 退化成裸 6 位
-    代码(如 "000001"), 早期实现直接交给 ``to_panel_symbol`` 按首位推断 —— 上证指数
-    ``000001.SH`` 于是被写成 ``000001.SZ``, 与真实的平安银行撞在同一个 symbol 上,
-    在 kline_daily 留下重复行, 令矩阵构建报
-    "MarketDataMatrix requires unique timestamp/symbol rows"。
+    纵深防御(机制已复现, 触发前提未观测到): 快照的 ``exchange`` 为空时, SDK 的
+    ``full_code`` 属性(``f"{exchange}{code}"``)退化成裸 6 位代码(如 "000001"),
+    早期实现直接交给 ``to_panel_symbol`` 按首位推断 —— 上证指数 ``000001.SH``
+    于是被写成 ``000001.SZ``, 与真实的平安银行撞在同一个 symbol 上, 在 kline_daily
+    留下重复行, 令矩阵构建报 "MarketDataMatrix requires unique timestamp/symbol rows"。
     正确行为: 丢弃该行(少一行好过把指数值写成股票价)。
+
+    注(2026-09-30, 网关 3.2.2 实测): 真实快照**不含 full_code 字段**, 且 ``exchange``
+    从不缺失或为空(抽样 80 只全为 ``sh``)。故本用例是人为构造异常输入来钉住防护行为,
+    **不代表**当前上游会走到该分支。
     """
     bare = SimpleNamespace(
         full_code="000001",  # exchange 为空 → full_code 无交易所标识
@@ -2037,21 +2041,27 @@ def test_code_table_invalidated_on_new_day(monkeypatch) -> None:
 
 
 def test_code_table_invalidated_after_ttl(monkeypatch) -> None:
-    """TTL 过期后必须重拉, 以限制盘中新上市/退市的可见滞后。"""
+    """TTL 过期后必须重拉, 以限制盘中新上市/退市的可见滞后。
+
+    用**实例**的 ``_code_ttl_s`` 计算偏移(而非模块常量): 实例 TTL 可配
+    (``code_ttl_s`` / ``ELTDX_CODE_TTL``), 绑定模块常量会在改配后失配。
+    """
     from app.plugins.eltdx import http_client as hc
 
     t, counter = _codes_transport()
+    ttl = t._code_ttl_s
+    assert ttl > 1, "默认 TTL 应显著大于 1s"
     t.all_a_shares()
     assert counter["n"] == 1
 
     # 推进到 TTL 之内: 仍命中
     base = time.monotonic()
-    monkeypatch.setattr(hc.time, "monotonic", lambda: base + hc._CODE_CACHE_TTL_S - 1)
+    monkeypatch.setattr(hc.time, "monotonic", lambda: base + ttl - 1)
     t.all_a_shares()
     assert counter["n"] == 1, "TTL 未到不应回源"
 
     # 超过 TTL: 重拉
-    monkeypatch.setattr(hc.time, "monotonic", lambda: base + hc._CODE_CACHE_TTL_S + 1)
+    monkeypatch.setattr(hc.time, "monotonic", lambda: base + ttl + 1)
     t.all_a_shares()
     assert counter["n"] == 2, "TTL 过期未失效"
 
@@ -2114,6 +2124,349 @@ def test_code_table_cache_cleared_on_close() -> None:
     t.close()
     t.all_a_shares()
     assert counter["n"] == 2, "close 后仍命中旧缓存"
+
+
+def _codes_transport_with_timeout(handler, *, timeout: float):
+    """构造一个可指定 ``timeout`` 的代码表替身(用于"等待超时"类用例)。
+
+    直接覆写 ``_rpc``(而非真实 HTTP), 故不连网络; 但保留真实的
+    ``all_a_shares`` 缓存/单飞逻辑, 以便用例验证并发语义本身。
+    """
+    from app.plugins.eltdx.http_client import HttpTransport, _wrap
+
+    t = HttpTransport(base_url="http://test.local", timeout=timeout)
+    counter = {"n": 0}
+
+    def _rpc(method, params):
+        counter["n"] += 1
+        return _wrap(handler(method, params))
+
+    t._rpc = _rpc  # type: ignore[method-assign]
+    return t, counter
+
+
+def test_code_table_waiter_returns_bounded_when_holder_stalls() -> None:
+    """**回归防护(实测缺陷)**: 持有者卡死时, 等待者必须在 timeout 内有界返回。
+
+    旧实现里等待者 deadline 用尽后会**递归重入** ``_fetch_and_cache_code_symbols``,
+    而 ``_code_fetching`` 仍为 True → 再进一轮等待 → 无限递归。实测(持有者永久
+    阻塞, timeout=0.5, 4 并发): 4 个线程全部无法退出。
+
+    更糟的是这不只是理论边界: ``_request`` 内含 2 次重试, 单次 socket 超时
+    ``timeout``, 故持有者最坏耗时 ≈ 2*timeout > 等待者 deadline —— 生产中
+    "等待者先到期再递归"是**常态**, 表现为 /quote 轮询与分钟增量一起静默假死。
+
+    正确行为: 等待者超时返回 [](软失败), 由下一轮轮询自然重试。
+    """
+    started = threading.Event()
+
+    def h(method, params):
+        started.set()
+        time.sleep(30)  # 远大于 timeout
+        return ["sz000001"]
+
+    t, _ = _codes_transport_with_timeout(h, timeout=0.3)
+    holder = threading.Thread(target=t.all_a_shares, daemon=True)
+    holder.start()
+    assert started.wait(timeout=5), "持有者未启动"
+
+    t0 = time.perf_counter()
+    result = t.all_a_shares()  # 本线程是等待者
+    elapsed = time.perf_counter() - t0
+
+    assert result == [], "等待者超时应软失败返回空"
+    assert elapsed < 2.0, f"等待者必须按 timeout 有界返回, 实际 {elapsed:.2f}s"
+
+
+def test_code_table_reset_releases_stalled_single_flight() -> None:
+    """**回归防护(实测缺陷)**: reset() 必须清除单飞占位, 否则自愈路径失效。
+
+    旧实现的 ``reset()`` 只关连接池, **不清** ``_code_fetching``: 网关故障期间卡住的
+    回源占位会一直为 True, 之后每次 ``all_a_shares()`` 都只能空等到 timeout 才返回
+    (实测 timeout=0.3 时每次调用耗时 0.3s), 而 reset() 正是网关重启后的自愈入口。
+    """
+    started = threading.Event()
+
+    def h(method, params):
+        started.set()
+        time.sleep(30)
+        return ["sz000001"]
+
+    t, _ = _codes_transport_with_timeout(h, timeout=0.3)
+    holder = threading.Thread(target=t.all_a_shares, daemon=True)
+    holder.start()
+    assert started.wait(timeout=5), "持有者未启动"
+
+    t.reset(reason="网关重启")
+    assert t._code_inflight is None, "reset 后单飞占位必须已清除"
+
+    # 自愈后必须能立刻成功回源(而不是被旧占位拖到 timeout)
+    t._rpc = lambda method, params: ["sz000001"]  # type: ignore[method-assign]
+    t0 = time.perf_counter()
+    assert t.all_a_shares() == ["000001.SZ"]
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 0.15, f"reset 后应立即回源, 实际 {elapsed:.2f}s(旧占位未清除)"
+
+
+def test_code_table_inflight_result_discarded_after_close() -> None:
+    """**回归防护(实测缺陷)**: close() 之后, 在途回源的结果不得写回缓存。
+
+    旧实现的 ``close()`` 只把 ``_code_fetching`` 置 False, 但在途请求返回后仍会
+    无条件写缓存(实测: close 后 ``_code_symbols`` 被在途结果重新填成旧清单)——
+    于是 close 的清缓存形同虚设。
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def h(method, params):
+        started.set()
+        release.wait(timeout=10)
+        return ["sz000001", "sh600000"]
+
+    t, _ = _codes_transport_with_timeout(h, timeout=5)
+    holder = threading.Thread(target=t.all_a_shares, daemon=True)
+    holder.start()
+    assert started.wait(timeout=5), "持有者未启动"
+
+    t.close()          # 作废在途世代
+    release.set()      # 放行在途请求(其世代已失效)
+    holder.join(timeout=10)
+    assert not holder.is_alive(), "在途请求应已结束"
+
+    assert t._code_symbols is None, "close 后不得被在途结果重新填充"
+
+
+def test_code_table_failure_does_not_multiply_fetches() -> None:
+    """**回归防护(实测缺陷)**: 回源失败时不得让每个调用者各自重拉(单飞退化)。
+
+    旧实现在持有者失败后, 等待者会 break 出去**自行回源**, 于是 N 个并发调用者
+    打出 N 次请求(实测 2/4/8 并发分别回源 2/4/8 次)—— 恰是单飞要消除的放大,
+    方向上反了。正确行为: 等待者读到"同世代失败"即软返回, 由下一轮统一重试。
+
+    本用例**无旧清单**(冷启动即失败), 故只能返回空; 有当日旧清单时的兜底行为
+    见 ``test_code_table_falls_back_to_stale_list_on_failure``。
+    """
+
+    def h(method, params):
+        time.sleep(0.2)  # 贴合真实失败量级(连接错误/超时, 非瞬时)
+        raise RuntimeError("gateway down")
+
+    t, counter = _codes_transport_with_timeout(h, timeout=5)
+    results: list[list[str]] = []
+    lock = threading.Lock()
+
+    def worker():
+        out = t.all_a_shares()
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30)
+
+    assert counter["n"] == 1, f"失败时应只回源 1 次, 实际 {counter['n']} 次(单飞退化)"
+    assert len(results) == 8
+    assert all(r == [] for r in results), "无旧清单时失败应全部软返回空"
+    # 失败不写缓存: 下一轮仍能成功后恢复
+    t._rpc = lambda method, params: ["sz000001"]  # type: ignore[method-assign]
+    assert t.all_a_shares() == ["000001.SZ"], "失败后下一轮应能恢复"
+
+
+def test_code_table_falls_back_to_stale_list_on_failure() -> None:
+    """**行为契约**: 回源失败时若有**当日旧清单**, 必须兜底返回它而不是 ``[]``。
+
+    理由: 代码表只用于决定"拉哪些标的", 不是行情数据本身。旧清单(最多 TTL 时长
+    之前)的后果是**覆盖面略窄** —— 退市标的快照取不到会被 ``_snapshot_row`` 丢弃、
+    新标的下一轮补上, 不产生错误行; 而返回 ``[]`` 会让整轮行情/分钟为空
+    (``get_realtime`` 直接返回空、``get_intraday_latest`` 返回空帧)。
+    故有旧清单时用旧清单严格更优(与 quote_service "指数本轮获取失败, 沿用上轮缓存"
+    同一思路)。
+
+    覆盖**持有者**与**等待者**两条路径: 前者自己回源失败, 后者等到的是同世代失败。
+    """
+    state = {"fail": False}
+
+    def h(method, params):
+        if state["fail"]:
+            time.sleep(0.2)
+            raise RuntimeError("gateway down")
+        return ["sz000001", "sh600000"]
+
+    t, counter = _codes_transport_with_timeout(h, timeout=5)
+    fresh = t.all_a_shares()
+    assert fresh == ["000001.SZ", "600000.SH"]
+
+    # ---- 持有者路径: 单线程, 回源失败 ----
+    t._code_at = 0.0  # 强制 TTL 过期
+    state["fail"] = True
+    assert t.all_a_shares() == fresh, "持有者路径应兜底当日旧清单"
+
+    # ---- 等待者路径: 4 并发同时等到同世代失败 ----
+    t._code_at = 0.0
+    counter["n"] = 0
+    results: list[list[str]] = []
+    lock = threading.Lock()
+
+    def worker():
+        out = t.all_a_shares()
+        with lock:
+            results.append(out)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30)
+
+    assert counter["n"] == 1, f"单飞仍应只回源 1 次, 实际 {counter['n']}"
+    assert results and all(r == fresh for r in results), "等待者路径应兜底当日旧清单"
+
+
+def test_code_table_stale_fallback_is_same_day_only() -> None:
+    """跨日的旧清单**不得**兜底: 隔夜有上市/退市/代码变更, 且当日分区已切换。
+
+    无当日旧清单时仍返回 ``[]``(软失败, 不伪造数据)。
+    """
+    from datetime import date
+
+    t, _ = _codes_transport()
+    t.all_a_shares()
+    assert t._stale_code_symbols_locked() is not None, "当日清单应可兜底"
+
+    t._code_day = date(2020, 1, 1)  # 伪造成历史日期
+    assert t._stale_code_symbols_locked() is None, "跨日旧清单不得兜底"
+
+
+def test_code_table_stale_fallback_has_age_bound() -> None:
+    """旧清单**超过陈旧上界**后不得再兜底, 否则长时间故障会一直用数小时前的清单。
+
+    上界之所以必须看**数据真实取回时刻**(``_code_data_at``)而不是缓存有效期起点
+    (``_code_at``): 降级会刷新 ``_code_at``(让旧清单再顶一轮), 若上界也用它,
+    每次降级都把年龄归零, 上界将**永不触发**(实测: 上界 1s 时连续 4 轮仍返回数据)。
+    """
+    state = {"fail": False}
+
+    def h(method, params):
+        if state["fail"]:
+            raise RuntimeError("gateway down")
+        return ["sz000001"]
+
+    t, _ = _codes_transport_with_timeout(h, timeout=5)
+    t.all_a_shares()
+    assert t._stale_code_symbols_locked() is not None, "刚取回应在界内"
+
+    # 把数据年龄推到上界之外(不改 _code_at, 模拟"降级刷新过缓存有效期")
+    t._code_data_at = time.monotonic() - (t._code_stale_max_s + 1)
+    assert t._stale_code_symbols_locked() is None, "超过陈旧上界不得兜底"
+
+    # 且此时回源失败应返回空(而非降级)
+    t._code_at = 0.0  # 强制 TTL 过期
+    state["fail"] = True
+    assert t.all_a_shares() == [], "超出陈旧上界后失败应返回空"
+
+
+def test_code_table_stale_fallback_backs_off() -> None:
+    """**行为契约**: 降级使用旧清单后应刷新缓存有效期, 避免每轮都真打网关。
+
+    否则上游持续故障时(每轮回源都失败、``_code_at`` 不变 → 缓存始终判过期),
+    每轮都会发一次真实请求并记一条 warning —— 既不退避, 也对已故障的上游持续施压。
+    实测修复前后: 连续 4 轮由"回源 4 次"降为"回源 1 次"。
+    """
+    state = {"fail": False}
+
+    def h(method, params):
+        if state["fail"]:
+            raise RuntimeError("gateway down")
+        return ["sz000001", "sh600000"]
+
+    t, counter = _codes_transport_with_timeout(h, timeout=5)
+    fresh = t.all_a_shares()
+    assert fresh == ["000001.SZ", "600000.SH"]
+
+    t._code_at = 0.0  # 强制 TTL 过期
+    state["fail"] = True
+    counter["n"] = 0
+    for _ in range(4):
+        assert t.all_a_shares() == fresh, "降级应持续返回旧清单"
+    assert counter["n"] == 1, (
+        f"降级后应退避(只回源 1 次), 实际 {counter['n']} 次 —— 每轮都在打网关"
+    )
+
+
+def test_code_table_ttl_is_configurable() -> None:
+    """``ELTDX_CODE_TTL`` / ``code_ttl_s``: TTL=0 等价"每轮回源", 正数生效。"""
+    from app.plugins.eltdx.http_client import HttpTransport, _wrap
+
+    calls = {"n": 0}
+
+    def _rpc(method, params):
+        calls["n"] += 1
+        return _wrap(["sz000001"])
+
+    # TTL=0: 每次调用都回源
+    t0 = HttpTransport(base_url="http://test.local", timeout=5, code_ttl_s=0.0)
+    t0._rpc = _rpc  # type: ignore[method-assign]
+    for _ in range(3):
+        t0.all_a_shares()
+    assert calls["n"] == 3, f"TTL=0 应每轮回源, 实际 {calls['n']} 次"
+
+    # TTL>0: 命中缓存
+    calls["n"] = 0
+    t1 = HttpTransport(base_url="http://test.local", timeout=5, code_ttl_s=300.0)
+    t1._rpc = _rpc  # type: ignore[method-assign]
+    for _ in range(3):
+        t1.all_a_shares()
+    assert calls["n"] == 1, f"TTL=300 应只回源 1 次, 实际 {calls['n']} 次"
+
+
+def test_code_table_interrupted_fetch_returns_empty() -> None:
+    """**已知行为**: close()/reset() 打断在途回源时, 该次调用返回 ``[]``。
+
+    即便上游其实已成功返回, 结果也按"世代已作废 → 不可信"丢弃。这是预期语义
+    (reset 期间的连接路径已重置, 数据不可信), 与 close() 一致; 但要钉住,
+    否则后人看到"请求成功了却返回空"会误当 bug 改掉。
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def h(method, params):
+        started.set()
+        release.wait(timeout=10)
+        return ["sz000001", "sh600000"]
+
+    t, _ = _codes_transport_with_timeout(h, timeout=5)
+    out: dict[str, list[str]] = {}
+
+    def holder():
+        out["r"] = t.all_a_shares()
+
+    th = threading.Thread(target=holder, daemon=True)
+    th.start()
+    assert started.wait(timeout=5), "持有者未启动"
+
+    t.reset(reason="mid-flight")  # 作废在途世代
+    release.set()                 # 上游其实成功返回了
+    th.join(timeout=10)
+    assert not th.is_alive()
+
+    assert out["r"] == [], "被 reset 打断的调用应返回空(结果不可信)"
+    assert t._code_symbols is None, "被打断的结果不得写入缓存"
+
+
+def test_code_table_stays_correct_after_many_refetches() -> None:
+    """长跑正确性: 反复 TTL 失效后仍返回正确结果, 且状态不随回源次数累积。
+
+    结果槽位只保留**一个世代**。若按世代累积, 长期运行下容器会无界增长; 这里用
+    行为断言(结果正确 + 单飞仍生效)覆盖, 避免直接钉住实现细节。
+    """
+    t, counter = _codes_transport()
+    for _ in range(50):
+        assert t.all_a_shares() == ["000001.SZ", "600000.SH"]
+        t._code_at = 0.0  # 强制 TTL 过期, 触发真实回源
+    assert counter["n"] == 50, f"每次 TTL 失效应各回源一次, 实际 {counter['n']}"
+    assert t.all_a_shares() == ["000001.SZ", "600000.SH"]
 
 
 def test_transport_factory_defaults_to_http_and_never_falls_back(monkeypatch) -> None:

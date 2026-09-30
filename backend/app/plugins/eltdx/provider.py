@@ -46,6 +46,8 @@ from app.plugins.eltdx.client import (
     to_panel_symbol,
 )
 from app.plugins.eltdx.http_client import (
+    DEFAULT_CODE_STALE_MAX_S,
+    DEFAULT_CODE_TTL_S,
     DEFAULT_HTTP_TIMEOUT_S,
     DEFAULT_HTTP_URL,
     HttpTransport,
@@ -60,12 +62,19 @@ _CN_TZ = timezone(timedelta(hours=8))
 def _record_symbol(rec: Any) -> str | None:
     """eltdx 记录 → 面板 symbol; 交易所信息不足时**拒绝推断**返回 None。
 
-    ``_snapshot_row``/``get_depth_batch`` 原先直接取 ``full_code or code``:
-    eltdx 的 ``full_code`` 由 ``exchange`` + ``code`` 拼接, ``exchange`` 缺失时
-    它就退化成裸 6 位代码, 再交给 ``to_panel_symbol`` 按首位猜交易所 ——
+    退化链(机制已复现, 触发前提未观测到): ``full_code`` 是 SDK 的**属性**而非网关
+    字段 —— ``return f"{self.exchange}{self.code}"``(见 eltdx ``QuoteSnapshot.full_code``)。
+    故 ``exchange`` 为空时它退化成裸 6 位代码(实测: ``('','000001')`` → ``'000001'``、
+    ``('','920157')`` → ``'920157'``), 再交给 ``to_panel_symbol`` 按首位猜交易所 ——
     沪市指数(000001 上证指数)会被猜成 ``000001.SZ``, 北交所(920xxx)会被猜成
-    ``920000.SH``。这些错码既不是股票也不是指数, 却被当作股票写进 kline_daily,
-    与真实的平安银行(000001.SZ)撞成重复行, 令矩阵构建直接报错。
+    ``920000.SH``。这些错码既不是股票也不是指数, 若被当作股票写进 kline_daily,
+    会与真实标的(如平安银行 000001.SZ)撞成重复行, 令矩阵构建报
+    "MarketDataMatrix requires unique timestamp/symbol rows"。
+
+    实盘可达性(2026-09-30, 网关 3.2.2 实测): ``quotes.get_snapshots`` 返回的 23 个
+    字段中**不含 full_code**, 且 ``exchange`` 字段**从不缺失或为空**(抽样 80 只全部
+    为 ``sh``, 指数路径同样全有值)。故本函数是**纵深防御**: 只在上下游异常导致
+    ``exchange`` 缺失时才生效, 而该前提在当前版本未被观测到 —— 不是活跃缺陷。
 
     显式 ``exchange`` 是唯一可靠来源(与 ``_shares_row`` 同一口径); 取不到时
     **不猜**, 由调用方丢弃该行 —— 宁可少一行, 不可把指数值写成股票价。
@@ -500,8 +509,24 @@ def _make_transport() -> Any:
     base_url = os.environ.get("ELTDX_HTTP_URL", DEFAULT_HTTP_URL)
     timeout = float(os.environ.get("ELTDX_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT_S))
     workers = int(os.environ.get("ELTDX_HTTP_WORKERS", str(_INTRADAY_LATEST_WORKERS)))
-    logger.info("eltdx 使用 HTTP 网关传输: %s (timeout=%.0fs)", base_url, timeout)
-    return HttpTransport(base_url=base_url, timeout=timeout, max_workers=workers)
+    # 代码表缓存 TTL(秒): 0 = 每轮都回源(最小可见时滞, 或排障用)。
+    code_ttl = float(os.environ.get("ELTDX_CODE_TTL", DEFAULT_CODE_TTL_S))
+    # 降级清单的陈旧度上界(秒): 回源失败时最多沿用多久之前的当日清单。
+    # 0 = 不作上界(仅受"当日"约束), 不建议 —— 长时间故障会一直用很久前的清单。
+    code_stale_max = float(
+        os.environ.get("ELTDX_CODE_STALE_MAX", DEFAULT_CODE_STALE_MAX_S)
+    )
+    logger.info(
+        "eltdx 使用 HTTP 网关传输: %s (timeout=%.0fs, 代码表缓存 %.0fs, 降级上界 %.0fs)",
+        base_url, timeout, code_ttl, code_stale_max,
+    )
+    return HttpTransport(
+        base_url=base_url,
+        timeout=timeout,
+        max_workers=workers,
+        code_ttl_s=code_ttl,
+        code_stale_max_s=code_stale_max,
+    )
 
 
 class EltDxProvider:

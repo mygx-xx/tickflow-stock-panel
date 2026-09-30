@@ -57,21 +57,36 @@ DEFAULT_HTTP_URL = "http://127.0.0.1:8000"
 # 网关侧上游超时默认 8s; 但全市场批量(1000 只)本身要 ~2.7s, 大请求要留足余量。
 DEFAULT_HTTP_TIMEOUT_S = 120.0
 
-# 代码表缓存 TTL(秒)。依据(实测): 全市场 5578 只快照并发 8 约 1.4s, 而
-# codes.all_a_shares 每次 2.1~6.5s(中位 4.3s), 占单轮总耗时(5.6~7.9s)七成以上;
-# 代码表当日几乎不变(实测连续多次集合完全一致), 故按 TTL 缓存。
+# 代码表缓存 TTL(秒)。依据(2026-09-30 复核实测, 网关 3.2.2): codes.all_a_shares
+# 每次回源约 1.48~1.64s(连续 5 次), 缓存命中仅 0.030ms —— 差约 4.9 万倍, 故按 TTL 缓存。
+# 代码表当日几乎不变(实测连续两次集合完全一致, 5578 只无差异), 缓存语义安全。
 # 取 5 分钟: 覆盖数十轮刷新, 同时把盘中新上市/退市的可见滞后限制在 5 分钟内。
 # 另按「北京日期」跨日强制失效(见 all_a_shares), 不依赖 TTL。
-_CODE_CACHE_TTL_S = 300.0
+# 注: 早期记载的「每次 2.1~6.5s(中位 4.3s)、占单轮七成以上」为接入网关前的旧观测,
+# 现已不复现, 不应再据此评估收益。
+# 可用 ``ELTDX_CODE_TTL`` 覆盖(见 provider._make_transport); 设为 0 等价于"每轮都回源"。
+DEFAULT_CODE_TTL_S = 300.0
+
+# 兜底清单(失败时沿用当日旧清单)的**陈旧度上界**(秒)。旧清单只用于决定"拉哪些
+# 标的", 但无限陈旧仍不妥: 交易时段内的新股/退市/代码变更会一直不可见。故给一个
+# 宽松上界(默认 2xTTL = 10 分钟); 超过则宁可本轮返回空, 让下一轮重新取干净的清单。
+# 取 2xTTL 的理由: 单次回源约 1.5s, 允许"连续两次回源失败"仍能降级服务, 同时把
+# 最坏陈旧度控制在 10 分钟内(而非此前实测可达的数小时)。
+DEFAULT_CODE_STALE_MAX_S = 2 * DEFAULT_CODE_TTL_S
 
 
 def _code_entry_symbol(item: Any) -> str | None:
     """代码表条目 → 面板 symbol; 无法确定交易所时返回 None(**不推断**)。
 
-    条目有两种形态: ``"sz000001"``(带 2 位前缀)或 ``{"code","exchange"}``。
-    两者都拿不到交易所信息时拒绝按首位猜 —— 沪市指数 000001 会被猜成
-    ``000001.SZ``, 北交所 920000 会被猜成 ``920000.SH``, 这些错码会被当作
-    股票写进 kline_daily, 与真实标的撞成重复行。
+    实测(2026-09-30, 网关 3.2.2): ``codes.all_a_shares`` 返回**全部为 str** 且
+    **100% 带交易所前缀** —— 5578 条实测分布 ``sh`` 2320 / ``sz`` 2907 / ``bj`` 351,
+    无裸 6 位代码、无 ``{"code","exchange"}`` 形态。故 dict 分支是**纵深防御**
+    (JSON 序列化形态若变化时的兜底), 当前上游走不到。
+
+    不推断的理由: ``to_panel_symbol`` 对裸 6 位按首位猜(6/9→SH, 其余→SZ), 会把
+    沪市指数 000001 猜成 ``000001.SZ``、北交所 920xxx 猜成 ``920xxx.SH``。
+    该退化仅在条目**缺失交易所信息**时发生 —— 当前网关版本未观测到此情形,
+    因此这是异常路径的防护而非活跃缺陷。
     """
     if isinstance(item, str):
         raw = item.strip()
@@ -212,19 +227,43 @@ class HttpTransport:
         timeout: float = DEFAULT_HTTP_TIMEOUT_S,
         max_workers: int = 8,
         pool_size: int | None = None,
+        code_ttl_s: float = DEFAULT_CODE_TTL_S,
+        code_stale_max_s: float = DEFAULT_CODE_STALE_MAX_S,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = float(timeout)
         self._max_workers = max(1, int(max_workers))
+        # 代码表缓存 TTL(秒)。0 表示不缓存(每轮都回源), 便于排障或需要最小时滞时用。
+        self._code_ttl_s = max(0.0, float(code_ttl_s))
+        # 兜底清单陈旧度上界(秒)。<=0 表示不作上界限制(仅受"当日"约束)。
+        self._code_stale_max_s = float(code_stale_max_s)
         self._lock = threading.Lock()
         self._seq = 0
         # 代码表缓存: 由 quote 线程与 minute-refresh 线程共享(provider 为模块级单例),
-        # 故读写与「单飞」都需加锁。网络请求严格在锁外(见 all_a_shares)。
-        self._code_lock = threading.Lock()
+        # 故缓存读写与「单飞」都在同一把条件变量下协调。**网络请求严格在锁外**
+        # (见 all_a_shares), 避免持锁做 IO 阻塞另一个线程的实时路径。
+        #
+        # 为什么用 Condition 而不是 Lock + sleep 轮询:
+        #   轮询实现有两个结构性缺陷 —— 等待者超时后只能**递归重入**取数(无层数上限,
+        #   持有者一旦卡死等待者即永久卡死), 且无法区分「同世代成功/失败」,
+        #   于是失败时每个等待者各自再拉一次(单飞退化为 N 次并发回源)。
+        #   条件变量让等待者被精确唤醒、且能读到该世代的结果, 两处缺陷一并消除。
+        self._code_cv = threading.Condition()
         self._code_symbols: list[str] | None = None
         self._code_day: date | None = None
         self._code_at: float = 0.0
-        self._code_fetching = False
+        # 单飞: generation 标识「在途世代」, None 表示当前无人在回源。
+        self._code_generation = 0
+        self._code_inflight: int | None = None
+        # 最近一次回源结果(只保留**一个**槽位)。等待者只关心「自己进入时正在拉的那
+        # 一个世代」, 故不需要按世代累积 —— 累积会让字典随运行时长无界增长。
+        self._code_last_gen: int | None = None
+        self._code_last_result: tuple[str, list[str] | None] | None = None
+        # 数据新鲜度(与 _code_at 分离): 记录清单**真实取回**的时刻。
+        # 为什么必须与 _code_at 分开: _code_at 是"缓存有效期"的起点(降级时会刷新,
+        # 让旧清单再顶一轮), 而陈旧度上界必须看数据**真实年龄** —— 若共用 _code_at,
+        # 每次降级都把年龄归零, 陈旧上界将永不触发(实测: 上界 1s 连续 4 轮仍返回数据)。
+        self._code_data_at: float = 0.0
         host, port = self._host_port()
         self._pool = _ConnPool(
             host=host,
@@ -309,6 +348,23 @@ class HttpTransport:
 
     # ---- 连接管理(与进程内同形, 供 loader/provider 无感复用) ------------
 
+    def _invalidate_code_cache(self) -> None:
+        """清空代码表缓存, 并作废在途回源(其世代号因此失效)。
+
+        递增 ``_code_generation`` 是关键: 在途请求返回时世代号已不匹配, 结果被
+        丢弃而**不会**把旧清单写回刚清空的缓存(否则 close 的清缓存形同虚设)。
+        同时唤醒所有等待者 —— 否则它们会一直等到自己的 deadline。
+        """
+        with self._code_cv:
+            self._code_generation += 1
+            self._code_inflight = None
+            self._code_last_gen = None
+            self._code_last_result = None
+            self._code_symbols = None
+            self._code_day = None
+            self._code_at = 0.0
+            self._code_cv.notify_all()
+
     def close(self) -> None:
         """关闭全部 keep-alive 连接并清空代码表缓存(与 EltDxClient 同接口)。
 
@@ -317,15 +373,18 @@ class HttpTransport:
         标的集合。
         """
         self._pool.close_all()
-        with self._code_lock:
-            self._code_symbols = None
-            self._code_day = None
-            self._code_at = 0.0
-            self._code_fetching = False
+        self._invalidate_code_cache()
 
     def reset(self, *, reason: str = "") -> None:
-        """丢弃现有 keep-alive 连接, 下次调用重建(网关重启后的自愈)。"""
+        """丢弃现有 keep-alive 连接, 下次调用重建(网关重启后的自愈)。
+
+        同样作废在途回源并清空缓存: 回源请求本身是通过被重置的那条连接路径发出的,
+        其成败已不可信; 更重要的是**清除单飞占位** —— 否则网关故障期间卡住的
+        回源会让 ``_code_inflight`` 永久非空, 所有后续调用只能等到超时才返回,
+        使自愈路径失去意义。
+        """
         self._pool.close_all()
+        self._invalidate_code_cache()
         if reason:
             logger.warning("eltdx-http 连接已重置(原因: %s)", reason)
 
@@ -336,14 +395,24 @@ class HttpTransport:
     # ---- 代码表 ---------------------------------------------------------
 
     def all_a_shares(self) -> list[str]:
-        """全市场 A 股(面板格式); 失败返回 []。
+        """全市场 A 股(面板格式); 失败返回 ``[]``(但可能降级为当日旧清单, 见下)。
 
-        带 TTL 缓存(见 ``_CODE_CACHE_TTL_S``): 命中直接返回副本, 未命中回源。
-        失效条件 = 北京日期变化 或 TTL 过期 —— 跨日必须重拉, 不靠 TTL 兜底。
+        带 TTL 缓存(见 ``DEFAULT_CODE_TTL_S`` / ``ELTDX_CODE_TTL``): 命中返回副本,
+        未命中回源。失效条件 = 北京日期变化 或 TTL 过期 —— 跨日必须重拉, 不靠 TTL 兜底。
 
-        并发: provider 是模块级单例, quote 线程与 minute-refresh 线程共用本实例。
-        锁只保护缓存读写与「单飞」占位, **网络请求在锁外**(避免持锁做 IO 阻塞
-        另一个线程的实时路径)。
+        并发契约(provider 是模块级单例, quote 线程与 minute-refresh 线程共用本实例):
+
+        * **单飞**: 同一时刻最多一个线程回源, 其余等这一世代的结果。
+        * **有界**: 任何调用都在 ``timeout`` 内返回, 绝不无限阻塞(等待者结构上不递归)。
+        * **降级**: 回源失败/超时时, 若存在**当日且未超陈旧上界**的旧清单, 返回旧清单;
+          否则返回 ``[]``。返回空时会向上放大为本轮行情/分钟为空, 故旧清单优先。
+        * **锁外 IO**: 网络请求在条件变量之外发出, 不阻塞另一个线程的实时路径。
+
+        注意 ``ELTDX_CODE_TTL=0`` 的语义是"每轮都回源", **不是**"失败即返回空":
+        降级兜底仍会用内存中的上次成功清单(受陈旧上界约束)。
+
+        已知行为: ``close()``/``reset()`` 若打断在途回源, 该次调用返回 ``[]`` ——
+        即便上游其实已成功返回(世代已作废, 结果按不可信丢弃), 属预期语义。
         """
         cached = self._cached_code_symbols()
         if cached is not None:
@@ -352,55 +421,167 @@ class HttpTransport:
 
     def _cached_code_symbols(self) -> list[str] | None:
         """命中则返回**副本**(防止调用方原地修改污染缓存); 未命中返回 None。"""
-        with self._code_lock:
-            if self._code_symbols is None or self._code_day is None:
-                return None
-            if self._code_day != cn_today():
-                return None  # 跨日: 立即失效, 不等 TTL
-            if (time.monotonic() - self._code_at) >= _CODE_CACHE_TTL_S:
-                return None
-            logger.debug("eltdx-http 代码表缓存命中: %d 只", len(self._code_symbols))
-            return list(self._code_symbols)
+        with self._code_cv:
+            return self._cached_code_symbols_locked()
+
+    def _cached_code_symbols_locked(self) -> list[str] | None:
+        """``_cached_code_symbols`` 的无锁版本(调用方须已持有 ``_code_cv``)。"""
+        if self._code_symbols is None or self._code_day is None:
+            return None
+        if self._code_day != cn_today():
+            return None  # 跨日: 立即失效, 不等 TTL
+        if (time.monotonic() - self._code_at) >= self._code_ttl_s:
+            return None
+        logger.debug("eltdx-http 代码表缓存命中: %d 只", len(self._code_symbols))
+        return list(self._code_symbols)
+
+    def _stale_code_symbols_locked(self) -> list[str] | None:
+        """可兜底的旧清单(仅**当日**且未超陈旧上界), 供回源失败时降级; 无则 None。
+
+        为什么失败时返回旧清单而非 ``[]``: 代码表只用于**决定拉哪些标的**, 不是
+        行情数据本身。旧清单用于取数时的后果是"覆盖面略窄" —— 退市标的快照取不到
+        会被 ``_snapshot_row`` 丢弃, 新标的下一轮补上, **不产生错误行**; 而返回
+        ``[]`` 会让整轮行情/分钟为空。故有旧清单时用旧清单更优(与 quote_service 的
+        "指数本轮获取失败, 沿用上轮缓存"同一思路)。
+
+        两道约束, 缺一不可:
+        * **必须当日**: 隔夜标的存在上市/退市/代码变更, 且面板当日分区已切换,
+          用昨日清单取到的数据会写进今天的上下文。
+        * **不得超过 ``_code_stale_max_s``**: 否则上游长时间故障时会一直用数小时前的
+          清单, 期间新股/退市完全不可见。超界宁可本轮返回空, 让下一轮取干净清单。
+        """
+        if self._code_symbols is None or self._code_day != cn_today():
+            return None
+        # 用数据**真实取回时刻**判断年龄(不随降级刷新), 否则上界永不触发。
+        if (
+            self._code_stale_max_s > 0
+            and (time.monotonic() - self._code_data_at) > self._code_stale_max_s
+        ):
+            return None
+        return list(self._code_symbols)
 
     def _fetch_and_cache_code_symbols(self) -> list[str]:
-        """回源拉代码表并写缓存; 单飞语义: 并发时只放行一个请求, 其余等结果。"""
-        with self._code_lock:
-            if self._code_fetching:
-                # 已有线程在拉: 等它写完缓存(不重复回源), 超时则自行回源。
-                wait_for_other = True
+        """回源拉代码表并写缓存; 单飞: 并发时只放行一个请求, 其余等该世代结果。"""
+        with self._code_cv:
+            # 「判断 + 占位」在同一次持锁内完成, 结构上不存在 TOCTOU 空窗。
+            if self._code_inflight is not None:
+                waiting_for = self._code_inflight
+                i_am_holder = False
             else:
-                self._code_fetching = True
-                wait_for_other = False
+                self._code_generation += 1
+                waiting_for = self._code_generation
+                self._code_inflight = waiting_for
+                self._code_last_gen = None
+                self._code_last_result = None
+                i_am_holder = True
 
-        if wait_for_other:
-            deadline = time.monotonic() + self._timeout
-            while time.monotonic() < deadline:
-                time.sleep(0.05)
-                cached = self._cached_code_symbols()
-                if cached is not None:
-                    return cached
-                with self._code_lock:
-                    if not self._code_fetching:
-                        break  # 对方已结束但仍未写入(失败) → 由本线程回源
-            return self._fetch_and_cache_code_symbols()
+            if not i_am_holder:
+                return self._await_code_generation_locked(waiting_for)
 
+        # 只有持有者走到这里; 以下是**锁外**的网络请求。
         try:
             started = time.perf_counter()
             symbols = self._request_a_shares()
             elapsed_ms = (time.perf_counter() - started) * 1000
-            if symbols:
-                with self._code_lock:
-                    self._code_symbols = list(symbols)
-                    self._code_day = cn_today()
-                    self._code_at = time.monotonic()
+        except BaseException:
+            with self._code_cv:
+                self._code_last_gen = waiting_for
+                self._code_last_result = ("fail", None)
+                if self._code_inflight == waiting_for:
+                    self._code_inflight = None
+                self._code_cv.notify_all()
+            raise
+
+        with self._code_cv:
+            if symbols and waiting_for == self._code_generation:
+                now = time.monotonic()
+                self._code_symbols = list(symbols)
+                self._code_day = cn_today()
+                self._code_at = now
+                self._code_data_at = now  # 真实取回时刻(陈旧度上界的基准)
+                self._code_last_gen = waiting_for
+                self._code_last_result = ("ok", list(symbols))
                 logger.info(
                     "eltdx-http 代码表回源: %d 只, 耗时 %.0fms (缓存 %.0fs)",
-                    len(symbols), elapsed_ms, _CODE_CACHE_TTL_S,
+                    len(symbols), elapsed_ms, self._code_ttl_s,
                 )
-            return symbols
-        finally:
-            with self._code_lock:
-                self._code_fetching = False
+                outcome = list(symbols)
+            elif not symbols and waiting_for == self._code_generation:
+                # 回源失败(软失败返回空): 优先降级用**当日且未超陈旧上界**的旧清单,
+                # 避免把一次回源失败放大成整轮行情/分钟为空。
+                stale = self._stale_code_symbols_locked()
+                self._code_last_gen = waiting_for
+                if stale is not None:
+                    # 刷新 TTL: 降级结果按"一轮有效缓存"使用, 否则上游持续故障时每轮
+                    # 都会真打一次网关(__code_at 不变 → 缓存始终判过期), 既无退避也刷警告。
+                    # 代价: 上游恢复最多晚 TTL 被发现 —— 对当日近乎不变的代码表可接受。
+                    self._code_at = time.monotonic()
+                    self._code_last_result = ("ok", list(stale))
+                    logger.warning(
+                        "eltdx-http 代码表回源失败, 降级使用当日旧清单(%d 只, 缓存 %.0fs)",
+                        len(stale), self._code_ttl_s,
+                    )
+                    outcome = stale
+                else:
+                    self._code_last_result = ("fail", None)
+                    outcome = []
+            else:
+                # 世代已失效(close/reset 期间返回) → 结果与旧清单都不可信, 一律丢弃。
+                if symbols:
+                    logger.debug("eltdx-http 代码表回源结果已过期, 丢弃 (%d 只)", len(symbols))
+                self._code_last_gen = waiting_for
+                self._code_last_result = ("fail", None)
+                outcome = []
+            if self._code_inflight == waiting_for:
+                self._code_inflight = None
+            self._code_cv.notify_all()
+            return outcome
+
+    def _await_code_generation_locked(self, waiting_for: int) -> list[str]:
+        """等待某个在途世代出结果(调用方须已持有 ``_code_cv``)。
+
+        退出条件必须同时看**结果是否就绪**, 不能只看 ``_code_inflight`` —— 持有者是
+        先写结果、再清占位, 若只等占位清空会「结果已就绪却读不到」而误返回 ``[]``
+        (实测: 单飞正常但 6 个并发里 5 个拿到空)。
+
+        本函数**结构上不递归**: 无论成功/失败/超时/被作废, 都在此处直接返回,
+        故调用者必然有界返回。旧实现在超时后递归重入取数, 持有者卡死时等待者
+        会无限递归(实测 4 个线程全部无法退出)。
+
+        失败/超时时**优先返回当日的过期旧清单**(见 ``_stale_code_symbols_locked``),
+        避免把一次回源失败放大成整轮行情为空; 无旧清单才返回 ``[]``。
+        """
+        deadline = time.monotonic() + self._timeout
+        while True:
+            if self._code_last_gen == waiting_for and self._code_last_result is not None:
+                kind, syms = self._code_last_result
+                if kind == "ok":
+                    return list(syms or [])
+                stale = self._stale_code_symbols_locked()
+                if stale is not None:
+                    logger.debug(
+                        "eltdx-http 代码表同世代回源失败, 兜底使用当日旧清单(%d 只)", len(stale)
+                    )
+                    return stale
+                logger.debug("eltdx-http 代码表同世代回源失败且无旧清单, 本轮返回空")
+                return []  # 无旧清单: 不各自重拉, 由下一轮统一回源
+            if self._code_inflight != waiting_for:
+                # 在途世代已被 close/reset 作废 → 本轮返回空(缓存已被清, 旧清单不可信)
+                return []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stale = self._stale_code_symbols_locked()
+                if stale is not None:
+                    logger.warning(
+                        "eltdx-http 代码表等待回源超时(%.0fs), 兜底使用当日旧清单(%d 只)",
+                        self._timeout, len(stale),
+                    )
+                    return stale
+                logger.warning(
+                    "eltdx-http 代码表等待回源超时(%.0fs)且无旧清单, 本轮返回空", self._timeout
+                )
+                return []
+            self._code_cv.wait(timeout=min(remaining, 0.25))
 
     def _request_a_shares(self) -> list[str]:
         """真正发起一次代码表请求(软失败返回 [], 失败**不写缓存**以便下轮重试)。"""
