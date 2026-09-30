@@ -1032,8 +1032,17 @@ class QuoteService:
             return pl.DataFrame()
         df = df.select(keep)
         # 自定义源可能不提供 change_pct/change_amount, 按 last_price/prev_close 补算
-        # (TickFlow 路径在 _fetch_full_market_quotes 已算好, 此处只补缺失的)
-        if "change_pct" not in df.columns and "last_price" in df.columns and "prev_close" in df.columns:
+        # (TickFlow 路径在 _fetch_full_market_quotes 已算好, 此处只补缺失的)。
+        # 注意: 键"存在但整列为 None"也算未提供 —— eltdx 快照就返回 change_pct=None,
+        # 只判断列是否存在会让侧栏指数涨跌幅永远为 --, 故用全空判定。
+        if (
+            "last_price" in df.columns
+            and "prev_close" in df.columns
+            and (
+                "change_pct" not in df.columns
+                or df["change_pct"].null_count() == len(df)
+            )
+        ):
             # prev_close=0 → inf (非合法 JSON), prev_close=null → null; 用 when 守护
             df = df.with_columns(
                 pl.when(pl.col("prev_close") != 0)
@@ -1041,7 +1050,14 @@ class QuoteService:
                 .otherwise(None)
                 .alias("change_pct")
             )
-        if "change_amount" not in df.columns and "last_price" in df.columns and "prev_close" in df.columns:
+        if (
+            "last_price" in df.columns
+            and "prev_close" in df.columns
+            and (
+                "change_amount" not in df.columns
+                or df["change_amount"].null_count() == len(df)
+            )
+        ):
             df = df.with_columns(
                 (pl.col("last_price") - pl.col("prev_close")).alias("change_amount")
             )

@@ -56,6 +56,35 @@ logger = logging.getLogger(__name__)
 # 北京墙钟时区(UTC+8)。用固定偏移而非 zoneinfo: 中国无夏令时, 且避免 tzdata 依赖
 _CN_TZ = timezone(timedelta(hours=8))
 
+
+def _record_symbol(rec: Any) -> str | None:
+    """eltdx 记录 → 面板 symbol; 交易所信息不足时**拒绝推断**返回 None。
+
+    ``_snapshot_row``/``get_depth_batch`` 原先直接取 ``full_code or code``:
+    eltdx 的 ``full_code`` 由 ``exchange`` + ``code`` 拼接, ``exchange`` 缺失时
+    它就退化成裸 6 位代码, 再交给 ``to_panel_symbol`` 按首位猜交易所 ——
+    沪市指数(000001 上证指数)会被猜成 ``000001.SZ``, 北交所(920xxx)会被猜成
+    ``920000.SH``。这些错码既不是股票也不是指数, 却被当作股票写进 kline_daily,
+    与真实的平安银行(000001.SZ)撞成重复行, 令矩阵构建直接报错。
+
+    显式 ``exchange`` 是唯一可靠来源(与 ``_shares_row`` 同一口径); 取不到时
+    **不猜**, 由调用方丢弃该行 —— 宁可少一行, 不可把指数值写成股票价。
+    """
+    exchange = getattr(rec, "exchange", None)
+    code = getattr(rec, "code", None)
+    if exchange and code:
+        return to_panel_symbol(f"{exchange}{code}")
+    # 无显式 exchange 时, full_code 仍可能自带交易所标识: 前缀式 "sz000001"
+    # (eltdx 原生形态, 8 位)或后缀式 "000001.SZ"。两者都可解析;
+    # 只有裸 6 位代码(如 "000001")一律拒绝 —— 那正是误判的来源。
+    full_code = getattr(rec, "full_code", None)
+    if full_code:
+        text = str(full_code)
+        if "." in text or len(text) == 8:
+            return to_panel_symbol(text)
+    return None
+
+
 _DATASETS = ("daily", "realtime", "minute", "full_minute", "depth5", "financial", "adj_factor")
 
 # 日 K 列(面板 canonical 9 列, 含 quote_ts; 由 normalizer.DAILY_COLS 单源定义)
@@ -335,17 +364,9 @@ def _shares_row(rec: Any) -> dict | None:
     面板契约要**股**(``float_shares > 0`` 才参与 join_asof), 故 x10000。
     缺失/非正值的流通股本返回 None(下游会丢弃 0 值, 这里提前剔除更干净)。
 
-    symbol 解析**必须优先用显式 ``exchange``**: 裸 6 位代码走 ``to_panel_symbol`` 的
-    交易所推断(首位 6/9→SH, 其余→SZ)会把北交所(4xxxxx/8xxxxx/920xxx)误判成 .SZ
-    (实测 ``exchange='bj', code='430047'`` 会得到错误的 ``430047.SZ``)。
+    symbol 解析走 ``_record_symbol``: 显式 ``exchange`` 优先, 取不到时拒绝推断(见该函数)。
     """
-    code = getattr(rec, "code", None)
-    exchange = getattr(rec, "exchange", None)
-    symbol = None
-    if code and exchange:
-        symbol = to_panel_symbol(f"{exchange}{code}")  # 显式交易所优先, 唯一可靠的路径
-    if symbol is None:
-        symbol = to_panel_symbol(getattr(rec, "full_code", None) or code)
+    symbol = _record_symbol(rec)
     if symbol is None:
         return None
 
@@ -376,7 +397,7 @@ def _shares_row(rec: Any) -> dict | None:
 
 def _snapshot_row(snap: Any) -> dict | None:
     """单个 QuoteSnapshot → 面板 realtime 行; 必需字段缺失则丢弃(不伪造)。"""
-    symbol = to_panel_symbol(getattr(snap, "full_code", None) or getattr(snap, "code", None))
+    symbol = _record_symbol(snap)
     if symbol is None:
         return None
     last = _to_float(getattr(snap, "last_price", None))
@@ -660,20 +681,28 @@ class EltDxProvider:
             out: list[dict] = []
             for i in range(1, len(items)):
                 prev, cur = items[i - 1], items[i]
-                if not (start_d <= cur.date <= end_d):
+                # 事件日同样要兼容两种传输: 进程内是 date, HTTP 网关序列化成
+                # '2002-07-25' 字符串。直接用 cur.date 与 date 端点比较会抛
+                # TypeError('<=' not supported between date and str), 而该异常被
+                # 下方的单标的软失败吞掉 —— 表现为**全市场 5584 只全部失败、
+                # sync_adj 报告 "no new factors"**, 除权因子静默停更。
+                cur_date = _bar_date(getattr(cur, "date", None))
+                if cur_date is None:
+                    continue
+                if not (start_d <= cur_date <= end_d):
                     continue
                 scale_ratio = _safe_div(cur.hfq_scale, prev.hfq_scale)
                 if scale_ratio is None:
                     continue
                 div = _safe_div(cur.hfq_offset - prev.hfq_offset, cur.hfq_scale)
-                pc = _prev_close(closes, cur.date)
+                pc = _prev_close(closes, cur_date)
                 if pc is None or pc <= 0:
                     continue  # 无基准价则无法推导(不伪造)
                 denom = pc - (div or 0.0)
                 if denom <= 0:
                     continue
                 ex = scale_ratio * pc / denom
-                out.append({"symbol": sym, "trade_date": cur.date, "ex_factor": ex})
+                out.append({"symbol": sym, "trade_date": cur_date, "ex_factor": ex})
             return out
 
         workers = min(_ADJ_WORKERS, max(1, total))
@@ -939,7 +968,7 @@ class EltDxProvider:
 
         out: dict[str, dict] = {}
         for rec in records:
-            symbol = to_panel_symbol(getattr(rec, "full_code", None) or getattr(rec, "code", None))
+            symbol = _record_symbol(rec)
             if symbol is None:
                 continue
             row = _depth_row(rec)

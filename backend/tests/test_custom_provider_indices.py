@@ -163,6 +163,36 @@ def _disable_record_processing_side_effects(monkeypatch, service: qs.QuoteServic
     monkeypatch.setattr(service, "_evaluate_monitors", lambda daily, extra: None)
 
 
+def test_index_rec_with_null_change_pct_is_backfilled():
+    """change_pct **键存在但值为 None** 时必须补算, 否则侧栏指数涨跌幅永远显示 --。
+
+    回归防护(实测缺陷): eltdx 快照不提供 change_pct, 但其 realtime record 里带有
+    ``"change_pct": None`` 键。旧实现只判断 ``"change_pct" not in df.columns``,
+    列存在即跳过补算, 于是 /api/intraday/indices 返回 change_pct=null ——
+    前端 Layout 的侧栏指数条 (核心四只) 涨跌幅全部渲染成 "--"。
+    """
+    df = qs.QuoteService._build_index_quotes([
+        {
+            "symbol": "000001.SH", "last_price": 3838.14, "prev_close": 3830.45,
+            "change_pct": None, "change_amount": None, "amplitude": None,
+        }
+    ])
+
+    pct = df["change_pct"].to_list()[0]
+    assert pct is not None, "change_pct 为 None 时未补算"
+    # (3838.14 - 3830.45) / 3830.45 * 100 ≈ 0.2008 (百分数口径)
+    assert abs(pct - 0.2008) < 0.001, f"涨跌幅口径错误: {pct}"
+
+
+def test_index_rec_zero_prev_close_does_not_produce_inf():
+    """prev_close=0 时补算结果必须是 None, 不能是 inf (非法 JSON)。"""
+    df = qs.QuoteService._build_index_quotes([
+        {"symbol": "X.SH", "last_price": 10.0, "prev_close": 0, "change_pct": None}
+    ])
+
+    assert df["change_pct"].to_list() == [None]
+
+
 def test_failed_index_refresh_keeps_last_known_good_cache(monkeypatch):
     service = qs.QuoteService()
     _disable_record_processing_side_effects(monkeypatch, service)
