@@ -81,10 +81,24 @@ _FINANCE_RETRY_SLEEP_S = float(os.environ.get("ELTDX_FINANCE_RETRY_SLEEP", "0.05
 _MINUTE_WORKERS = int(os.environ.get("ELTDX_MINUTE_WORKERS", "8"))
 _MINUTE_MAX_BARS = int(os.environ.get("ELTDX_MINUTE_MAX_BARS", "12000"))  # ~50 交易日
 
-# 全量分钟「稳态增量轮」批量参数。实测 bars.get 批量上限很高(2000 只/请求 3.9s 足额),
-# 全市场 5578 只按 1000 分片共 6 批, 一遍约 11.7s(每只 3 根)。
+# 全量分钟「稳态增量轮」批量参数。实测 bars.get 批量上限很高, 且**无 80 限制**
+# (80/200/500/4000 只均足额返回)。全市场 5578 只按 1000 分片共 6 批, 一遍 ~10.1s。
 _INTRADAY_LATEST_BATCH = int(os.environ.get("ELTDX_INTRADAY_LATEST_BATCH", "1000"))
-_INTRADAY_LATEST_WORKERS = int(os.environ.get("ELTDX_INTRADAY_LATEST_WORKERS", "2"))
+# 稳态增量轮的并发线程数。
+#
+# 注意 bars_multi **没有 80 上限** —— 那是 `snapshots`(快照)专属的硬上限, 不要混淆:
+#   实测 bars.get 单请求: 80 只 196ms / 200 只 468ms / 500 只 1340ms / 4000 只 11.7s,
+#   均**足额返回**(仅 5578 只时回 5572, 是缺数据的退市/停牌标的, 非截断)。
+#   对照 snapshots 请求 81 只 -> 只回 80(静默截断)。
+#
+# 并发标定(盘中实测, 全市场 5578 只 x count=3, 每请求 80 只):
+#   线程 8 : 10.1~13.6s(波动大)   线程 12: 10.13/10.13/10.17s   线程 16: 10.04~10.16s
+# 即 **>=12 线程后锁死在 ~10.1s 的地板**, 再往上(24)无收益。
+# 该地板是上游 7709 主站的处理速率(~1.8ms/只串行), 不由本端并发决定 —— 实测把分片
+# 改成 500/700/1000/1400 全并行仍是 ~10.1s。故取 8: 已达地板附近, 且给主池(16 slot)
+# 留足余量(8 分钟 + 4 快照 + 1 盘口 = 13 < 16)。
+# 切勿设 >=16: 会与快照/盘口争抢主池 slot, 高峰反被排队拖慢。
+_INTRADAY_LATEST_WORKERS = int(os.environ.get("ELTDX_INTRADAY_LATEST_WORKERS", "8"))
 
 # 实时快照单次请求的代码数上限。**eltaX 硬上限为 80**(实测: 请求 81/100/400/700 均
 # 静默截断为 80 只; 请求 800/1600/3000 直接断连 os error 10054)。超限会导致
