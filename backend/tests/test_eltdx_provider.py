@@ -1659,3 +1659,84 @@ def test_finance_split_recursion_terminates_on_single_poison_symbol() -> None:
     assert "600519.SH" in df["symbol"].to_list()
     # 单只也失败 -> 该只被丢弃, 且**不得**无限递归(调用次数有限)
     assert len(fake.calls) < 50, "单只毒代码不得导致无限拆分"
+
+
+# ---------------------------------------------------------------------------
+# 运行时崩溃自愈(2026-09-30 盘中事故的回归防护)
+# ---------------------------------------------------------------------------
+
+_DEAD_MSG = "7709 runtime command channel is closed"
+
+
+def test_runtime_dead_detected_by_message() -> None:
+    """崩溃识别: 只有 "runtime command channel is closed" 才算运行时崩溃。
+
+    2026-09-30 盘中实测: 上游一次 `response timed out during connect` 之后,
+    eltaX 内部运行时进入 closed 状态, 此后**所有**接口(代码表/快照/K线/盘口)
+    一律报此错且**永不自愈**, 面板表现为全线静默为空 + 无限空转。
+    普通业务错误(如 invalid code)不得误判为崩溃而重置连接池。
+    """
+    from app.plugins.eltdx.client import EltDxClient
+
+    assert EltDxClient._is_runtime_dead(RuntimeError(_DEAD_MSG)) is True
+    assert EltDxClient._is_runtime_dead(RuntimeError("invalid code: sh999999")) is False
+    assert EltDxClient._is_runtime_dead(RuntimeError("station error")) is False
+
+
+def test_call_rebuilds_pool_and_retries_once_on_runtime_death() -> None:
+    """崩溃后必须**重建连接池并重试一次** —— 否则旧池永久不可用, 服务无限空转。
+
+    这是本次事故的核心修复: 换新池后能立刻恢复取数。
+    """
+    from app.plugins.eltdx.client import EltDxClient
+
+    c = EltDxClient()
+    calls: list[int] = []
+
+    class _Boom:
+        """首次调用抛"运行时崩溃", 第二次成功(模拟重建后的新池)。"""
+
+        def __call__(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError(_DEAD_MSG)
+            return "ok"
+
+    assert c._call(_Boom()) == "ok"
+    assert len(calls) == 2, "必须在重建后重试一次"
+    assert c._client is None, "崩溃后旧池必须被作废(下次调用重建)"
+
+
+def test_call_retries_only_once_under_sustained_failure() -> None:
+    """上游持续崩溃时**只重试一次**, 不得打成重试风暴。"""
+    from app.plugins.eltdx.client import EltDxClient
+
+    c = EltDxClient()
+    calls: list[int] = []
+
+    def _always_dead():
+        calls.append(1)
+        raise RuntimeError(_DEAD_MSG)
+
+    with pytest.raises(RuntimeError):
+        c._call(_always_dead)
+    assert len(calls) == 2, f"应只尝试 2 次(原始+重试), 实际 {len(calls)}"
+
+
+def test_call_does_not_retry_business_errors() -> None:
+    """普通业务错误不触发重建/重试(否则会对限流类错误雪上加霜)。"""
+    from app.plugins.eltdx.client import EltDxClient
+
+    c = EltDxClient()
+    sentinel = object()
+    c._client = sentinel
+    calls: list[int] = []
+
+    def _biz_error():
+        calls.append(1)
+        raise RuntimeError("invalid code: sh999999")
+
+    with pytest.raises(RuntimeError):
+        c._call(_biz_error)
+    assert len(calls) == 1, "业务错误不得重试"
+    assert c._client is sentinel, "业务错误不得作废连接池"

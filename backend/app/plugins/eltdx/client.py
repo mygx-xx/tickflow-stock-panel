@@ -133,6 +133,60 @@ class EltDxClient:
                 )
             return self._client
 
+    @staticmethod
+    def _is_runtime_dead(err: BaseException | str) -> bool:
+        """判断异常是否为 eltaX **运行时整体崩溃**(池已不可用, 必须重建)。
+
+        实测(2026-09-30 盘中): 上游一次 ``response timed out during connect`` 之后,
+        eltaX 内部运行时进入 closed 状态, 此后**所有**接口(含 all_a_shares /
+        snapshots / bars)一律报 ``7709 runtime command channel is closed``,
+        且**永不自愈** —— 面板表现为行情/分钟/盘口全线静默为空并无限空转。
+        eltaX 未暴露任何健康状态字段(仅有 close), 故只能按错误文本识别。
+        """
+        msg = str(err)
+        return "runtime command channel is closed" in msg
+
+    def reset(self, *, reason: str = "") -> None:
+        """丢弃当前连接池, 使下次调用重建(用于运行时崩溃后的自愈)。
+
+        与 ``close()`` 的区别: 语义是"作废并重建", 会记录 warning 供显性观测;
+        崩溃场景下 close 也可能抛异常, 故此处一律吞掉并保证指针已清空。
+        """
+        with self._lock:
+            client, self._client = self._client, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception as e:
+                logger.debug("eltdx reset close failed: %s", e)
+        if reason:
+            logger.warning("eltdx 连接池已重建(原因: %s)", reason)
+
+    def _heal_if_dead(self, err: BaseException) -> bool:
+        """运行时崩溃时作废连接池(下次调用自动重建)。返回是否判定为崩溃。
+
+        调用方在 ``except`` 里调用本方法, 并按需决定是否重试一次。
+        """
+        if not self._is_runtime_dead(err):
+            return False
+        self.reset(reason=f"runtime 崩溃: {str(err)[:60]}")
+        return True
+
+    def _call(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """执行一次 eltdx 调用; 遇运行时崩溃则**重建连接池并重试一次**。
+
+        这是自愈的核心: 崩溃后旧池永久不可用, 必须换新池才能真正恢复 ——
+        否则面板会一直"静默返回空"并无限空转(实测 2026-09-30 盘中事故)。
+        仅重试一次, 避免上游持续故障时打成重试风暴。
+        """
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if not self._heal_if_dead(e):
+                raise
+            logger.warning("eltdx 运行时崩溃后重试一次: %s", str(e)[:60])
+            return fn(*args, **kwargs)
+
     def close(self) -> None:
         """关闭连接池(loader 重建注册表时会调用)。"""
         with self._lock:
@@ -152,7 +206,7 @@ class EltDxClient:
     def all_a_shares(self) -> list[str]:
         """全市场 A 股代码(面板格式); 失败返回 []。"""
         try:
-            raw = self._ensure().codes.all_a_shares()
+            raw = self._call(self._ensure().codes.all_a_shares)
         except Exception as e:
             logger.warning("eltdx all_a_shares 失败: %s", e)
             return []
@@ -164,7 +218,7 @@ class EltDxClient:
     def all_indices(self) -> list[str]:
         """全市场指数代码(面板格式); 失败返回 []。"""
         try:
-            raw = self._ensure().codes.all_indices()
+            raw = self._call(self._ensure().codes.all_indices)
         except Exception as e:
             logger.warning("eltdx all_indices 失败: %s", e)
             return []
@@ -191,7 +245,9 @@ class EltDxClient:
         for start in range(0, want, page):
             take = min(page, want - start)
             try:
-                series = self._ensure().bars.get(
+                # 经 _call 包裹: 运行时崩溃时重建连接池并重试一次(自愈)
+                series = self._call(
+                    self._ensure().bars.get,
                     code,
                     period=period,
                     count=take,
@@ -231,8 +287,12 @@ class EltDxClient:
         if not codes:
             return []
         try:
-            resp = self._ensure().bars.get(
-                [c for c, _ in codes], period=period, count=max(1, int(count)), adjust=None
+            resp = self._call(
+                self._ensure().bars.get,
+                [c for c, _ in codes],
+                period=period,
+                count=max(1, int(count)),
+                adjust=None,
             )
         except Exception as e:
             logger.warning("eltdx bars_multi 失败(%d 只, period=%s): %s", len(codes), period, e)
@@ -300,10 +360,13 @@ class EltDxClient:
         out: list[Any] = []
         try:
             if len(chunks) == 1:
-                return list(self._ensure().quotes.get_snapshots(chunks[0]) or [])
+                return list(self._call(self._ensure().quotes.get_snapshots, chunks[0]) or [])
             # 多片: 并发取, 单片的异常不影响其他片(隔离而非整批失败)
             with ThreadPoolExecutor(max_workers=min(self._max_workers, len(chunks))) as pool:
-                futures = [pool.submit(self._ensure().quotes.get_snapshots, ch) for ch in chunks]
+                futures = [
+                    pool.submit(self._call, self._ensure().quotes.get_snapshots, ch)
+                    for ch in chunks
+                ]
                 for fut in as_completed(futures):
                     try:
                         out.extend(list(fut.result() or []))
@@ -326,7 +389,7 @@ class EltDxClient:
         前复权偏移量, hfq_offset 增量除以 hfq_scale 才是真实每股分红(见 provider)。
         """
         try:
-            resp = self._ensure().corporate.adjustment_factors(code)
+            resp = self._call(self._ensure().corporate.adjustment_factors, code)
         except Exception as e:
             logger.warning("eltdx adjustment_factors 失败 %s: %s", code, e)
             return []
@@ -345,7 +408,7 @@ class EltDxClient:
         """
         if not codes:
             return None
-        return self._ensure().corporate.finance_batch(list(codes))
+        return self._call(self._ensure().corporate.finance_batch, list(codes))
 
     # ---- 五档盘口 -------------------------------------------------------
 
@@ -358,4 +421,4 @@ class EltDxClient:
         codes = [c for c in (to_eltdx_code(s) for s in symbols) if c]
         if not codes:
             return None
-        return self._ensure().quotes.get_depth(codes)
+        return self._call(self._ensure().quotes.get_depth, codes)
