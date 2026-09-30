@@ -84,3 +84,34 @@ body {
   from { transform: translateX(0); }
   to { transform: translateX(-50%); }
 }
+
+/* === 自选页现价闪动 ===
+ * 仅当该股价格相对上一次快照发生变化时触发一次 (见 lib/useTickFlash)。
+ * 用背景色 + 短暂保留, 不改变文字色 —— 文字色始终跟随涨跌 (priceColorClass),
+ * 闪烁若也改文字色会与其冲突, 且闪完需要回落到同一语义色。
+ * 涨用 bull(红) / 跌用 bear(绿), 与 A 股红涨绿跌一致; 平盘不闪。
+ * animation-fill-mode: both 保证动画结束后回落到透明背景而非突然跳变。
+ */
+@keyframes tick-flash-up {
+  0%   { background-color: hsl(var(--bull) / 0.28); }
+  100% { background-color: transparent; }
+}
+@keyframes tick-flash-down {
+  0%   { background-color: hsl(var(--bear) / 0.28); }
+  100% { background-color: transparent; }
+}
+
+.tick-flash-up {
+  animation: tick-flash-up 0.6s ease-out both;
+}
+.tick-flash-down {
+  animation: tick-flash-down 0.6s ease-out both;
+}
+
+/* 无障碍: 用户要求减少动态效果时关闭闪动 (WCAG 2.3.3) */
+@media (prefers-reduced-motion: reduce) {
+  .tick-flash-up,
+  .tick-flash-down {
+    animation: none;
+  }
+}

@@ -11,6 +11,7 @@ import { storage } from '@/lib/storage'
 import { fmtPrice, fmtPct, fmtBigNum, priceColorClass, formatExtNumber } from '@/lib/format'
 import { cn } from '@/lib/cn'
 import { computeGroupPcts, loadGroupStatsConfig, type GroupStatsConfigPatch } from '@/lib/watchlistGroupStats'
+import { useTickFlash, tickFlashCls } from '@/lib/useTickFlash'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { StockPreviewDialog } from '@/components/StockPreviewDialog'
@@ -431,6 +432,22 @@ function RealtimeDot({ title = '实时监控中' }: { title?: string }) {
       {/* 内圈: 实心点 + 微辉光 */}
       <span className="relative inline-flex rounded-full h-2 w-2 bg-accent shadow-[0_0_5px_rgba(61,214,140,0.6)]" />
     </span>
+  )
+}
+
+// ===== 现价单元格 (带变动闪动) =====
+// 必须是独立组件: 闪动状态是 per-symbol 的 hook, 不能在 renderCell 的 map 回调里调用
+// hook。价格变动检测见 lib/useTickFlash。
+function PriceCell({ price, pct, className }: {
+  price: number | null | undefined
+  pct: number | null | undefined
+  className: string
+}) {
+  const flash = useTickFlash(price)
+  return (
+    <td className={cn(className, priceColorClass(pct), tickFlashCls(flash))}>
+      {fmtPrice(price)}
+    </td>
   )
 }
 
@@ -1820,7 +1837,7 @@ export function Watchlist() {
                 // 实时行情列：price/pct/amount 使用 rt_ 回退（自选页有实时推送）
                 const numCls = 'px-2 py-1.5 text-right num tabular-nums'
                 if (key === 'price') {
-                  return <td className={`${numCls} ${priceColorClass(pct)}`}>{fmtPrice(price)}</td>
+                  return <PriceCell price={price} pct={pct} className={numCls} />
                 }
                 if (key === 'pct') {
                   return <td className={`${numCls} ${priceColorClass(pct)}`}>{fmtPct(pct)}</td>
