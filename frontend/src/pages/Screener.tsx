@@ -674,9 +674,27 @@ export function Screener() {
   // 重新运行策略：重载策略文件 + 重跑全部策略，刷新符合条件的个股
   const reloadStrategies = useMutation({
     mutationFn: api.strategyReload,
-    onSuccess: () => {
+    onSuccess: async () => {
+      // 重载可能让磁盘上已删除的策略从引擎消失。必须先用「重载后」的最新列表过滤策略池
+      // 再重跑: 否则会把已失效的 ID 当 strategy_ids 发给 /run_all, 报
+      // 404 unknown strategies (2026-10-01: data/strategies/custom 里 folk_w_* 已删,
+      // 池内仍残留, 点重载即触发)。
       qc.invalidateQueries({ queryKey: ['screener-strategies'] })
-      if (asOf) requestRunAll({ date: asOf })
+      try {
+        const fresh = await qc.fetchQuery({
+          queryKey: [...QK.screenerStrategies('all'), 'all'],
+          queryFn: () => api.screenerStrategies(undefined, 'all'),
+          staleTime: 0,
+        })
+        const byId = new Map(fresh.presets.map(p => [p.id, p]))
+        const dailyIds = pool.filter(
+          id => byId.has(id) && !(byId.get(id)?.timeframes?.includes('1m') ?? false),
+        )
+        // 本次 fetchQuery 会刷新 strategies 查询 → 下方 prune effect 顺带清掉池中失效项
+        if (asOf && dailyIds.length > 0) requestRunAll({ date: asOf, strategyIds: dailyIds })
+      } catch {
+        // 拿不到最新列表时宁可不重跑, 也不把可能已失效的 ID 发给后端
+      }
       // 分钟策略: 重置去重 key, 策略列表失效重取后 effect 重新触发批量计算
       minuteRunDateRef.current = null
     },
