@@ -119,6 +119,9 @@ _FINANCE_BATCH = int(os.environ.get("ELTDX_FINANCE_BATCH", "20"))
 # 失败批的本地重试次数与间隔; 重试仍失败则二分拆分(见 _finance_records)
 _FINANCE_RETRIES = int(os.environ.get("ELTDX_FINANCE_RETRIES", "2"))
 _FINANCE_RETRY_SLEEP_S = float(os.environ.get("ELTDX_FINANCE_RETRY_SLEEP", "0.05"))
+# f10 报表单标的请求节流(上游是逐标的接口, 无批量)。实测单请求约 40ms,
+# 取 0.05s 留出余量; 全市场 5500 只约 5 分钟/表。
+_F10_INTERVAL_S = float(os.environ.get("ELTDX_F10_INTERVAL", "0.05"))
 
 # 分钟并发(独立于日K, 避免瞬时占满连接池)与单标的根数上限
 _MINUTE_WORKERS = int(os.environ.get("ELTDX_MINUTE_WORKERS", "8"))
@@ -310,12 +313,35 @@ def _depth_row(rec: Any) -> dict | None:
     }
 
 
+def _today_wallclock_ms(hour: int, minute: int, sec: int, micro: int = 0) -> int | None:
+    """当日北京墙钟 → 毫秒时间戳; 非交易日返回 None。
+
+    上游紧凑时间不含日期, 只能按"当日"还原。但休市日根本没有"当日"可言 ——
+    此时返回 None 表示日期未知, 不伪造归属。
+
+    交易日判定走 app.services.trading_day 探针链 (fuyao 日历 → tickflow 时间戳),
+    结论带 TTL 缓存, 单次调用负担仅为一次字典查询。探针返回 None (未知) 时维持
+    还原行为: 未知不放行会丢掉盘中真实行情, 且读取侧与 final 边界两道防线仍在。
+    """
+    from app.services import trading_day
+
+    if trading_day.is_trading_day() is False:
+        return None
+    try:
+        dt = datetime(date.today().year, date.today().month, date.today().day,
+                      hour, minute, sec, micro, tzinfo=_CN_TZ)
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
 def _hhmmss_ts(raw: Any) -> int | None:
     """当日紧凑时间(``HHMMSS`` 6 位 或 ``HHMMSScc`` 8 位) → 当日北京墙钟毫秒时间戳。
 
     盘口记录的 ``update_time_raw`` 实测为 **6 位**(如 ``153252`` = 15:32:52),
     与快照的 8 位(``HHMMSScc``, 末 2 位为百分秒)不同, 故按长度自适应:
     6 位 → 直接 HHMMSS; 8 位 → 前 6 位 HHMMSS + 末 2 位作秒的小数。
+    与 _snapshot_ts 同纪律: 休市日无"当日"可归属, 返回 None 而非伪时间戳。
     """
     if raw is None:
         return None
@@ -335,12 +361,7 @@ def _hhmmss_ts(raw: Any) -> int | None:
     hour, minute, sec = int(head[0:2]), int(head[2:4]), int(head[4:6])
     if hour > 23 or minute > 59 or sec > 59:
         return None
-    today = date.today()
-    try:
-        dt = datetime(today.year, today.month, today.day, hour, minute, sec, micro, tzinfo=_CN_TZ)
-    except ValueError:
-        return None
-    return int(dt.timestamp() * 1000)
+    return _today_wallclock_ms(hour, minute, sec, micro)
 
 
 def _safe_div(a: Any, b: Any) -> float | None:
@@ -404,6 +425,132 @@ def _shares_row(rec: Any) -> dict | None:
     }
 
 
+# ---- 三大报表: f10 T 代码口径表 ----------------------------------------
+#
+# 背景: f10.finance_report 的列名是不透明 ``T***`` 代码, eltdx 包内无代码→名称字典。
+# 这里的映射**不是靠算术反推**, 而是用扶摇(同花顺)同期数据逐字段交叉验证 +
+# 会计恒等式自证得出的(2026-10-01 实测 3 标的 x 2 表, 见 docs/eltdx-capability-audit.md §6)。
+#
+# ⚠️ **同一 T 代码在不同行业模板下含义不同**, 必须按 ``nhytype`` 分流:
+#   nhytype=0 通用(工商) / 1 银行 / 3 保险。实测反例: ``T039`` 在茅台是总资产
+#   (3090.5 亿, 与扶摇一致), 在平安银行只有 104.6 亿而扶摇总资产 60287.9 亿 ——
+#   差 576 倍。**用全局固定表映射金融股会静默写入错误总资产**。
+# ``T041`` 更危险: 通用族是"现金净增加", 金融族是"capex" —— **语义互换**。
+#
+# 只映射已验证的合计行; 金融族的明细科目(流动资产/应收/存货等)上游无稳定对应,
+# 一律不映射(留空), 不用猜测值填充。
+_F10_TEMPLATE_GENERAL = 0  # nhytype=0 通用
+_F10_BALANCE_MAPS: dict[str, dict[str, str]] = {
+    "general": {
+        "total_assets": "T039",
+        "total_liabilities": "T062",
+        "total_equity": "T071",
+        "total_current_assets": "T020",
+        "total_non_current_assets": "T038",
+        "cash_and_equivalents": "T007",
+        "accounts_receivable": "T010",
+    },
+    "financial": {
+        "total_assets": "T048",
+        "total_liabilities": "T083",
+        "total_equity": "T093",
+    },
+}
+_F10_CASHFLOW_MAPS: dict[str, dict[str, str]] = {
+    "general": {
+        "net_operating_cash_flow": "T017",
+        "net_investing_cash_flow": "T029",
+        "net_financing_cash_flow": "T038",
+        "net_cash_change": "T041",
+        "capex": "T024",
+    },
+    "financial": {
+        "net_operating_cash_flow": "T033",
+        "net_investing_cash_flow": "T044",
+        "net_financing_cash_flow": "T055",
+        "net_cash_change": "T058",
+        "capex": "T041",
+    },
+}
+# f10 表名 → 面板表名 / 口径表
+_F10_STATEMENTS = {
+    "balance_sheet": ("zcfzb", _F10_BALANCE_MAPS),
+    "cash_flow": ("xjllb", _F10_CASHFLOW_MAPS),
+}
+
+
+def _f10_template_family(nhytype: Any) -> str:
+    """``nhytype`` → 模板族名。非 0(银行 1 / 保险 3 / 其它) 一律按金融族处理。
+
+    fail-safe 取向: 认不出行业时按**金融族**取其已验证的合计行, 而不是按通用族 ——
+    通用族的 ``T039`` 落在金融报表上是个无关的小数字, 会静默产出错误总资产。
+    金融族映射在通用股上只会取到 None(列不存在/为空), 随后由多源合并保留原值,
+    不会污染数据。
+    """
+    value = _to_float(nhytype)
+    if value is not None and int(value) == _F10_TEMPLATE_GENERAL:
+        return "general"
+    return "financial"
+
+
+def _f10_statement_rows(
+    result: Any, table: str, symbol: str
+) -> list[dict]:
+    """``f10.finance_report`` 响应 → 面板财务行(按报告期)。
+
+    只输出**口径表里已声明的列**; 未声明字段不落盘(避免把不透明代码写进 parquet)。
+    ``period_end`` 取 ``rq``(报告期, 实测 2026-06-30 形态); 无 ``rq`` 的行丢弃 ——
+    面板合并逻辑按 (symbol, period_end) 归组, 缺报告期的行无意义。
+    """
+    spec = _F10_STATEMENTS.get(table)
+    if spec is None or result is None:
+        return []
+    _, maps = spec
+
+    result_sets = getattr(result, "result_sets", None) or []
+    if not result_sets:
+        return []
+    first = result_sets[0]
+    columns = list(getattr(first, "columns", None) or [])
+    if not columns:
+        return []
+    raw_rows = list(getattr(first, "rows", None) or [])
+
+    # 行业模板判别: 实测第 2 张结果集带 nhytype(第 1 张是宽表, 无此字段)
+    nhytype = None
+    for extra in result_sets[1:]:
+        for row in (getattr(extra, "rows", None) or []):
+            candidate = getattr(row, "nhytype", None)
+            if candidate is not None:
+                nhytype = candidate
+                break
+        if nhytype is not None:
+            break
+    family = _f10_template_family(nhytype)
+    field_map = maps[family]
+
+    out: list[dict] = []
+    for row in raw_rows:
+        period = getattr(row, "rq", None)
+        if not period:
+            continue
+        rec: dict = {
+            "symbol": symbol,
+            "period_end": str(period),
+            "announce_date": None,  # 上游不提供公告日, 留空由合并逻辑按报告期处理
+        }
+        for field, code in field_map.items():
+            if code not in columns:
+                continue
+            value = _to_float(getattr(row, code, None))
+            if value is not None:
+                rec[field] = value
+        # 除报告期外无任何有效数值 → 丢弃(如 lrb 的 3 列空行)
+        if len(rec) > 3:
+            out.append(rec)
+    return out
+
+
 def _snapshot_row(snap: Any) -> dict | None:
     """单个 QuoteSnapshot → 面板 realtime 行; 必需字段缺失则丢弃(不伪造)。"""
     symbol = _record_symbol(snap)
@@ -439,11 +586,21 @@ def _snapshot_row(snap: Any) -> dict | None:
 
 
 def _snapshot_ts(time_raw: Any) -> int | None:
-    """快照时间 → 毫秒时间戳。
+    """快照时间 → 毫秒时间戳; 无法确定**真实日期**时返回 None。
 
     eltdx ``time_raw`` 是主站的"当日 HHMMSSmmm"紧凑整数(如 15330366 = 15:33:03.366),
-    无日期部分。契约允许缺失时退本地时间, 故这里按**北京墙钟当日**还原为毫秒戳;
-    无法解析时返回 None(下游退本地时间)。
+    **不含日期部分**。历史上这里无条件按本地当日还原, 会使休市日返回的上一交易日
+    冻结快照获得"今天"的时间戳 (2026-10-01 国庆实测: 上游停在 09-30 14:59:59.990,
+    被还原成 10-01 14:59:59.990)。该伪时间戳同时击穿两道防线:
+
+    1. quote_service._build_daily 按 quote_ts 过滤非当日记录 (专治停牌股回归),
+       因时间戳已变成当日而失效;
+    2. final 定版边界比较只看时刻大小, 伪时间戳晚于当日边界 → 陈旧快照被当定版落盘,
+       再用 cn_today() 打戳造出与上一交易日逐行相同的假分区。
+
+    按 CONTRIBUTING「provider 负责把供应商字段转换为内部标准格式」与「缺少能力时
+    fail-closed, 禁止静默换用错误口径」, 无法确定日期时返回 None (= 日期未知),
+    由服务层的 filter_halt_days 等既有防线兜底, 而不是伪造一个日期归属。
     """
     if time_raw is None:
         return None
@@ -465,12 +622,7 @@ def _snapshot_ts(time_raw: Any) -> int | None:
     if hour > 23 or minute > 59 or sec > 59:
         return None
     ms = int(frac) * 10  # 百分秒 → 毫秒
-    today = date.today()
-    try:
-        dt = datetime(today.year, today.month, today.day, hour, minute, sec, ms * 1000)
-    except ValueError:
-        return None
-    return int(dt.timestamp() * 1000)
+    return _today_wallclock_ms(hour, minute, sec, ms * 1000)
 
 
 class _EltDxConfig:
@@ -1001,39 +1153,48 @@ class EltDxProvider:
                 out[symbol] = row
         return out
 
-    # ---- 财务(shares 表) -------------------------------------------------
+    # ---- 财务 -------------------------------------------------------------
 
     def get_financials(
         self, table: str, symbols: list[str], latest_only: bool = False
     ) -> pl.DataFrame:
-        """财务数据。**只实现 ``shares`` 表**; 其余表返回空帧(由面板多源合并保留 TickFlow 值)。
+        """财务数据: ``shares`` / ``balance_sheet`` / ``cash_flow``; 其余返回空帧。
 
-        ## 为什么只接 shares
-        面板要 5 张表(metrics/income/balance_sheet/cash_flow/shares):
+        ## 各表来源与口径
 
-        * ``shares`` ← ``corporate.finance_batch`` 的 ``zong_gu_ben`` / ``liu_tong_gu_ben``,
-          字段名**明确**且面板有真实下游(``share_capital.apply_historical_float_shares``
-          驱动历史换手率 ``turnover_rate = volume x 10000 / float_shares``)。
-        * ``metrics`` / 三大报表 ← ``f10.finance_report`` 返回的是**不透明代码**
-          (``T007`` / ``T039`` / ``N000``…), eltdx 包内**不含代码→名称字典**。会计恒等式
-          虽自洽(T039-T077≈总负债), 但 40+ 字段只能靠算术反推, 错位会静默产出错误财务因子,
-          且合并逻辑用 ``drop_nulls().last()`` **无法用 null 修正**。按"口径不明确不接"原则跳过。
+        * ``shares`` ← ``corporate.finance_batch``(字段名明确, 见 ``_shares_row``)。
+        * ``balance_sheet`` ← ``f10.finance_report('zcfzb')``
+        * ``cash_flow`` ← ``f10.finance_report('xjllb')``
+          两者的 ``T***`` 代码含义由 ``_F10_*_MAP`` 声明, 按 ``nhytype`` 分通用/金融两族。
+        * ``income`` ← **上游无数据**, 恒返回空帧, 由多源合并保留 fuyao 值:
+          实测 ``lrb`` 只回 3 列(``rtype``/``nhytype``/``zqname``)无数值, 而
+          ``zcfzb``/``xjllb`` 正常回 102/71 列、99/69 列; 试过 16 个候选
+          ``report_type`` 取值均无数值 —— 这是**上游缺口**, 不是客户端解析问题。
+        * ``metrics`` ← 未接入(指标接口为单股单期, 面板 metrics 走 fuyao)。
 
-        ## 单位(实测 eltdx 3.2.2)
-        ``FinanceRecord`` 的 ``*_raw_float`` 以**万股 / 万元**计(茅台总股本 125008.15625
-        万股 = 12.5 亿股; 净资产 251253600 万元 = 2.51 万亿元)。面板契约要**股**(且
-        ``float_shares > 0`` 才有效), 故这里 x10000。
+        ## 为什么现在敢接三大报表
 
-        ``period_end``: ``FinanceRecord`` 只给 ``updated_date``(实测 2026-08-15, 是**公告日**),
-        无报告期字段 —— 但面板的 PIT 逻辑正是 ``available_date = announce_date or period_end``,
-        故以 ``updated_date`` 作 ``period_end`` 与 ``announce_date`` 同值, 语义等价且不引入
-        未来函数(该期数据在公告日才可用)。
+        早前按"口径不明确不接"跳过的理由是不透明代码只能靠算术反推。现已用
+        **扶摇同期数据逐字段交叉验证 + 会计恒等式自证**(2026-10-01, 3 标的 x 2 表):
+        9 个资产负债表字段与扶摇**逐位精确相等**, 恒等式在通用/金融两族上均成立。
+        关键前提是 ``nhytype`` 模板判别 —— 缺了它, 金融股会被通用族映射静默写错
+        (``T039`` 在平安银行仅 104.6 亿, 而真实总资产 60287.9 亿)。
+
+        ## 单位
+        ``f10`` 的金额已是**元**(实测茅台总资产 309050784569.31), 与面板契约一致,
+        无需换算。``shares`` 另见 ``_shares_row``(万股 → 股)。
         """
-        if table != "shares":
+        if table == "shares":
+            return self._shares_table(symbols)
+        if table not in _F10_STATEMENTS:
             logger.info(
-                "eltdx get_financials: 表 %s 未接入(仅 shares), 返回空帧交由多源合并保留原值", table
+                "eltdx get_financials: 表 %s 未接入, 返回空帧交由多源合并保留原值", table
             )
             return pl.DataFrame()
+        return self._statement_table(table, symbols, latest_only=latest_only)
+
+    def _shares_table(self, symbols: list[str]) -> pl.DataFrame:
+        """``shares`` 表: ``corporate.finance_batch`` → 面板股本行。"""
         codes = [s for s in symbols if to_eltdx_code(s)]
         if not codes:
             return pl.DataFrame()
@@ -1061,6 +1222,52 @@ class EltDxProvider:
         df = pl.DataFrame(rows, infer_schema_length=None)
         keep = [c for c in _SHARES_COLUMNS if c in df.columns]
         return df.select(keep).unique(subset=["symbol", "period_end"], keep="last")
+
+    def _statement_table(
+        self, table: str, symbols: list[str], *, latest_only: bool
+    ) -> pl.DataFrame:
+        """``balance_sheet`` / ``cash_flow``: 逐标的取 f10 报表(上游为单标的接口)。
+
+        逐标的失败**按标的隔离**(不拖垮整表), 与 daily 的按批隔离同思路:
+        面板的备份源补齐逻辑正是靠"某标的没取到"来决定是否回退, 单只失败必须
+        表现为该标的缺行, 而不是整表抛异常。
+        """
+        report_type, _ = _F10_STATEMENTS[table]
+        panels = [s for s in symbols if to_eltdx_code(s)]
+        if not panels:
+            return pl.DataFrame()
+        rows: list[dict] = []
+        failed = 0
+        for i, symbol in enumerate(panels):
+            if i:
+                time.sleep(_F10_INTERVAL_S)
+            code = to_eltdx_code(symbol)
+            try:
+                result = self._client.finance_report(code, report_type)
+            except Exception as e:  # 单标的失败只隔离该只
+                failed += 1
+                logger.debug("eltdx f10 %s %s 失败: %s", report_type, symbol, e)
+                continue
+            parsed = _f10_statement_rows(result, table, symbol)
+            if not parsed:
+                continue
+            if latest_only:
+                parsed = [max(parsed, key=lambda r: r["period_end"])]
+            rows.extend(parsed)
+        if failed:
+            logger.info(
+                "eltdx f10 %s: %d/%d 只标的失败(已隔离), 成功 %d 只",
+                report_type, failed, len(panels), len(panels) - failed,
+            )
+        if not rows:
+            logger.warning(
+                "eltdx f10 %s: 未取到有效行(请求 %d 只)", report_type, len(panels)
+            )
+            return pl.DataFrame()
+        df = pl.DataFrame(rows, infer_schema_length=None)
+        return df.unique(subset=["symbol", "period_end"], keep="last").sort(
+            ["symbol", "period_end"]
+        )
 
     def _finance_records(self, chunk: list[str], stats: dict[str, int]) -> list[Any]:
         """取一批财务记录, 失败时**重试**并最终**拆半递归**。

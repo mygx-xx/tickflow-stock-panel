@@ -364,12 +364,18 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
     `bars.get` 批量 —— 实测 1000 只/片、全市场 5578 只约 10s, 节奏 ~12s)、
     `depth5`(`quotes.get_depth` 各 5 档; volume 单位为手, 封死涨跌停时量为 **0 需原样保留**,
     失败按契约**抛异常**由服务按批隔离, 不跨源回退)、
-    `financial`(**只实现 `shares` 表**: `corporate.finance_batch` 的总/流通股本, eltdx 单位为
-    **万股**故 provider 内 x10000; `period_end`/`announce_date` 取 `updated_date`。
-    下游驱动 `share_capital` 的历史换手率 `volume x 10000 / float_shares`)、
+    `financial`(**`shares` + `balance_sheet` + `cash_flow`**:
+    `shares` 走 `corporate.finance_batch` 的总/流通股本, eltdx 单位为**万股**故 provider 内
+    x10000, `period_end`/`announce_date` 取 `updated_date`, 下游驱动 `share_capital` 的历史
+    换手率 `volume x 10000 / float_shares`;
+    `balance_sheet`/`cash_flow` 走 `f10.finance_report(zcfzb/xjllb)`, 列名是不透明 `T***`,
+    口径表按 **`nhytype`** 分通用/金融两族 —— 同一 T 代码在两族下含义不同
+    (`T039` 通用族是总资产, 金融族只有 `T048` 才是), 映射表与验证方式见
+    [eltdx-capability-audit.md](./eltdx-capability-audit.md) §6.3)、
     `adj_factor`(除权因子**单事件比值**: 由 `(hfq_scale, hfq_offset)` 推导, 公式与标定见下)
-  - **未接入** `metrics` / `income` / `balance_sheet` / `cash_flow` 四张财务表
-    (f10 报表字段见下, 未声明即回退或由多源合并保留 TickFlow 值)
+  - **未接入** `metrics` / `income` 两张财务表 — `income` 是**上游缺口**
+    (`lrb` 只回 3 列名称行无数值, 试过 16 个 report_type 取值), 故 provider 返回空帧交
+    多源合并保留其它源的值; `metrics` 的指标接口是单股单期, 全市场成本过高
   - `client.py` — 进程内连接池封装 + **代码格式双向转换**(`sz000001` ↔ `000001.SZ`)+ 分批并发 +
     **自管分页**(单页上限 800, `all_pages` 会因 max_pages 抛异常故不依赖 SDK)+ 软失败 +
     **运行时崩溃自愈**(`_call`: 命中 `runtime command channel is closed` 即重建池并重试一次)

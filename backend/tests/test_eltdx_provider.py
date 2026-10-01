@@ -258,12 +258,13 @@ def test_missing_fields_are_none_not_fabricated() -> None:
     assert row["turnover_rate"] is None
 
 
-def test_snapshot_ts_parsing_and_invalid() -> None:
+def test_snapshot_ts_parsing_and_invalid(monkeypatch) -> None:
     """time_raw = 当日 HHMMSScc 紧凑整数(实测 8 位, 末 2 位为百分秒)。
 
     真机样例: 15330366 → 15:33:03.66(当日最后一笔, 收盘后 15:33 时刻)。
     非法值(时/分/秒越界、位数不足)返回 None, 由下游退本地时间。
     """
+    _assume_trading_day(monkeypatch, True)
     ts = _snapshot_ts(15330366)  # 15:33:03.66
     assert ts is not None
     dt = datetime.fromtimestamp(ts / 1000)
@@ -273,6 +274,38 @@ def test_snapshot_ts_parsing_and_invalid() -> None:
     assert _snapshot_ts(12345) is None  # 位数不足 6
     assert _snapshot_ts(99999999) is None  # hour=99 越界
     assert _snapshot_ts(15609999) is None  # minute=60 越界
+
+
+def _assume_trading_day(monkeypatch, verdict) -> None:
+    """固定交易日探针结论, 隔离真实网络 (探针自身另有 test_trading_day.py 覆盖)。"""
+    from app.services import trading_day
+
+    monkeypatch.setattr(trading_day, "is_trading_day", lambda now=None: verdict)
+
+
+def test_snapshot_ts_withheld_on_holiday(monkeypatch) -> None:
+    """休市日回归: 上游 time_raw 不含日期, 不得用本地当日伪造归属。
+
+    2026-10-01 国庆实测: eltdx 全市场快照冻结在 09-30 14:59:59.990, 而 time_raw
+    (14595999) 仍被按"本地当日"还原成 10-01 14:59:59.990。该伪时间戳同时击穿:
+      1. _build_daily 按 quote_ts 过滤非当日记录 (专治停牌股回归) 的防线;
+      2. final 定版边界比较 → 陈旧快照被当定版落盘, 再用 cn_today() 打戳, 造出与
+         上一交易日逐行相同的假分区 (5561 只 OHLC 全等, 全市场涨跌幅归零)。
+    故休市日必须返回 None (日期未知), 交由服务层的 filter_halt_days 等防线兜底。
+    """
+    _assume_trading_day(monkeypatch, False)
+    assert _snapshot_ts(14595999) is None
+    assert _snapshot_ts(15330366) is None
+    # 盘口记录走同一纪律
+    from app.plugins.eltdx.provider import _hhmmss_ts
+
+    assert _hhmmss_ts(153252) is None
+
+
+def test_snapshot_ts_unknown_verdict_keeps_restoring(monkeypatch) -> None:
+    """探针未知 (未配 fuyao 且 tickflow 不可用) 时维持还原, 不误伤盘中真实行情。"""
+    _assume_trading_day(monkeypatch, None)
+    assert _snapshot_ts(15330366) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -895,10 +928,15 @@ def test_depth_skips_records_without_levels() -> None:
         ("abc", None),
     ],
 )
-def test_hhmmss_ts_parses_both_widths(raw, expect_hm) -> None:
-    """时间戳解析需兼容 6 位(盘口)与 8 位(快照)两种紧凑形态。"""
+def test_hhmmss_ts_parses_both_widths(raw, expect_hm, monkeypatch) -> None:
+    """时间戳解析需兼容 6 位(盘口)与 8 位(快照)两种紧凑形态。
+
+    休市日该函数返回 None (日期不可归属, 见 test_snapshot_ts_withheld_on_holiday),
+    故这里固定"交易日"以免测试结果随运行日漂移。
+    """
     from app.plugins.eltdx.provider import _hhmmss_ts
 
+    _assume_trading_day(monkeypatch, True)
     ts = _hhmmss_ts(raw)
     if expect_hm is None:
         assert ts is None
@@ -1148,6 +1186,279 @@ def test_financials_shares_none_response_returns_empty() -> None:
 def test_financial_declared_in_datasets() -> None:
     """financial 必须在 config.datasets 中(否则 provider_has_dataset 判 False 而回退)。"""
     assert "financial" in EltDxProvider().config.datasets
+
+
+# ---------------------------------------------------------------------------
+# 三大报表(f10): T 代码口径表 + nhytype 模板族分流
+# ---------------------------------------------------------------------------
+
+
+def _f10_response(
+    columns: list[str], rows: list[dict], *, nhytype: int | None = 0
+) -> SimpleNamespace:
+    """f10.finance_report 响应替身: result_sets[0] 宽表 + result_sets[1] 带 nhytype。
+
+    实测形态: 第 1 张结果集是报表宽表(无行业字段), 第 2 张是一行
+    ``{rtype, nhytype, zqname}``。模板族判别必须读第 2 张。
+    """
+    sets = [
+        SimpleNamespace(
+            key="table0",
+            columns=columns,
+            rows=[SimpleNamespace(**r) for r in rows],
+        )
+    ]
+    if nhytype is not None:
+        sets.append(
+            SimpleNamespace(
+                key="table1",
+                columns=["rtype", "nhytype", "zqname"],
+                rows=[SimpleNamespace(rtype="zcfzb", nhytype=nhytype, zqname="测试")],
+            )
+        )
+    return SimpleNamespace(result_sets=sets)
+
+
+class _F10Client(_FakeClient):
+    """f10 假 client: 按 (eltdx_code, report_type) 返回预设响应。"""
+
+    def __init__(self, responses: dict[tuple[str, str], object], *, raise_for: set | None = None):
+        super().__init__()
+        self._responses = responses
+        self._raise_for = raise_for or set()
+
+    def finance_report(self, code, report_type):
+        self.calls.append(("finance_report", code, report_type))
+        if (code, report_type) in self._raise_for:
+            raise RuntimeError("station down")
+        resp = self._responses.get((code, report_type))
+        if resp is None:
+            raise RuntimeError("no such report")
+        return resp
+
+
+def test_f10_template_family_mapping() -> None:
+    """nhytype → 模板族: 0 为通用, 其余(银行 1 / 保险 3 / 未知) 一律金融族。
+
+    未知值按金融族是 **fail-safe**: 通用族的 T039 落在金融报表上是个无关小数字,
+    会静默产出错误总资产; 而金融族映射在通用股上取不到列 → 留空由多源合并保留。
+    """
+    from app.plugins.eltdx.provider import _f10_template_family
+
+    assert _f10_template_family(0) == "general"
+    assert _f10_template_family(1) == "financial"
+    assert _f10_template_family(3) == "financial"
+    assert _f10_template_family(None) == "financial"
+    assert _f10_template_family("2") == "financial"
+
+
+def test_f10_balance_sheet_general_family() -> None:
+    """通用族(nhytype=0): T039/T062/T071 → 资产/负债/权益。"""
+    resp = _f10_response(
+        ["rq", "T039", "T062", "T071", "T020", "T038", "T007", "T010"],
+        [{
+            "rq": "2026-06-30",
+            "T039": 309050784569.31,
+            "T062": 46954432394.95,
+            "T071": 262096352174.36,
+            "T020": 260724668103.4,
+            "T038": 48326116465.91,
+            "T007": 53518798979.08,
+            "T010": 570895.04,
+        }],
+        nhytype=0,
+    )
+    p = _provider(_F10Client({("sh600519", "zcfzb"): resp}))
+    df = p.get_financials("balance_sheet", ["600519.SH"], latest_only=True)
+
+    assert df.height == 1
+    row = df.to_dicts()[0]
+    assert row["symbol"] == "600519.SH"
+    assert row["period_end"] == "2026-06-30"
+    assert row["total_assets"] == pytest.approx(309050784569.31)
+    assert row["total_liabilities"] == pytest.approx(46954432394.95)
+    assert row["total_equity"] == pytest.approx(262096352174.36)
+    assert row["cash_and_equivalents"] == pytest.approx(53518798979.08)
+    # 会计恒等式自证
+    assert row["total_assets"] == pytest.approx(
+        row["total_liabilities"] + row["total_equity"]
+    )
+
+
+def test_f10_balance_sheet_financial_family_uses_different_codes() -> None:
+    """金融族(nhytype=1): 必须走 T048/T083/T093, **不得**误用通用族 T039。
+
+    回归防护(实测): 平安银行 T039=104.6 亿而真实总资产 60287.9 亿, 差 576 倍。
+    """
+    resp = _f10_response(
+        ["rq", "T039", "T048", "T083", "T093"],
+        [{
+            "rq": "2026-06-30",
+            "T039": 10464000000,  # 通用族代码在金融报表里是无关数字
+            "T048": 6028785000000.0,
+            "T083": 5480571000000.0,
+            "T093": 548214000000.0,
+        }],
+        nhytype=1,
+    )
+    p = _provider(_F10Client({("sz000001", "zcfzb"): resp}))
+    df = p.get_financials("balance_sheet", ["000001.SZ"], latest_only=True)
+
+    row = df.to_dicts()[0]
+    assert row["total_assets"] == pytest.approx(6028785000000.0)
+    assert row["total_assets"] != pytest.approx(10464000000)  # 未误用 T039
+    assert row["total_liabilities"] == pytest.approx(5480571000000.0)
+    assert row["total_equity"] == pytest.approx(548214000000.0)
+    assert row["total_assets"] == pytest.approx(
+        row["total_liabilities"] + row["total_equity"]
+    )
+
+
+def test_f10_balance_sheet_omits_unmapped_detail_for_financial() -> None:
+    """金融族不映射明细科目(上游无稳定对应) → 该字段不落盘, 不用猜测值填充。"""
+    resp = _f10_response(
+        ["rq", "T048", "T083", "T093", "T020"],
+        [{
+            "rq": "2026-06-30",
+            "T048": 6028785000000.0,
+            "T083": 5480571000000.0,
+            "T093": 548214000000.0,
+            "T020": 999.0,
+        }],
+        nhytype=1,
+    )
+    p = _provider(_F10Client({("sz000001", "zcfzb"): resp}))
+    row = p.get_financials("balance_sheet", ["000001.SZ"], latest_only=True).to_dicts()[0]
+
+    assert "total_current_assets" not in row  # 未声明列根本不落盘
+
+
+def test_f10_cash_flow_general_vs_financial_t041_semantics() -> None:
+    """T041 在通用族是"现金净增加", 在金融族是"capex" —— 语义互换, 必须分流。
+
+    这是最危险的一处: 若沿用通用族映射, 金融股的 capex 会被写成现金净增加。
+    """
+    general = _f10_response(
+        ["rq", "T017", "T029", "T038", "T041", "T024"],
+        [{"rq": "2026-06-30", "T017": 70690750119.06, "T029": 25640543520.6,
+          "T038": -37944297802.12, "T041": 58385486034.9, "T024": 832142752.28}],
+        nhytype=0,
+    )
+    financial = _f10_response(
+        ["rq", "T033", "T044", "T055", "T058", "T041"],
+        [{"rq": "2026-06-30", "T033": 215012000000.0, "T044": -70495000000.0,
+          "T055": -196012000000.0, "T058": -53384000000.0, "T041": 666000000.0}],
+        nhytype=1,
+    )
+    p = _provider(_F10Client({
+        ("sh600519", "xjllb"): general,
+        ("sz000001", "xjllb"): financial,
+    }))
+    df = p.get_financials("cash_flow", ["600519.SH", "000001.SZ"], latest_only=True)
+    by_sym = {r["symbol"]: r for r in df.to_dicts()}
+
+    # 通用族: T041 = 现金净增加
+    assert by_sym["600519.SH"]["net_cash_change"] == pytest.approx(58385486034.9)
+    assert by_sym["600519.SH"]["capex"] == pytest.approx(832142752.28)
+    # 金融族: T041 = capex(不是现金净增加), 现金净增加走 T058
+    assert by_sym["000001.SZ"]["capex"] == pytest.approx(666000000.0)
+    assert by_sym["000001.SZ"]["net_cash_change"] == pytest.approx(-53384000000.0)
+    assert by_sym["000001.SZ"]["net_cash_change"] != pytest.approx(666000000.0)
+
+
+def test_f10_cash_flow_keeps_signed_net_values() -> None:
+    """筹资/投资净额必须保留上游符号, 不做 abs 或取反。
+
+    ``T037`` 是筹资活动现金**流出**的正数原值, ``T038`` 才是带符号净额;
+    映射 T038 即得负数, 无需手工取反(实测茅台 -37,944,297,802.12)。
+    """
+    resp = _f10_response(
+        ["rq", "T017", "T029", "T038", "T041", "T024", "T037"],
+        [{"rq": "2026-06-30", "T017": 70690750119.06, "T029": 25640543520.6,
+          "T038": -37944297802.12, "T041": 58385486034.9, "T024": 832142752.28,
+          "T037": 37944297802.12}],  # 同额正数: 证明选的是 T038 而非 T037
+        nhytype=0,
+    )
+    p = _provider(_F10Client({("sh600519", "xjllb"): resp}))
+    row = p.get_financials("cash_flow", ["600519.SH"], latest_only=True).to_dicts()[0]
+
+    assert row["net_financing_cash_flow"] < 0
+    assert row["net_financing_cash_flow"] == pytest.approx(-37944297802.12)
+
+
+def test_f10_income_returns_empty_frame() -> None:
+    """利润表: 上游 lrb 无数值 → 恒返回空帧(交多源合并保留 fuyao 值)。"""
+    p = _provider(_F10Client({}))
+    assert p.get_financials("income", ["600519.SH"]).is_empty()
+
+
+def test_f10_lrb_nameless_row_is_discarded() -> None:
+    """即使上游对 lrb 回了 3 列名称行, 也必须被丢弃(无 rq/无数值)。"""
+    from app.plugins.eltdx.provider import _f10_statement_rows
+
+    resp = _f10_response(
+        ["rtype", "nhytype", "zqname"],
+        [{"rtype": "lrb", "nhytype": 0, "zqname": "贵州茅台"}],
+        nhytype=None,
+    )
+    assert _f10_statement_rows(resp, "balance_sheet", "600519.SH") == []
+
+
+def test_f10_single_symbol_failure_is_isolated() -> None:
+    """单标的请求失败只隔离该只, 不拖垮整表(备份源补齐正依赖此语义)。"""
+    resp = _f10_response(
+        ["rq", "T039", "T062", "T071"],
+        [{"rq": "2026-06-30", "T039": 100.0, "T062": 40.0, "T071": 60.0}],
+        nhytype=0,
+    )
+    p = _provider(_F10Client(
+        {("sh600519", "zcfzb"): resp},
+        raise_for={("sz000001", "zcfzb")},
+    ))
+    df = p.get_financials("balance_sheet", ["600519.SH", "000001.SZ"], latest_only=True)
+
+    assert df.height == 1
+    assert df.to_dicts()[0]["symbol"] == "600519.SH"
+
+
+def test_f10_latest_only_selects_newest_period() -> None:
+    """latest_only=True 时每只标的只保留最新报告期。"""
+    resp = _f10_response(
+        ["rq", "T039", "T062", "T071"],
+        [
+            {"rq": "2025-12-31", "T039": 1.0, "T062": 1.0, "T071": 1.0},
+            {"rq": "2026-06-30", "T039": 2.0, "T062": 2.0, "T071": 2.0},
+        ],
+        nhytype=0,
+    )
+    p = _provider(_F10Client({("sh600519", "zcfzb"): resp}))
+
+    latest = p.get_financials("balance_sheet", ["600519.SH"], latest_only=True)
+    assert latest.to_dicts()[0]["period_end"] == "2026-06-30"
+
+    full = p.get_financials("balance_sheet", ["600519.SH"], latest_only=False)
+    assert full.height == 2
+    assert sorted(full["period_end"].to_list()) == ["2025-12-31", "2026-06-30"]
+
+
+def test_f10_statement_uses_eltdx_code_and_correct_report_type() -> None:
+    """请求前必须转 eltdx 代码, 且表名 → report_type 映射正确。"""
+    resp = _f10_response(
+        ["rq", "T039", "T062", "T071"],
+        [{"rq": "2026-06-30", "T039": 1.0, "T062": 1.0, "T071": 1.0}],
+        nhytype=0,
+    )
+    fake = _F10Client({("sh600519", "zcfzb"): resp})
+    p = _provider(fake)
+    p.get_financials("balance_sheet", ["600519.SH"], latest_only=True)
+
+    assert ("finance_report", "sh600519", "zcfzb") in fake.calls
+
+
+def test_f10_metrics_still_not_implemented() -> None:
+    """metrics 仍未接入 → 空帧(其来源是指标接口, 与三大报表不同路径)。"""
+    p = _provider(_F10Client({}))
+    assert p.get_financials("metrics", ["600519.SH"]).is_empty()
 
 
 # ---------------------------------------------------------------------------

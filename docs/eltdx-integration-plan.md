@@ -20,10 +20,10 @@
 | `minute` | ✅ | 1 分钟 K（真 OHLC） |
 | `full_minute` | ✅ | 全量分钟修复轮（当日窗口批量） |
 | `depth5` | ✅ | 五档盘口（封单/盘口深度） |
-| `financial` | ⚠️ 部分 | 仅 `shares` 表 |
+| `financial` | ⚠️ 部分 | `shares` + 资产负债表 + 现金流量表（利润表/指标未接） |
 | `adj_factor` | ✅ | 除权因子（单事件比值） |
 
-**明确不做**（理由见 §6）：`metrics` / `income` / `balance_sheet` / `cash_flow` 四张财务表；连板梯队（面板无数据集槽位）。
+**明确不做**（理由见 §6）：`metrics` / `income` 两张财务表 —— `income` 是**上游缺口**（`lrb` 无数据），`metrics` 接口为单股单期、全市场成本过高；连板梯队（面板无数据集槽位）。
 
 **设计约束**：不改动任何 `services/`、`api/` 代码 —— 插件机制的意义就是零集成改动；未声明的数据集自动回退 TickFlow。
 
@@ -38,7 +38,7 @@
 | `minute` | `get_minute` | `bars.get(code, period='1m')` | **必须用 bars 而非 minutes.history**；`datetime` 转**北京墙钟 naive** |
 | `full_minute` | `get_intraday_batch` / `get_intraday_latest` | 同上（当日窗口 / 批量最新 N 根） | 增量轮走 `bars.get` 批量（1000 只/片），实测全市场 ~11.7s |
 | `depth5` | `get_depth_batch` | `quotes.get_depth(codes)` | 各 5 档；**量为 0 须保留**；失败**抛异常**不回退 |
-| `financial` | `get_financials` | `corporate.finance_batch(codes)` | 仅 `shares`；股本**万股→x10000**；`period_end` 取 `updated_date` |
+| `financial` | `get_financials` | `corporate.finance_batch(codes)` + `f10.finance_report` | `shares` 走前者（股本**万股→x10000**，`period_end` 取 `updated_date`）；`balance_sheet`/`cash_flow` 走 `zcfzb`/`xjllb`，按 **`nhytype`** 分通用/金融两族映射 T 代码；`income` 上游无数据返回空帧 |
 | `adj_factor` | `get_adj_factors` | `corporate.adjustment_factors(code)` | `(scale, offset)` → **单事件比值**（公式见 §4.4） |
 | （代码表） | 内部使用 | `codes.all_a_shares()` / `all_indices()` | 代码格式转换 `sz000001` ↔ `000001.SZ` |
 

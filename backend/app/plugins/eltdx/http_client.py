@@ -759,6 +759,21 @@ class HttpTransport:
             return None
         return self._rpc("corporate.finance_batch", {"codes": list(codes)})
 
+    def finance_report(self, code: str, report_type: str) -> Any:
+        """单标的财务报表(``f10.finance_report``); 失败抛异常。
+
+        ``report_type``: ``zcfzb`` 资产负债表 / ``xjllb`` 现金流量表 / ``lrb`` 利润表。
+
+        ⚠️ **实测(网关 3.2.2)``lrb`` 上游不返回数值** —— 只回一行
+        ``{rtype:'lrb', nhytype:0, zqname:'<简称>'}``(3 列), 而 ``zcfzb``/``xjllb``
+        正常回 102/71 列、99/69 列; 试过 16 个候选 report_type 取值均无数值。
+        利润表须回退其它数据源(provider 侧据此返回空帧交多源合并)。
+
+        返回 ``result_sets[0]`` 含 ``columns`` / ``rows``, 列名为不透明 ``T***`` 代码;
+        含义与行业模板判别见 provider 的 ``_F10_*_MAP``。
+        """
+        return self._rpc("f10.finance_report", {"code": code, "report_type": report_type})
+
     # ---- 五档盘口 -------------------------------------------------------
 
     def depth(self, symbols: list[str]) -> Any:

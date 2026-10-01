@@ -148,6 +148,120 @@ def test_all_rows_unrecognized_returns_empty_with_no_fake_data(monkeypatch):
 # ---- 客户端信封解析 (实测结构 vs 文档示例) ----
 
 
+def test_client_resets_pool_and_retries_on_connection_error(monkeypatch):
+    """连接层失败(池坏死)必须重建连接池并重试一次 —— 这是实测事故的回归防护。
+
+    现象(2026-10-01): 服务进程内复用的 httpx 池一次瞬断后永久坏死, 连续 55 分钟
+    1555 次请求全部 WinError 10061, 而同一时刻新建 client 10/10 成功。不重建池
+    则后续所有请求继续失败, 且同步流程会把失败当"无数据"吞掉(静默 0 行)。
+    """
+    attempts = {"n": 0}
+    payload = {"code": 0, "data": {"timestamp": 1, "total": 1, "item": [_row()]}}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return payload
+
+    class _Http:
+        """第一次抛连接错误(模拟坏死池), 之后正常。"""
+
+        def get(self, path, params=None):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise fc.httpx.ConnectError("connection refused")
+            return _Resp()
+
+        def close(self):
+            pass
+
+    created = {"n": 0}
+
+    def _make(**kw):
+        created["n"] += 1
+        return _Http()
+
+    monkeypatch.setattr(fc.httpx, "Client", _make)
+    c = fc.FuyaoClient(api_key="k")
+    rows, _total = c.snapshot_page()
+
+    assert len(rows) == 1, "重试应成功"
+    assert attempts["n"] == 2, "必须重试一次"
+    assert created["n"] == 2, "重试前必须重建连接池"
+
+
+def test_client_raises_when_retry_also_fails(monkeypatch):
+    """重建后仍失败 → 抛 FuyaoError(不无限重试)。"""
+
+    class _Http:
+        def get(self, path, params=None):
+            raise fc.httpx.ConnectError("still refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(fc.httpx, "Client", lambda **kw: _Http())
+    c = fc.FuyaoClient(api_key="k")
+    with pytest.raises(fc.FuyaoError):
+        c.snapshot_page()
+
+
+def test_client_reset_preserves_connection_params(monkeypatch):
+    """reset 必须用同一套 base_url/headers/timeout 重建(否则 Key 或端点会丢)。"""
+    seen: list[dict] = []
+
+    class _Http:
+        def get(self, path, params=None):
+            return None
+
+        def close(self):
+            pass
+
+    def _make(**kw):
+        seen.append(kw)
+        return _Http()
+
+    monkeypatch.setattr(fc.httpx, "Client", _make)
+    c = fc.FuyaoClient(api_key="secret-key", base_url="https://x.test", timeout=7.0)
+    c.reset()
+
+    assert len(seen) == 2
+    assert seen[0] == seen[1], "重建参数必须与首次一致"
+    assert seen[0]["base_url"] == "https://x.test"
+    assert seen[0]["timeout"] == 7.0
+    assert seen[0]["headers"] == {"X-api-key": "secret-key"}
+
+
+def test_client_does_not_reset_on_business_error(monkeypatch):
+    """HTTP 4xx/5xx 是业务错误, 不应触发连接池重建(重建无意义且掩盖真实错误)。"""
+    created = {"n": 0}
+
+    class _Resp:
+        status_code = 500
+
+        def json(self):
+            return {}
+
+    class _Http:
+        def get(self, path, params=None):
+            return _Resp()
+
+        def close(self):
+            pass
+
+    def _make(**kw):
+        created["n"] += 1
+        return _Http()
+
+    monkeypatch.setattr(fc.httpx, "Client", _make)
+    c = fc.FuyaoClient(api_key="k")
+    with pytest.raises(fc.FuyaoError):
+        c.snapshot_page()
+
+    assert created["n"] == 1, "业务错误不应重建连接池"
+
+
 def _patch_http(monkeypatch, payload, status_code=200):
     class _Resp:
         def json(self):

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from pathlib import Path
@@ -37,22 +38,60 @@ class FuyaoClient:
         if not api_key:
             raise FuyaoError("未配置 FUYAO_API_KEY")
         self.last_server_ts = 0  # 最近一页响应里的服务端时间戳(ms), 供行情归属
+        # 连接参数留存: reset() 需要用同一套参数重建连接池
+        self._base_url = base_url
+        self._headers = {"X-api-key": api_key}
+        self._timeout = timeout
         self._http = httpx.Client(
             base_url=base_url,
-            headers={"X-api-key": api_key},
+            headers=self._headers,
             timeout=timeout,
         )
 
     def close(self) -> None:
         self._http.close()
 
+    def reset(self) -> None:
+        """丢弃当前连接池并重建(连接池坏死后的自愈)。
+
+        ## 为什么需要它(2026-10-01 实测事故)
+        ``httpx.Client`` 复用 keep-alive 连接池。一次上游瞬断即可让池内连接全部进入
+        坏死状态, 此后**每个请求都失败**且**永不自愈**: 实测服务进程内该 client
+        连续 55 分钟、1555 次请求全部 ``WinError 10061 由于目标计算机积极拒绝``,
+        失败速率恒定 29~30 次/分钟; 而**同一时刻新建 client 连续 10/10 成功** ——
+        证明网络正常, 坏死的是那个被长期复用的池。
+
+        后果是静默的: 同步流程把每次失败都当作"该标的无数据"吞掉, ``last_sync``
+        时间戳照常前进, 前端看起来"同步成功", 实际整表 0 行写入。
+
+        与 ``close()`` 的区别: close 是终态(provider 被丢弃), reset 是"作废并重建",
+        供仍在使用的 provider 自愈。重建失败时保持旧池不作废, 避免把可用的池也弄丢。
+        """
+        with contextlib.suppress(Exception):  # 旧池可能已损坏, close 抛错不应影响重建
+            self._http.close()
+        self._http = httpx.Client(
+            base_url=self._base_url,
+            headers=self._headers,
+            timeout=self._timeout,
+        )
+
     # ---- 内部 ----
     def _get(self, path: str, params: dict) -> dict:
-        """GET + 信封解包。code != 0 时抛 FuyaoError(含 code 与 message)。"""
+        """GET + 信封解包。code != 0 时抛 FuyaoError(含 code 与 message)。
+
+        连接层失败时**重建连接池并重试一次** —— 见 ``reset`` 说明: 坏死的池不会
+        自愈, 不重建则后续所有请求都会继续失败。
+        """
         try:
             resp = self._http.get(path, params=params)
         except httpx.HTTPError as e:
-            raise FuyaoError(f"网络请求失败: {e}") from e
+            # 只对连接层错误自愈(超时/连接被拒/连接中断); HTTP 状态码错误不在此列,
+            # 由下面 status_code 分支处理(那是业务错误, 重建连接无意义)。
+            self._reset_and_log(e)
+            try:
+                resp = self._http.get(path, params=params)
+            except httpx.HTTPError as retry_err:
+                raise FuyaoError(f"网络请求失败: {retry_err}") from retry_err
         if resp.status_code != 200:
             raise FuyaoError(f"HTTP {resp.status_code}: {path}")
         try:
@@ -63,6 +102,11 @@ class FuyaoClient:
         if code not in (0, "0", None):
             raise FuyaoError(f"扶摇接口错误 code={code}: {payload.get('message', '')} ({path})")
         return payload.get("data") or {}
+
+    def _reset_and_log(self, err: Exception) -> None:
+        """重建连接池并记录一条 warning(便于观测自愈是否真的在发生)。"""
+        logger.warning("扶摇连接池疑似坏死(%s), 重建后重试一次", str(err)[:80])
+        self.reset()
 
     # ---- 快照 ----
     def snapshot_page(

@@ -53,13 +53,98 @@ def _financial_is_custom() -> bool:
     return custom_sources.provider_has_dataset(provider, "financial")
 
 
+def _financial_backup_provider(primary: str) -> str | None:
+    """主财务源取不到某标的时用于补齐的备份源; 无可用备份返回 None。
+
+    选取规则: 当前生效源之外, **声明了 financial 数据集**的插件里按注册表顺序取第一个。
+    为什么是插件而不是 TickFlow: 财务源已插件化, 通用流程不应硬编码 TickFlow
+    (CONTRIBUTING §4); 且 TickFlow 需要 Expert 档, 而插件零 Key 即可用。
+    没有备份源时行为与改造前完全一致(缺失标的就是缺失)。
+    """
+    from app.data_providers import custom as custom_sources
+
+    for plugin in custom_sources.list_plugins():
+        name = str(plugin.get("name") or "")
+        if not name or name == primary:
+            continue
+        if not plugin.get("available"):
+            continue
+        if custom_sources.provider_has_dataset(name, "financial"):
+            return name
+    return None
+
+
+def _fill_missing_from_backup(
+    table: str,
+    primary_df: pl.DataFrame,
+    symbols: list[str],
+    primary: str,
+    *,
+    latest_only: bool,
+) -> pl.DataFrame:
+    """主源结果里**缺哪些标的**就用备份源补哪些(逐标的回退)。
+
+    语义("主源优先, 备份只补缺"): 主源已提供的标的**一律不覆盖** —— 备份源只填空缺,
+    不参与取值仲裁。这样主源换版本/换口径不会被备份源悄悄顶掉, 也避免了"谁先谁后"
+    的隐式优先级。
+
+    为什么值得做: 实测主源(eltdx)对**利润表**恒返回空(上游 lrb 无数据), 且对个别标的
+    会因上游缺口取不到; 没有这一层时这些标的会整表缺失, 表现为前端「暂无数据」。
+
+    失败隔离: 备份源整体异常/超时都只记 warning 并**原样返回主源结果**, 绝不让备份源
+    的问题影响主源已经取到的数据。
+    """
+    if not symbols:
+        return primary_df
+    have = (
+        set(primary_df["symbol"].drop_nulls().to_list())
+        if not primary_df.is_empty() and "symbol" in primary_df.columns
+        else set()
+    )
+    missing = [s for s in symbols if s not in have]
+    if not missing:
+        return primary_df
+
+    backup = _financial_backup_provider(primary)
+    if not backup:
+        logger.info(
+            "sync_%s: 主源 %s 缺 %d/%d 只且无可用备份源, 保持原样",
+            table, primary, len(missing), len(symbols),
+        )
+        return primary_df
+
+    from app.data_providers import custom as custom_sources
+    try:
+        provider = custom_sources.get_provider(backup)
+        extra = provider.get_financials(table, missing, latest_only=latest_only)
+    except Exception as e:  # 备份源故障不得影响主源结果
+        logger.warning("sync_%s 备份源 %s 取数失败(保留主源结果): %s", table, backup, e)
+        return primary_df
+    if extra is None or extra.is_empty() or "symbol" not in extra.columns:
+        logger.info("sync_%s: 备份源 %s 未补到数据(缺 %d 只)", table, backup, len(missing))
+        return primary_df
+
+    # 只接受备份源里确实属于缺失集合的标的, 防止备份源返回超范围数据覆盖主源
+    extra = extra.filter(pl.col("symbol").is_in(missing))
+    if extra.is_empty():
+        return primary_df
+    filled = extra["symbol"].n_unique()
+    logger.info(
+        "sync_%s: 主源 %s 缺 %d 只, 备份源 %s 补齐 %d 只",
+        table, primary, len(missing), backup, filled,
+    )
+    if primary_df.is_empty():
+        return extra
+    return pl.concat([primary_df, extra], how="diagonal_relaxed")
+
+
 def _fetch_table(
     table: str,
     symbols: list[str],
     capset: CapabilitySet,
     latest_only: bool = True,
 ) -> pl.DataFrame:
-    """通过当前财务数据源拉取一张标准化财务表。"""
+    """通过当前财务数据源拉取一张标准化财务表(主源优先, 备份源补缺)。"""
     is_custom = _financial_is_custom()
     if not is_custom and not capset.has(Cap.FINANCIAL):
         logger.info("sync_%s skipped: no FINANCIAL capability", table)
@@ -70,17 +155,21 @@ def _fetch_table(
 
     # 自定义数据源分流
     if is_custom:
-        from app.services import preferences
         from app.data_providers import custom as custom_sources
+        from app.services import preferences
+        primary = preferences.get_financial_provider()
         try:
-            provider = custom_sources.get_provider(preferences.get_financial_provider())
+            provider = custom_sources.get_provider(primary)
             df = provider.get_financials(table, symbols, latest_only=latest_only)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("sync_%s custom provider failed: %s", table, e)
-            return pl.DataFrame()
+            df = pl.DataFrame()
         if df.is_empty() or "symbol" not in df.columns:
-            return pl.DataFrame()
-        return df
+            df = pl.DataFrame()
+        # 主源取不到的标的, 用备份源补齐(逐标的回退)。
+        return _fill_missing_from_backup(
+            table, df, symbols, primary, latest_only=latest_only
+        )
 
     from app.tickflow.client import get_client
     tf = get_client()

@@ -12,13 +12,14 @@
 #   full_minute — 全量分钟修复轮(get_intraday_batch: 当日窗口批量)
 #                 get_intraday_latest 无更优路径时返回空 → 服务按契约降级为仅修复轮(60s)
 #   depth5      — 五档盘口(quotes.get_depth, 各 5 档; 封死涨跌停时量为 0 需保留)
-#   financial   — 财务: **只实现 shares 表**(finance_batch 的股本字段, 字段名明确,
-#                 万股→股换算后驱动面板历史换手率); metrics/三大报表不接
-#                 (f10.finance_report 返回不透明 T*** 代码且包内无字典, 反推风险高)
+#   financial   — 财务: shares 表(finance_batch 股本, 万股→股) + 资产负债表/现金流量表
+#                 (f10.finance_report zcfzb/xjllb, T 代码口径已经扶摇交叉验证 + 恒等式自证,
+#                  按 nhytype 分通用/金融两族)。
+#                 **利润表(income)未接入** — 上游 lrb 只回名称行无数值, 由多源合并保留原值
 #   adj_factor  — 除权因子(单事件比值)。由 (hfq_scale, hfq_offset) 推导:
 #                 div=(offset增量)/scale, ex_factor=scale比 x 前收/(前收-div)。
 #                 与 fuyao 表对账 32/32 吻合, 最大相对偏差约 0.024%(offset 累计精度)
-# 未接入: metrics/income/balance_sheet/cash_flow 四张财务表(由多源合并保留原值)
+# 未接入: metrics/income 两张财务表(由多源合并保留原值)
 
 name: eltdx
 display_name: "eltdx (通达信)"
@@ -26,6 +27,6 @@ runtime: python
 entry: app.plugins.eltdx.provider:EltDxProvider
 check: app.plugins.eltdx.provider:availability
 datasets: [daily, realtime, minute, full_minute, depth5, financial, adj_factor]
-description: "通达信在线行情协议直连(eltdx, Research-Only)。日K(不复权原始价, 连接池并发)、全市场实时快照(含指数)、1分钟K(真 OHLC: 分时图与分钟回测)、全量分钟修复轮(盘中当日窗口批量)、五档盘口(封单/盘口深度)、历史股本(shares 表, 驱动换手率)、除权因子(单事件比值)。零 API Key。三大财务报表未接入, 自动回退 TickFlow。"
+description: "通达信在线行情协议直连(eltdx, Research-Only)。日K(不复权原始价, 连接池并发)、全市场实时快照(含指数)、1分钟K(真 OHLC: 分时图与分钟回测)、全量分钟修复轮(盘中当日窗口批量)、五档盘口(封单/盘口深度)、财务(shares 股本 + 资产负债表 + 现金流量表; 口径经扶摇交叉验证)、除权因子(单事件比值)。零 API Key。利润表与财务指标未接入, 自动回退其它数据源。"
 install_hint: "点击卡片「安装依赖」按钮(执行 pip install eltdx), 或在 backend 目录手动: uv pip install --python .venv/Scripts/python.exe -r app/plugins/eltdx/requirements.txt"
 homepage: "https://github.com/electkismet/eltdx"
