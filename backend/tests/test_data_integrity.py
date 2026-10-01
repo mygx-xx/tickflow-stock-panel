@@ -14,14 +14,13 @@ import polars as pl
 import pytest
 
 from app.market_time import CN_TZ, cn_today
-from app.services import data_integrity as di
+from app.services import trading_day
 from app.services.data_integrity import (
     AUTO_REPAIR_MAX_LAG_DAYS,
     IntegrityIssue,
     _candidate_days,
     _is_snapshot,
     _quote_ts_max_ms,
-    _trading_calendar,
     earliest_issue_day,
     prune_enriched_partitions,
     scan_recent_integrity,
@@ -677,10 +676,15 @@ def _no_trading_calendar_by_default():
     fuyao → 探测即回退, 零外部依赖); 日历相关用例自行写入 fake 日历。
     (fetched_at=0.0 表示 TTL 已过, 不用 time.monotonic — 本文件顶部
     `from datetime import time` 会遮蔽标准库 time。)"""
-    saved = di._CAL
-    di._CAL = (0.0, None)
+    saved_cal = trading_day._CAL
+    saved_file = trading_day._CAL_FILE
+    saved_persisted = trading_day._PERSISTED
+    trading_day.set_calendar_store(None)
+    trading_day._CAL = (0.0, None)
     yield
-    di._CAL = saved
+    trading_day._CAL = saved_cal
+    trading_day._CAL_FILE = saved_file
+    trading_day._PERSISTED = saved_persisted
 
 
 def _patch_fuyao_calendar(monkeypatch, days):
@@ -689,7 +693,7 @@ def _patch_fuyao_calendar(monkeypatch, days):
         get_provider=lambda name: SimpleNamespace(trading_days=lambda: set(days)),
     )
     monkeypatch.setattr(app.data_providers, "custom", fake)
-    di._CAL = (0.0, None)  # 清缓存, 强制本用例走自己的日历
+    trading_day._CAL = (0.0, None)  # 清缓存, 强制本用例走自己的日历
 
 
 def _recent_trading_day_before(day: date) -> date:
@@ -698,7 +702,7 @@ def _recent_trading_day_before(day: date) -> date:
     取代旧的 `while d.weekday() >= 5` 探针 —— 节假日(如 2026 中秋 09-25)
     后该探针会命中休市日, 而休市日在日历语义下不再是候选日。
     """
-    cal = _trading_calendar()
+    cal = trading_day.trading_calendar()
     d = day - timedelta(days=1)
     while True:
         if cal is not None:
@@ -732,7 +736,7 @@ def test_candidate_days_falls_back_to_weekday_without_calendar(monkeypatch):
 def test_calendar_fetch_failure_serves_last_known(monkeypatch):
     """fuyao 抖动时沿用上次成功结果 (stale-while-error), 不退回周几近似。"""
     _patch_fuyao_calendar(monkeypatch, _CAL_FAKE_2026_09)
-    assert _trading_calendar() == _CAL_FAKE_2026_09
+    assert trading_day.trading_calendar() == _CAL_FAKE_2026_09
 
     def _boom():
         raise RuntimeError("fuyao down")
@@ -742,8 +746,8 @@ def test_calendar_fetch_failure_serves_last_known(monkeypatch):
         get_provider=lambda name: SimpleNamespace(trading_days=_boom),
     )
     monkeypatch.setattr(app.data_providers, "custom", fake)
-    di._CAL = (0.0, _CAL_FAKE_2026_09)  # fetched_at=0 → TTL 过期 → 重新探测失败
-    assert _trading_calendar() == _CAL_FAKE_2026_09
+    trading_day._CAL = (0.0, _CAL_FAKE_2026_09)  # fetched_at=0 → TTL 过期 → 重新探测失败
+    assert trading_day.trading_calendar() == _CAL_FAKE_2026_09
 
 
 def test_scan_no_false_missing_when_etf_lags_over_holiday(tmp_path, monkeypatch):

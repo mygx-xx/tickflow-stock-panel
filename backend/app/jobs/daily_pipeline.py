@@ -896,6 +896,37 @@ def _push_phase_change_alert(data_dir) -> None:
     logger.info("phase change alert: %s (severity=%s)", msg, severity)
 
 
+def _holiday_skip(job_label: str) -> bool:
+    """定时任务节假日门控: 交易日探针确定休市 → True (跳过本轮)。
+
+    CronTrigger 只能表达 mon-fri, 覆盖不到调休/长假; 探针未知 (None) 不拦,
+    与全项目交易日探针同语义。手动触发路径 (API) 不经过此门控。
+    """
+    from app.services import trading_day
+
+    if trading_day.is_trading_day() is False:
+        logger.info("scheduled %s 跳过: 交易日探针判定休市", job_label)
+        return True
+    return False
+
+
+def _scheduled_job(fn, job_label: str) -> bool:
+    """调度入口: 先过节假日门控, 再走 JobStore 跟踪。返回是否真正执行成功。"""
+    if _holiday_skip(job_label):
+        return False
+    return _run_tracked(fn, job_label)
+
+
+def _scheduled_depth_finalize() -> None:
+    """盘后五档 sealed 定版 (调度入口, 节假日跳过)。"""
+    if _holiday_skip("depth_finalize"):
+        return
+    state = _get_app_state()
+    depth_svc = getattr(state, "depth_service", None) if state else None
+    if depth_svc:
+        depth_svc.finalize()
+
+
 def _run_tracked(fn, job_label: str) -> bool:
     """调度触发时包装 JobStore 跟踪，确保同步历史有记录。
 
@@ -937,7 +968,7 @@ def _run_tracked(fn, job_label: str) -> bool:
 
 def _scheduled_pipeline_task(pipeline_fn) -> None:
     """Run weekly mining only after the tracked daily pipeline has fully succeeded."""
-    if not _run_tracked(pipeline_fn, "daily_pipeline"):
+    if not _scheduled_job(pipeline_fn, "daily_pipeline"):
         return
     try:
         from app.services.mining_schedule import run_weekly_mining
@@ -964,7 +995,11 @@ async def _run_scheduled_review(repo) -> None:
     LLM 偶发断流(peer closed connection)时自动重试最多 2 次。
     任何异常都吞掉只记日志, 绝不影响调度器主循环。
     """
+    import asyncio
     import json
+
+    if await asyncio.to_thread(_holiday_skip, "scheduled_review"):
+        return
 
     try:
         from app.services import market_recap_reports
@@ -1201,7 +1236,7 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         return result
 
     scheduler.add_job(
-        lambda: _run_tracked(_instruments_task, "instruments_sync"),
+        lambda: _scheduled_job(_instruments_task, "instruments_sync"),
         trigger=CronTrigger(day_of_week="mon-fri",
                             hour=inst_sched["hour"], minute=inst_sched["minute"],
                             timezone="Asia/Shanghai"),
@@ -1247,13 +1282,8 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
     # 盘后: 五档盘口 sealed 定版(时间由偏好决定, 默认15:02, 范围15:01~18:00)
     depth_sched = preferences.get_depth_finalize_time()
 
-    def _depth_finalize():
-        depth_svc = getattr(_get_app_state(), "depth_service", None) if _get_app_state() else None
-        if depth_svc:
-            depth_svc.finalize()
-
     scheduler.add_job(
-        _depth_finalize,
+        _scheduled_depth_finalize,
         trigger=CronTrigger(day_of_week="mon-fri",
                             hour=depth_sched["hour"], minute=depth_sched["minute"],
                             timezone="Asia/Shanghai"),

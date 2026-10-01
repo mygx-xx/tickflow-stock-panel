@@ -92,6 +92,8 @@ def _patch_scheduled_review(monkeypatch, pushed: list, archived: list):
     async def _fake_stream(*a, **k):
         return "正文", {"as_of": "2026-07-18", "emotion_label": "中性"}
 
+    # 定时复盘先过交易日门控; 本文件只测推送门控, 固定放行 (与运行日期无关)
+    monkeypatch.setattr(daily_pipeline, "_holiday_skip", lambda job_label: False)
     monkeypatch.setattr("app.secrets_store.get_ai_key", lambda: "sk-test")
     monkeypatch.setattr(daily_pipeline, "_stream_review_with_retry", _fake_stream)
     monkeypatch.setattr(

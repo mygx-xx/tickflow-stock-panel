@@ -20,8 +20,10 @@ CN = timezone(timedelta(hours=8))
 
 @pytest.fixture(autouse=True)
 def _clean_cache():
+    trading_day.set_calendar_store(None)  # 默认关闭持久化, 保持无磁盘副作用
     reset_cache()
     yield
+    trading_day.set_calendar_store(None)
     reset_cache()
 
 
@@ -276,3 +278,129 @@ def test_unknown_verdict_is_cached_within_short_ttl(monkeypatch):
     assert is_trading_day(monday) is None
     assert is_trading_day(monday) is None
     assert calls == {"fuyao": 1, "tickflow": 1}
+
+# ---- 统一交易日历 (任意日期 / 前后交易日 / 区间 / 单一缓存) ----
+
+def test_is_trading_day_for_date_uses_calendar(monkeypatch):
+    days = {date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8), date(2026, 9, 10)}
+    monkeypatch.setattr(trading_day, "trading_calendar", lambda: days)
+    assert trading_day.is_trading_day(date(2026, 9, 4)) is True
+    assert trading_day.is_trading_day(date(2026, 9, 8)) is True
+    assert trading_day.is_trading_day(date(2026, 9, 9)) is False  # 窗口内工作日但休市
+    assert trading_day.is_trading_day(date(2026, 9, 5)) is False  # 周六
+    assert trading_day.is_trading_day(date(2026, 9, 6)) is False  # 周日
+    # 超出日历窗口 → 未知, 不能误判成休市
+    assert trading_day.is_trading_day(date(2026, 9, 11)) is None
+    assert trading_day.is_trading_day(date(2026, 9, 3)) is None
+
+
+def test_is_trading_day_for_date_returns_none_without_calendar(monkeypatch):
+    monkeypatch.setattr(trading_day, "trading_calendar", lambda: None)
+    assert trading_day.is_trading_day(date(2026, 9, 8)) is None
+
+
+def test_is_trading_day_date_today_still_uses_probe_chain(monkeypatch):
+    """date 口径遇到「今天」时必须仍走探测链 (tickflow 兜底只回答今天)。"""
+    monday = datetime(2026, 9, 7, 10, 0, tzinfo=CN)
+    monkeypatch.setattr(trading_day, "cn_now", lambda: monday)
+    monkeypatch.setattr(trading_day, "_probe_fuyao", lambda now: True)
+    assert trading_day.is_trading_day(monday.date()) is True
+
+
+def test_prev_next_and_range_trading_days(monkeypatch):
+    days = {date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8)}
+    monkeypatch.setattr(trading_day, "trading_calendar", lambda: days)
+    assert trading_day.prev_trading_day(date(2026, 9, 8)) == date(2026, 9, 7)
+    assert trading_day.prev_trading_day(date(2026, 9, 4)) is None
+    assert trading_day.next_trading_day(date(2026, 9, 4)) == date(2026, 9, 7)
+    assert trading_day.next_trading_day(date(2026, 9, 8)) is None
+    assert trading_day.trading_days(date(2026, 9, 4), date(2026, 9, 8)) == [
+        date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8),
+    ]
+    assert trading_day.trading_days(date(2026, 9, 5), date(2026, 9, 6)) == []
+
+
+def test_trading_calendar_caches_fetch(monkeypatch):
+    calls = {"n": 0}
+
+    def _fetch():
+        calls["n"] += 1
+        return {date(2026, 9, 7)}
+
+    monkeypatch.setattr(trading_day, "_fetch_fuyao_calendar", _fetch)
+    assert trading_day.trading_calendar() == {date(2026, 9, 7)}
+    assert trading_day.trading_calendar() == {date(2026, 9, 7)}
+    assert calls["n"] == 1
+
+
+def test_trading_calendar_serves_stale_on_error(monkeypatch):
+    monkeypatch.setattr(trading_day, "_fetch_fuyao_calendar", lambda: {date(2026, 9, 7)})
+    assert trading_day.trading_calendar() == {date(2026, 9, 7)}
+    # 模拟 TTL 过期 + fuyao 抖动 (取数返回 None): 沿用上次成功结果
+    monkeypatch.setattr(trading_day, "_fetch_fuyao_calendar", lambda: None)
+    with trading_day._CAL_LOCK:
+        trading_day._CAL = (0.0, trading_day._CAL[1])
+    assert trading_day.trading_calendar() == {date(2026, 9, 7)}
+
+
+# ---- 交易日历持久化 (冷启动/离线兜底 + 并集累积 + 变更才写) ----
+
+def test_calendar_persists_and_reloads_offline(tmp_path, monkeypatch):
+    path = tmp_path / "trading_calendar.json"
+    trading_day.set_calendar_store(path)
+    days = {date(2026, 9, 7), date(2026, 9, 8)}
+    monkeypatch.setattr(trading_day, "_fetch_fuyao_calendar", lambda: set(days))
+    assert trading_day.trading_calendar() == days
+
+    # 模拟重启: 清内存缓存 (保留 _CAL_FILE), 上游不可用 → 从本地文件恢复
+    trading_day.reset_cache()
+    monkeypatch.setattr(trading_day, "_fetch_fuyao_calendar", lambda: None)
+    assert trading_day.trading_calendar() == days
+
+
+def test_calendar_union_accumulates_over_window(tmp_path, monkeypatch):
+    path = tmp_path / "trading_calendar.json"
+    trading_day.set_calendar_store(path)
+    monkeypatch.setattr(
+        trading_day, "_fetch_fuyao_calendar", lambda: {date(2026, 9, 7)},
+    )
+    assert trading_day.trading_calendar() == {date(2026, 9, 7)}
+
+    # 上游一年窗口滑动后只剩 09-08; 本地并集必须保留 09-07
+    trading_day.reset_cache()
+    monkeypatch.setattr(
+        trading_day, "_fetch_fuyao_calendar", lambda: {date(2026, 9, 8)},
+    )
+    assert trading_day.trading_calendar() == {date(2026, 9, 7), date(2026, 9, 8)}
+
+
+def test_calendar_only_writes_when_changed(tmp_path, monkeypatch):
+    path = tmp_path / "trading_calendar.json"
+    trading_day.set_calendar_store(path)
+    days = {date(2026, 9, 7), date(2026, 9, 8)}
+    monkeypatch.setattr(trading_day, "_fetch_fuyao_calendar", lambda: set(days))
+    writes = {"n": 0}
+
+    def _counting_replace(src, dst):
+        writes["n"] += 1
+        trading_day.os.replace(src, dst)
+
+    monkeypatch.setattr(trading_day, "_replace_file", _counting_replace)
+    assert trading_day.trading_calendar() == days
+    assert writes["n"] == 1
+    # 集合不变 → 即使 TTL 过期重取也不再写盘
+    with trading_day._CAL_LOCK:
+        trading_day._CAL = (0.0, trading_day._CAL[1])
+    assert trading_day.trading_calendar() == days
+    assert writes["n"] == 1
+
+
+def test_calendar_store_disabled_does_not_write(tmp_path, monkeypatch):
+    path = tmp_path / "trading_calendar.json"
+    trading_day.set_calendar_store(path)
+    trading_day.set_calendar_store(None)  # 关闭持久化
+    monkeypatch.setattr(
+        trading_day, "_fetch_fuyao_calendar", lambda: {date(2026, 9, 7)},
+    )
+    assert trading_day.trading_calendar() == {date(2026, 9, 7)}
+    assert not path.exists()

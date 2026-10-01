@@ -108,6 +108,10 @@ async def _application_lifespan(app: FastAPI):
     repo = KlineRepository(store)
     app.state.datastore = store
     app.state.repo = repo
+    # 交易日历持久化 (路径由 data_dir 决定): 冷启动/离线也能判定, 并把 fuyao
+    # 近一年窗口逐年累积; 拉取成功后与本地集合并集回写。
+    from app.services import trading_day
+    trading_day.set_calendar_store(store.data_dir / "trading_calendar.json")
     # 自定义/复合因子载入注册表 (P3); 单个失败只跳过该因子 (fail-隔离)
     from app.factors.store import load_into_registry
 
