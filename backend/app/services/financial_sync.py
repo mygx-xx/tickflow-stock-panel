@@ -217,6 +217,9 @@ def _fetch_table(
 
 def _write_table(table: str, df: pl.DataFrame, data_dir: Path) -> int:
     if df.is_empty() or "symbol" not in df.columns:
+        # 0 行写入多半是上游整体取数失败(如 fuyao 连接池坏死)。显式告警而非静默吞掉,
+        # 否则一次全失败的同步与"该表本来就没数据"在日志里无法区分。
+        logger.warning("sync_%s 无可写入数据(空帧), 跳过落盘", table)
         return 0
 
     # 写入 Parquet (全量覆盖)
@@ -453,12 +456,21 @@ class FinancialScheduler:
         self._task = asyncio.create_task(self._run_loop())
         logger.info("FinancialScheduler started (auto-schedule enabled)")
 
-    def _record_sync(self, table: str) -> None:
+    def _record_sync(self, table: str, rows: int) -> None:
         """记录一张表的同步完成时间: 更新内存 + 持久化到 preferences.json。
 
         持久化确保即使重启,前端 /status 仍返回真实的最后同步时间,
         不会错误地显示"尚未同步"。
+
+        只有确实写入数据(rows > 0)才推进时间戳: 0 行通常是上游整体取数失败
+        (如 fuyao 连接池坏死), 若照常推进, /status 会显示"已同步"但表里 0 行 ——
+        2026-10-01 利润表就是这样看起来正常、实际空表, 前端无从察觉。
         """
+        if rows <= 0:
+            logger.warning(
+                "sync_%s 写入 0 行, 不推进 last_sync(避免把失败标记为已同步)", table
+            )
+            return
         ts = datetime.now(timezone.utc).isoformat()
         self._last_sync[table] = ts
         try:
@@ -503,7 +515,7 @@ class FinancialScheduler:
                 # 每周: 只同步 metrics
                 try:
                     rows = sync_metrics(self._data_dir, self._capset)
-                    self._record_sync("metrics")
+                    self._record_sync("metrics", rows)
                     logger.info("FinancialScheduler: metrics synced, %d rows", rows)
                 except Exception as e:
                     logger.warning("FinancialScheduler: metrics sync failed: %s", e)
@@ -534,7 +546,7 @@ class FinancialScheduler:
             if not fn:
                 return {}
             rows = fn(self._data_dir, self._capset)
-            self._record_sync(table)
+            self._record_sync(table, rows)
             return {table: rows}
         # 全部同步
         symbols = _get_symbols(self._data_dir)
@@ -543,7 +555,7 @@ class FinancialScheduler:
             result[t] = _sync_history_table_for_symbols(
                 t, symbols, self._data_dir, self._capset
             )
-            self._record_sync(t)
+            self._record_sync(t, result[t])
         _refresh_financials_views(self._data_dir)
         return result
 
