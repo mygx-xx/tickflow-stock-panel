@@ -17,7 +17,7 @@ import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { type NavItem } from '@/lib/listNav'
 import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { useStrategyPool } from '@/lib/useStrategyPool'
-import { StrategyCard, CardSize, loadCardSize, cardWrapCls } from '@/components/screener/StrategyCard'
+import { StrategyCard, CardSize, loadCardSize } from '@/components/screener/StrategyCard'
 import { ScreenerTable } from '@/components/screener/ScreenerTable'
 import { ScreenerFilter as ScreenerFilterType, defaultFilter, filterActive, countActiveFilters, applyFilter, FilterPanel } from '@/components/screener/ScreenerFilter'
 import { StrategySettingsDialog } from '@/components/screener/StrategySettingsDialog'
@@ -893,20 +893,31 @@ export function Screener() {
         }
       />
 
-      <div className="px-8 py-4 space-y-3">
-        {/* 策略卡片 */}
+      <div className="h-full min-h-0">
+        <div className={`grid h-full min-h-0 grid-cols-1 gap-4 p-4 ${cardSize === 'hidden' ? '' : 'lg:grid-cols-[16rem_minmax(0,1fr)]'}`}>
+        {/* 左栏: 策略列表 (独立滚动, 策略多也不挤结果) */}
         {cardSize !== 'hidden' && (
-        <section>
-          {strategies.isLoading && <div className="text-sm text-muted">加载中…</div>}
+        <aside className="flex max-h-[40vh] min-h-0 flex-col overflow-hidden rounded-card border border-border bg-surface/60 lg:h-full lg:max-h-none">
+          <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+            <span className="text-xs font-medium text-foreground">
+              策略 <span className="font-mono text-[10px] text-muted">{displayPool.length}</span>
+            </span>
+            {activeStrategy && (
+              <span className="truncate text-[10px] text-muted">
+                当前 {strategyIdToName[activeStrategy] ?? activeStrategy}
+              </span>
+            )}
+          </div>
+          <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-2">
+          {strategies.isLoading && <div className="px-1 py-2 text-xs text-muted">加载中…</div>}
           {!strategies.isLoading && displayPool.length === 0 && (
-            <div className="text-sm text-muted py-4 text-center border border-dashed border-border rounded-btn">
+            <div className="px-2 py-6 text-center text-xs text-muted">
               {pool.length === 0
-                ? '策略池为空，点击右上角「策略池」按钮添加策略'
-                : '当前周期筛选下无策略，切换周期筛选或编辑策略池'}
+                ? '策略池为空，点击右上角「策略池」按钮添加'
+                : '当前周期筛选下无策略'}
             </div>
           )}
-          <div className={cardWrapCls(cardSize)}>
-            {displayPool.map(id => {
+          {displayPool.map(id => {
               const s = strategyMap.get(id)
               if (!s) return null
               const isMinute = s.timeframes?.includes('1m') ?? false
@@ -936,11 +947,12 @@ export function Screener() {
               )
             })}
           </div>
-        </section>
+        </aside>
         )}
 
-        {/* 结果 */}
-        <section>
+        {/* 右栏: 结果 (独立滚动) */}
+        <main className="min-w-0 min-h-0 lg:h-full lg:overflow-y-auto">
+        <section className="space-y-3">
           {run.isError && (
             <div className="text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">
               {String((run.error as any).message)}
@@ -1132,6 +1144,8 @@ export function Screener() {
             </div>
           )}
         </section>
+        </main>
+        </div>
       </div>
 
       <ListColumnCustomizer
