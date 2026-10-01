@@ -665,7 +665,7 @@ def _run_strategy(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         hint = f"; 可用策略: {available}" if available else "; 可先用 list_strategies 查询"
         raise ValueError(f"策略 {strategy_id} 不存在{hint}")
     svc = ScreenerService(repo)
-    as_of = svc.latest_date()
+    as_of = svc.latest_trading_date()
     if as_of is None:
         raise ValueError("本地暂无行情数据, 无法执行策略。")
     overrides = load_override(ctx.data_dir, strategy_id) or {} if ctx.data_dir else {}

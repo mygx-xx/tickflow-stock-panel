@@ -381,7 +381,9 @@ def build_market_overview(
     # 调用方未指定日期时视为"最新"请求: 指数行情走实时缓存 (quote_service),
     # 其余装配仍以解析出的真实日期为准。显式指定日期(历史复盘)时才回退数据库。
     explicit_as_of = as_of is not None
-    as_of = as_of or svc.latest_date()
+    # 用交易口径解析: 分区可能含打戳日实为休市日的假行 (见 latest_trading_date),
+    # 直接取 max(date) 会让看板把伪造交易日当"今天"渲染。
+    as_of = as_of or svc.latest_trading_date()
     status = _quote_status(quote_service)
     indices = _index_quotes(repo, quote_service, None if not explicit_as_of else as_of)
 

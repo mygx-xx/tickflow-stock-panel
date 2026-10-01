@@ -287,7 +287,7 @@ def strategies(
 def run_custom(req: CustomRequest, request: Request):
     repo = request.app.state.repo
     svc = ScreenerService(repo, asset_type=req.asset_type)
-    as_of = req.as_of or svc.latest_date()
+    as_of = req.as_of or svc.latest_trading_date()
     if not as_of:
         raise HTTPException(status_code=400,
                             detail="无可用数据日期 — enriched 表为空,请先运行盘后管道")
@@ -310,7 +310,7 @@ def run_custom(req: CustomRequest, request: Request):
 def run_preset(req: PresetRequest, request: Request):
     repo = request.app.state.repo
     svc = ScreenerService(repo, asset_type=req.asset_type)
-    as_of = req.as_of or svc.latest_date()
+    as_of = req.as_of or svc.latest_trading_date()
     if not as_of:
         raise HTTPException(status_code=400, detail="无可用数据日期")
 
@@ -511,7 +511,7 @@ def market_snapshot(request: Request):
 
     repo = request.app.state.repo
     svc = ScreenerService(repo)
-    as_of = svc.latest_date()
+    as_of = svc.latest_trading_date()
     if not as_of:
         return {"as_of": None, "rows": []}
 
@@ -689,7 +689,7 @@ def run_all(request: Request, body: Optional[dict] = None):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
     else:
-        as_of = svc.latest_date()
+        as_of = svc.latest_trading_date()
     if not as_of:
         return {"as_of": None, "results": {}}
 
@@ -839,7 +839,7 @@ def limit_ladder(
 
     repo = request.app.state.repo
     svc = ScreenerService(repo)
-    as_of = as_of or svc.latest_date()
+    as_of = as_of or svc.latest_trading_date()
     if not as_of:
         raise HTTPException(status_code=400, detail="无可用数据日期")
 

@@ -44,6 +44,11 @@ class _FakeService:
     def latest_date(self):
         return date.fromisoformat(AS_OF)
 
+    # 生产路径改用交易口径解析 (休市日不把假分区当 as_of); 本文件只关心 ISO 格式化
+    # 与非法入参拦截, 故两者返回同一固定日期。
+    def latest_trading_date(self):
+        return date.fromisoformat(AS_OF)
+
     def build_strategy_context(self, *args, **kwargs):
         return SimpleNamespace()
 

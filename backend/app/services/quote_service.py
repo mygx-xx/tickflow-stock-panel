@@ -582,7 +582,12 @@ class QuoteService:
 
         午休/收盘定版阶段同样走边界确认: 避免盘后手动刷新把竞价前的陈旧收盘价
         重新写回当日分区, 覆盖盘后管道按官方日线重建的结果。
+        节假日必须与自动轮询同门控: _market_phase 只看周几, 工作日休市 (国庆等)
+        会落到 morning/afternoon 而被误判为盘中, 手动刷新同样会落盘假分区。
         """
+        if not self._holiday_gate():
+            logger.info("交易日探针判定休市, 跳过手动行情刷新")
+            return self.status()
         phase = self._market_phase()
         is_final = phase in {"morning_final", "close_final"}
         self._fetch_quotes(
@@ -829,8 +834,20 @@ class QuoteService:
         if final_boundary_ms is not None:
             ts_vals = [t for t in (r.get("timestamp") for r in records) if t]
             max_ts = max(ts_vals) if ts_vals else None
+            # 边界只证明"时刻够晚", 不证明"快照属于今天": 休市日数据源返回上一
+            # 交易日的冻结快照时, 其时间戳 (如上一交易日 14:59:59) 本就晚于今日
+            # 边界, 单比大小会把陈旧快照当当日定版落盘, 再用 cn_today() 打戳
+            # 造出与上一交易日逐行相同的假分区 (2026-10-01 国庆实测: 5561 只
+            # OHLC 全等 09-30)。故必须校验快照的北京日期归属 == 今天。
+            max_day = (
+                datetime.fromtimestamp(max_ts / 1000, tz=CN_TZ).date()
+                if max_ts is not None
+                else None
+            )
             confirmed_final = bool(
-                max_ts is not None and max_ts >= final_boundary_ms - _FINAL_CONFIRM_SLACK_MS
+                max_ts is not None
+                and max_day == cn_today()
+                and max_ts >= final_boundary_ms - _FINAL_CONFIRM_SLACK_MS
             )
             self._last_final_confirmed = confirmed_final
 
@@ -1150,19 +1167,32 @@ class QuoteService:
         """行情轮询窗口(兼容旧调用): 包含盘前预热和未完成的午休/收盘定版。"""
         return self._should_poll_for_phase(self._market_phase())
 
-    @staticmethod
-    def _is_continuous_trading() -> bool:
-        """A股连续竞价时段(北京时间): 9:30-11:30 / 13:00-15:00, 仅工作日。
+    @classmethod
+    def _is_continuous_trading(cls) -> bool:
+        """A股连续竞价时段(北京时间): 9:30-11:30 / 13:00-15:00, 且今天是交易日。
 
         比 _is_trading_hours 严格: 排除 9:15-9:30 集合竞价(指示价, 非成交价)、
         午间与 15:00 后收盘缓冲。监控评估只在此窗口进行, 不对竞价/收盘后的陈旧价告警。
-        (节假日由 _evaluate_monitors 里的「快照日期=当日」新鲜度判据兜底, 无需交易日历。)
+
+        **必须并入交易日探针**: 周几门控覆盖不到「工作日但休市」(国庆等)。本方法
+        同时喂给 /api/intraday/status 的 is_trading_hours, 前端据此判定 isTrading
+        并决定是否触发一次即时取数 (Layout.tsx doEnableRealtime)。若此处只看周几,
+        休市日前端会显示"正在交易"并发出取数请求 —— 2026-10-01 国庆实测即由此触发
+        11:25 的行情拉取, 落盘出与上一交易日逐行相同的假分区。
+
+        原先靠 _evaluate_monitors 里的「快照日期=当日」新鲜度判据兜底, 但该判据被
+        同一个假分区满足而失效 (enriched_date 被伪造成当日), 故不能再依赖它。
+        探针未知 (None) 时维持周几近似, 与 _holiday_gate 同语义。
         """
         now = cn_now()
         t = now.time()
         morning = dt_time(9, 30) <= t <= dt_time(11, 30)
         afternoon = dt_time(13, 0) <= t <= dt_time(15, 0)
-        return now.weekday() < 5 and (morning or afternoon)
+        if not (now.weekday() < 5 and (morning or afternoon)):
+            return False
+        from app.services import trading_day
+
+        return trading_day.is_trading_day() is not False
 
     @staticmethod
     def _save_enabled(enabled: bool) -> None:

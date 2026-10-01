@@ -2334,7 +2334,13 @@ def test_code_table_returns_copy_not_cache_itself() -> None:
 
 
 def test_code_table_invalidated_on_new_day(monkeypatch) -> None:
-    """跨北京日期必须立即失效(不依赖 TTL)。"""
+    """跨北京日期必须立即失效(不依赖 TTL)。
+
+    日期必须由 ``hc.cn_today`` **自身**推进 (而非硬编码某个具体日期): 硬编码时
+    一旦运行日恰好等于该日期, "跨日"这一步就退化成同日, 断言 counter==2 恒失败
+    —— 2026-10-01 实测即如此 (原写法 ``date(2026,10,1)`` 与当天 cn_today() 相同)。
+    这里用「当天 + 1 天」构造跨日, 与运行日无关。
+    """
     from app.plugins.eltdx import http_client as hc
 
     t, counter = _codes_transport()
@@ -2345,8 +2351,9 @@ def test_code_table_invalidated_on_new_day(monkeypatch) -> None:
     t.all_a_shares()
     assert counter["n"] == 1
 
-    # 跨日 -> 重拉
-    monkeypatch.setattr(hc, "cn_today", lambda: date(2026, 10, 1))
+    # 跨日 -> 重拉 (相对当天推进, 不写死具体日期)
+    tomorrow = hc.cn_today() + timedelta(days=1)
+    monkeypatch.setattr(hc, "cn_today", lambda: tomorrow)
     t.all_a_shares()
     assert counter["n"] == 2, "跨日未失效"
 

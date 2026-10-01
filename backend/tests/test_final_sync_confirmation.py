@@ -10,7 +10,8 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 
 import pytest
 
@@ -125,6 +126,96 @@ def test_normal_poll_ignores_boundary(service) -> None:
     assert qs._last_final_confirmed is None
     assert repo.calls == ["daily"]
     assert events["enriched"] == 1
+
+
+def test_stale_previous_day_snapshot_after_boundary_skips_disk(service, monkeypatch) -> None:
+    """休市日回归: 快照时间戳晚于 final 边界, 但其日期**不是今天** → 不得落盘。
+
+    2026-10-01 国庆实测: 上游全市场冻结在 09-30 14:59:59.990, 而当日边界是 11:30。
+    仅比较时刻大小时, "昨 14:59" 并不晚于"今 11:30", 看似安全 —— 真正的漏洞在于
+    provider 只拿到 HHMMSS 的 ''当日'' 时间, 按本地当日还原后, 冻结快照被打上了
+    **今日 14:59** 的戳 (实测 ms=1790837999990), 于是大小比较必然通过, 陈旧快照被
+    当定版落盘, 再由 _build_daily 的 cn_today() 打戳, 造出与 09-30 逐行相同的假
+    分区 (5561 只 OHLC 全等, 全市场涨跌幅归零)。
+
+    故这里直接构造该被洗白后的状态: 时间戳的日期 != 今天, 但时刻晚于边界。
+    修复前只比大小 → True 落盘; 修复后校验日期归属 → False。
+    """
+    qs, repo, events = service
+    # 令"今天"比时间戳的日期晚一天: 等价于快照实为昨日、却被当成今日定版。
+    tomorrow = cn_today() + timedelta(days=1)
+    monkeypatch.setattr(qs_module, "cn_today", lambda: tomorrow)
+    yesterday = cn_today()  # 真实今天 = 快照所属日
+    stale_ts = int(
+        datetime.combine(yesterday, dt_time(14, 59, 59, 990_000), tzinfo=CN_TZ).timestamp() * 1000
+    )
+    # 边界取快照当日的 09:35: 时间戳在大小上必然通过, 唯一能拦下它的是日期校验
+    boundary = int(
+        datetime.combine(yesterday, dt_time(9, 35), tzinfo=CN_TZ).timestamp() * 1000
+    )
+    assert stale_ts > boundary, "时间戳必须晚于边界, 否则测试退化为大小比较"
+
+    qs._process_full_market_records(
+        [_record(stale_ts)], t0=0.0, now_ts=0.0,
+        final_boundary_ms=boundary,
+    )
+
+    assert qs._last_final_confirmed is False
+    assert repo.calls == []          # 陈旧快照绝不落盘
+    assert events["enriched"] == 0
+    assert events["broadcast"] == 1  # 展示缓存路径不受影响
+
+
+def test_today_snapshot_after_boundary_still_writes(service) -> None:
+    """日期归属校验不得误伤当日真实定版快照。"""
+    qs, repo, events = service
+
+    qs._process_full_market_records(
+        [_record(_beijing_ms(11, 30, 1))], t0=0.0, now_ts=0.0,
+        final_boundary_ms=_beijing_ms(11, 30),
+    )
+
+    assert qs._last_final_confirmed is True
+    assert repo.calls == ["daily"]
+    assert events["enriched"] == 1
+
+
+def test_refresh_skips_fetch_on_holiday(service, monkeypatch) -> None:
+    """手动刷新必须与自动轮询同门控, 休市日不得触发取数落盘。"""
+    from app.services import trading_day
+
+    qs, repo, _events = service
+    monkeypatch.setattr(trading_day, "is_trading_day", lambda now=None: False)
+    fetched = {"n": 0}
+    monkeypatch.setattr(
+        qs, "_fetch_quotes", lambda **kw: fetched.__setitem__("n", fetched["n"] + 1)
+    )
+
+    qs.refresh()
+
+    assert fetched["n"] == 0
+    assert repo.calls == []
+
+
+def test_refresh_fetches_when_trading(service, monkeypatch) -> None:
+    """交易日手动刷新照常取数 (门控不得误伤正常路径)。"""
+    from app.services import trading_day
+
+    qs, _repo, _events = service
+    monkeypatch.setattr(trading_day, "is_trading_day", lambda now=None: True)
+    monkeypatch.setattr(qs_module, "cn_now", lambda: _at_today(13, 30))
+    fetched = {"n": 0}
+    monkeypatch.setattr(
+        qs, "_fetch_quotes", lambda **kw: fetched.__setitem__("n", fetched["n"] + 1)
+    )
+
+    qs.refresh()
+
+    assert fetched["n"] == 1
+
+
+def _at_today(h: int, m: int) -> datetime:
+    return datetime.combine(cn_today(), dt_time(h, m), tzinfo=CN_TZ)
 
 
 def test_final_boundary_ms_matches_beijing_close(monkeypatch) -> None:

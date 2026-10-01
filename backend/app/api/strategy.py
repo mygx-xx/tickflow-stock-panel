@@ -373,7 +373,7 @@ def run_strategy(req: RunRequest, request: Request):
     if not as_of:
         from app.services.screener import ScreenerService
         svc = ScreenerService(request.app.state.repo, asset_type=req.asset_type)
-        as_of = svc.latest_date()
+        as_of = svc.latest_trading_date()
     if not as_of:
         raise HTTPException(status_code=400, detail="无可用数据日期")
 
@@ -410,7 +410,7 @@ def run_all(req: RunAllRequest, request: Request):
     if not as_of:
         from app.services.screener import ScreenerService
         svc = ScreenerService(request.app.state.repo, asset_type=req.asset_type)
-        as_of = svc.latest_date()
+        as_of = svc.latest_trading_date()
     if not as_of:
         return {"as_of": None, "results": {}}
 

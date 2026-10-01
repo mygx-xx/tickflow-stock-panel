@@ -14,9 +14,22 @@ from __future__ import annotations
 from datetime import datetime
 from unittest.mock import patch
 
+import pytest
+
 from app.market_time import CN_TZ
-from app.services import depth_service
+from app.services import depth_service, trading_day
 from app.services.depth_service import DepthService
+
+
+@pytest.fixture(autouse=True)
+def _trading_day(monkeypatch):
+    """固定交易日探针为「交易日」, 隔离真实日历与网络。
+
+    本文件只验证**时段窗口**边界; 休市日的剔除由
+    test_holiday_gate_blocks_continuous_trading 单独覆盖。不固定的话, 断言在
+    国庆/春节等休市日运行会整体翻转 (探针判休市 → 连续竞价恒 False)。
+    """
+    monkeypatch.setattr(trading_day, "is_trading_day", lambda now=None: True)
 
 
 def _cn_now_at(hour: int, minute: int, weekday: int = 0):
@@ -129,3 +142,50 @@ def test_window_matches_quote_service():
                     assert DepthService._is_continuous_trading() == QuoteService._is_continuous_trading(), (
                         f"窗口不一致 @ weekday={weekday} {hour:02d}:{minute:02d}"
                     )
+
+
+# ── 休市日: 工作日但无交易 (2026-10-01 国庆回归) ──────────────────────
+def test_holiday_gate_blocks_continuous_trading(monkeypatch):
+    """工作日 + 竞价时段, 但探针判休市 → 两边都必须 False。
+
+    2026-10-01 国庆实测: 原实现只看 weekday(), 周四 11:25 返回 True。
+    该值经 /api/intraday/status 的 is_trading_hours 传给前端, 前端据此
+    判定 isTrading=True 并触发一次即时取数 (Layout.tsx doEnableRealtime),
+    落盘出与上一交易日逐行相同的假分区 (5561 只 OHLC 全等)。
+    """
+    from app.services import quote_service
+    from app.services.quote_service import QuoteService
+
+    monkeypatch.setattr(trading_day, "is_trading_day", lambda now=None: False)
+    fn = _cn_now_at(11, 25, weekday=3)  # 周四盘中
+    with patch.object(depth_service, "cn_now", fn), \
+            patch.object(quote_service, "cn_now", fn):
+        assert QuoteService._is_continuous_trading() is False
+        assert DepthService._is_continuous_trading() is False
+
+
+def test_unknown_verdict_keeps_weekday_approx(monkeypatch):
+    """探针未知 (None) → 维持周几近似, 不误伤盘中真实行情。
+
+    必须固定时钟为盘中: 本文件其余用例都显式指定时刻, 这里若依赖真实挂钟,
+    断言会随运行时刻翻转 (非盘中自然为 False)。
+    """
+    from app.services import quote_service
+    from app.services.quote_service import QuoteService
+
+    monkeypatch.setattr(trading_day, "is_trading_day", lambda now=None: None)
+    fn = _cn_now_at(10, 0, weekday=0)  # 周一上午盘中
+    with patch.object(quote_service, "cn_now", fn):
+        assert QuoteService._is_continuous_trading() is True
+
+
+def test_holiday_does_not_widen_window_outside_session(monkeypatch):
+    """休市判定不得改变时段窗口本身: 盘中之外仍为 False。"""
+    from app.services import quote_service
+    from app.services.quote_service import QuoteService
+
+    monkeypatch.setattr(trading_day, "is_trading_day", lambda now=None: False)
+    # 午间休市: 无论交易日与否都不在连续竞价窗口
+    fn = _cn_now_at(12, 0, weekday=0)
+    with patch.object(quote_service, "cn_now", fn):
+        assert QuoteService._is_continuous_trading() is False

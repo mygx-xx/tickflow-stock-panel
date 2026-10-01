@@ -529,6 +529,44 @@ class ScreenerService:
             return None
         return None
 
+    def latest_trading_date(self) -> date | None:
+        """latest_date 的交易口径版本: 休市日打戳产生的分区视为无效, 回溯到最近交易日。
+
+        实时落盘用 cn_today() 给每行打戳 (quote_service._build_daily), 一旦在休市日
+        跑成就会留下 date=<休市日> 的分区, 内容与上一交易日逐行相同 (2026-10-01 国庆
+        实测: 5561 只 OHLC 全等, 全市场 change_pct 归零)。读取侧一律取 max(date),
+        于是该假分区成为全应用的 as_of —— 看板把它当交易日渲染, 选股/策略/监控/异动
+        全部继承错误日期。
+
+        判据: 候选 == 今天 且 探针确认今天休市 → 回溯到不晚于今天的最近分区。
+        探针未知 (None) 时不拦截 —— 探针不可用时"今天"可能就是真实交易日, 回溯会丢
+        当日数据; 候选早于今天时也不拦截 (节后首次运行的正常状态)。
+        """
+        d = self.latest_date()
+        if d is None:
+            return None
+        from app.market_time import cn_today
+        from app.services import trading_day
+
+        today = cn_today()
+        if d == today and trading_day.is_trading_day() is False:
+            return self._latest_date_on_or_before(today) or d
+        return d
+
+    def _latest_date_on_or_before(self, cutoff: date) -> date | None:
+        """DuckDB 回溯: 不晚于 cutoff 的最大 enriched 日期。"""
+        try:
+            res = self.repo.execute_one(
+                "SELECT max(date) FROM kline_enriched WHERE date <= ?",
+                [cutoff],
+            )
+            if res and res[0]:
+                d = res[0]
+                return d if isinstance(d, date) else date.fromisoformat(str(d))
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     def coverage_warnings(self, as_of: date, *, required_bars: int | None = None) -> list[str]:
         """数据充足性提示 (#303): enriched 覆盖不足时返回用户可读警告, 充足返回 []。
 
