@@ -423,15 +423,17 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
     from app.api import settings as settings_api
     from app.services import data_integrity
 
-    real_today = datetime.now(CN_TZ).date()
-    snapshot_day = _recent_trading_day_before(real_today)
+    # 锚定交易日: 自然今天可能是休市日, 用它当"最新分区"会让候选日计算
+    # 把完整数据判成缺口(见 _latest_trading_day_today docstring)。
+    latest_day = _latest_trading_day_today()
+    snapshot_day = _recent_trading_day_before(latest_day)
     _write_daily_partition(
         tmp_path, "kline_daily", snapshot_day,
         _ts_ms(snapshot_day, time(11, 58)),
     )
     _write_daily_partition(
-        tmp_path, "kline_daily", real_today,
-        _ts_ms(real_today, time(10, 0)),
+        tmp_path, "kline_daily", latest_day,
+        _ts_ms(latest_day, time(10, 0)),
     )
 
     launched = []
@@ -447,6 +449,19 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
     qs = _QuoteServiceStub()
     request = _gate_state(tmp_path, qs, repo=None)
     req = settings_api.RealtimeQuotesPrefs(realtime_quotes_enabled=True)
+
+    # 生产代码用真实 today 扫描并判窗口; 休市日(长假)会让"今天 - 坏日"超出
+    # AUTO_REPAIR_MAX_LAG_DAYS 而静默放行, 故两处均以 latest_day 为基准。
+    real_scan = data_integrity.scan_recent_integrity
+    monkeypatch.setattr(
+        data_integrity, "scan_recent_integrity",
+        lambda d, **kw: real_scan(d, today=latest_day, **kw),
+    )
+    real_window = data_integrity.within_auto_repair_window
+    monkeypatch.setattr(
+        data_integrity, "within_auto_repair_window",
+        lambda day, **kw: real_window(day, today=latest_day, **kw),
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         settings_api.update_realtime_quotes(req, request)
@@ -538,18 +553,30 @@ def test_boot_check_launches_repair_within_window(tmp_path, monkeypatch):
 
     from app.services import data_integrity
 
-    # boot_integrity_check 用真实"今天" — 往回找最近工作日造盘中快照分区
     launched = []
     monkeypatch.setattr(
         data_integrity, "launch_integrity_repair",
         lambda state, day, reason: (launched.append(day) or ("job-x", True)),
     )
 
-    real_today = datetime.now(CN_TZ).date()
-    probe = _recent_trading_day_before(real_today)
+    # 锚定交易日: boot_integrity_check 用真实"今天"扫描 + 判窗口, 休市日
+    # (长假)下"今天 - 坏日"会超出 AUTO_REPAIR_MAX_LAG_DAYS 而静默跳过修复。
+    latest_day = _latest_trading_day_today()
+    probe = _recent_trading_day_before(latest_day)
     data_dir = tmp_path / "boot"
     _write_daily_partition(data_dir, "kline_daily", probe, _ts_ms(probe, time(11, 58)))
-    _write_daily_partition(data_dir, "kline_daily", real_today, _ts_ms(real_today, time(10, 0)))
+    _write_daily_partition(data_dir, "kline_daily", latest_day, _ts_ms(latest_day, time(10, 0)))
+
+    real_scan = data_integrity.scan_recent_integrity
+    monkeypatch.setattr(
+        data_integrity, "scan_recent_integrity",
+        lambda d, **kw: real_scan(d, today=latest_day, **kw),
+    )
+    real_window = data_integrity.within_auto_repair_window
+    monkeypatch.setattr(
+        data_integrity, "within_auto_repair_window",
+        lambda day, **kw: real_window(day, today=latest_day, **kw),
+    )
 
     state = SimpleNamespace(
         repo=SimpleNamespace(store=SimpleNamespace(data_dir=data_dir)),
@@ -582,8 +609,12 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     from app.services import instrument_sync, kline_sync
     from app.tickflow.repository import DataStore, KlineRepository
 
-    today = datetime.now(CN_TZ).date()
+    # 锚定交易日: run_now 用 cn_today() 决定分支与扫描基准。休市日(长假)下
+    # "今天 - 坏日"超出 AUTO_REPAIR_MAX_LAG_DAYS, 修复分支不会触发, 用例静默失败。
+    # 只patch cn_today —— scan_recent_integrity 已由 pipeline 显式传入 today。
+    today = _latest_trading_day_today()
     yesterday = _recent_trading_day_before(today)
+    monkeypatch.setattr(daily_pipeline, "cn_today", lambda: today)
 
     _write_full_partition(tmp_path, "kline_daily", yesterday, _ts_ms(yesterday, time(11, 58)))
     _write_full_partition(tmp_path, "kline_daily", today, _ts_ms(today, time(10, 0)))
@@ -711,6 +742,23 @@ def _recent_trading_day_before(day: date) -> date:
         elif d.weekday() < 5:
             return d
         d -= timedelta(days=1)
+
+
+def _latest_trading_day_today() -> date:
+    """今天(若为交易日)或严格早于今天的最近交易日。
+
+    闸门类测试必须把「最新分区」锚在交易日上, 不能用自然今天 ——
+    休市日(如国庆长假)下最新分区会落在非交易日, 候选日计算随即把它当作
+    缺失日, 测试语义静默走偏。2026-10-07(休市, 长假至 10-06)即触发此问题:
+    4 个用例把当日分区当"完整数据", 而扫描把它判为缺口, 断言全部失败。
+    """
+    cal = trading_day.trading_calendar()
+    today = datetime.now(CN_TZ).date()
+    if cal is None:
+        return today if today.weekday() < 5 else _recent_trading_day_before(today)
+    if today in cal:
+        return today
+    return _recent_trading_day_before(today)
 
 
 def test_candidate_days_excludes_market_holiday(monkeypatch):
