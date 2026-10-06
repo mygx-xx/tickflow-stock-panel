@@ -259,12 +259,23 @@ function Cleanup-All {
 
 # ===== 7. Main loop - pump output, handle Ctrl-C =====
 # Treat Ctrl-C as input so try/finally is guaranteed to run.
-$prevCtrlC = [Console]::TreatControlCAsInput
+#
+# 非交互式会话(CI / IDE 任务面板 / 后台进程 / 输出重定向到管道)下没有真实控制台
+# 输入句柄, 此时 [Console]::TreatControlCAsInput / KeyAvailable / ReadKey 会抛
+# 「句柄无效」(WinError 6)。这类会话由父进程或 job 终止器负责结束脚本, 因此
+# 直接跳过控制台交互, 只泵日志。IsInputRedirected 在无控制台时同样安全返回。
+$interactive = -not [Console]::IsInputRedirected
+$prevCtrlC = $null
+if ($interactive) {
+    $prevCtrlC = [Console]::TreatControlCAsInput
+}
 try {
-    [Console]::TreatControlCAsInput = $true
+    if ($interactive) {
+        [Console]::TreatControlCAsInput = $true
+    }
 
     while ($true) {
-        if ([Console]::KeyAvailable) {
+        if ($interactive -and [Console]::KeyAvailable) {
             $key = [Console]::ReadKey($true)
             if (($key.Modifiers -band [ConsoleModifiers]::Control) -and $key.Key -eq 'C') {
                 break
@@ -296,6 +307,8 @@ try {
     }
 }
 finally {
-    [Console]::TreatControlCAsInput = $prevCtrlC
+    if ($interactive) {
+        try { [Console]::TreatControlCAsInput = $prevCtrlC } catch { }
+    }
     Cleanup-All
 }
