@@ -3161,7 +3161,9 @@ export const api = {
       `/api/pipeline/jobs?limit=${limit}`,
     ),
 
-  dataStatus: () => request<DataStatus>('/api/data/status'),
+  // 聚合 12 张表 + 文件层统计 + 调度信息, 属重接口; 冷缓存下会明显慢于普通查询,
+  // 不与默认的 30s 通用超时共用(否则数据页/看板首屏会报"请求超时")。
+  dataStatus: () => request<DataStatus>('/api/data/status', { timeoutMs: 90_000 }),
   dataClear: () => request<{ deleted_files: number }>('/api/data/clear', { method: 'POST' }),
   refreshCache: () => request<{ ok: boolean }>('/api/data/refresh-cache', { method: 'POST' }),
   enrichedSchema: (table: string) => request<EnrichedField[]>(`/api/data/schema/${table}`),

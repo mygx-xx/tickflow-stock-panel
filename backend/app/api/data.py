@@ -27,7 +27,10 @@ _TABLE_TTL_LARGE = 120.0  # 大表(分钟K等)单独 TTL，避免多分区聚合
 _STORAGE_TTL = 60.0  # storage 文件扫描独立 TTL,stage 写完不触发重算
 
 # 聚合慢的大表（分区数多、行数多），使用更长的 TTL
-_LARGE_TABLES = {"minute"}
+# 聚合慢的大表（分区数多、行数多），使用更长的 TTL
+# 指数日K/指数 enriched/ETF 日K 虽已改为零数据扫描(合计 <1s), 但仍是本接口里
+# 最重的三项, 给 120s 窗口避免多端并发时反复重算。
+_LARGE_TABLES = {"minute", "index_daily", "index_enriched", "etf_daily"}
 
 _storage_cache: dict[str, Any] | None = None
 _storage_cache_ts: float = 0.0
@@ -122,22 +125,42 @@ def _safe_aggregate(repo, view: str) -> dict | None:
     }
 
 
+def _partition_date_range(repo, subdir: str) -> list[str] | None:
+    """从``date=`` 分区目录名取有序日期列表, 不读任何 parquet。
+
+    返回 None 表示目录不存在或无分区(即无数据)。调用方据此判断"无数据"，
+    与 :func:`_safe_aggregate` 返回 None 的语义保持一致。
+    """
+    d = repo.store.data_dir / subdir
+    if not d.exists():
+        return None
+    dates: list[str] = []
+    for p in d.iterdir():
+        if p.is_dir() and p.name.startswith("date="):
+            dates.append(p.name[5:])
+    if not dates:
+        return None
+    dates.sort()
+    return dates
+
+
+def _describe_field_count(repo, view: str) -> int:
+    """DESCRIBE 取字段数 — 只读 schema 不碰数据, 失败返回 0。"""
+    try:
+        return len(repo.execute_all(f"DESCRIBE {view}"))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _safe_aggregate_daily(repo, view: str = "kline_daily") -> dict | None:
     """日K轻量统计 — 零数据扫描。
 
     从分区目录名获取日期范围和交易日数，不读任何 parquet。
     标的数从 instruments 小表获取（~5000行，毫秒级）。
     """
-    daily_dir = repo.store.data_dir / "kline_daily"
-    if not daily_dir.exists():
+    dates = _partition_date_range(repo, "kline_daily")
+    if dates is None:
         return None
-    dates: list[str] = []
-    for d in daily_dir.iterdir():
-        if d.is_dir() and d.name.startswith("date="):
-            dates.append(d.name[5:])
-    if not dates:
-        return None
-    dates.sort()
 
     symbols = _count_instruments_symbols(repo)
 
@@ -225,23 +248,54 @@ def _safe_aggregate_instruments(repo) -> dict | None:
     }
 
 
+def _count_index_instruments_symbols(repo) -> int:
+    """指数标的数 — 从 instruments_index 小表取(毫秒级)。"""
+    try:
+        row = repo.execute_one("SELECT count(DISTINCT symbol) FROM instruments_index")
+        if row and row[0]:
+            return int(row[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
 def _safe_aggregate_index_daily(repo) -> dict | None:
-    """指数日K统计。指数数据量较小，直接读取 parquet 元数据统计真实行数。"""
-    return _safe_aggregate(repo, "kline_index_daily")
+    """指数日K统计 — 零数据扫描。
+
+    指数日K 分区极多(kline_index_daily 约 1700 个 date= 分区)而单分区极小,
+    Parquet 的每文件元数据开销远大于数据本身: 实测全表 COUNT 需 ~47s, 而
+    /api/data/status 的前端超时只有 30s, 冷缓存必然超时。
+    故与 _safe_aggregate_daily 同策略 —— 分区目录取日期范围 + instruments_index
+    小表取标的数, 全表扫描为零。
+
+    注意 ``rows`` 恒为 0: 前端 StatCard 已支持该状态(展示 trading_days 而非行数),
+    Data.tsx 的指数/ETF 概览也本就硬编码 rows: 0, 无依赖绝对行数的消费点。
+    """
+    dates = _partition_date_range(repo, "kline_index_daily")
+    if dates is None:
+        return None
+    return {
+        "rows": 0,
+        "earliest_date": dates[0],
+        "latest_date": dates[-1],
+        "symbols_covered": _count_index_instruments_symbols(repo),
+        "trading_days": len(dates),
+    }
 
 
 def _safe_aggregate_index_enriched(repo) -> dict | None:
-    """指数 enriched 统计。指数数据量较小，直接读取 parquet 元数据统计真实行数。"""
-    fields = 0
-    try:
-        cols = repo.execute_all("DESCRIBE kline_index_enriched")
-        fields = len(cols)
-    except Exception:  # noqa: BLE001
-        pass
-    stats = _safe_aggregate(repo, "kline_index_enriched")
-    if not stats:
+    """指数 enriched 统计 — 零数据扫描(同 index_daily, 原全表扫描 ~64s)。"""
+    dates = _partition_date_range(repo, "kline_index_enriched")
+    if dates is None:
         return None
-    return {**stats, "fields": fields}
+    return {
+        "rows": 0,
+        "fields": _describe_field_count(repo, "kline_index_enriched"),
+        "earliest_date": dates[0],
+        "latest_date": dates[-1],
+        "symbols_covered": _count_index_instruments_symbols(repo),
+        "trading_days": len(dates),
+    }
 
 
 def _safe_aggregate_index_instruments(repo) -> dict | None:
@@ -309,39 +363,43 @@ def _safe_aggregate_etf_enriched(repo) -> dict | None:
     return {**stats, "fields": fields}
 
 
-def _safe_aggregate_etf_daily(repo) -> dict | None:
-    """ETF 日K统计 — 优先独立 kline_etf_daily，兼容旧 index 存储。"""
-    queries = [
-        """SELECT count(*) AS rows,
-                  min(date) AS earliest,
-                  max(date) AS latest,
-                  count(DISTINCT symbol) AS symbols,
-                  count(DISTINCT date) AS trading_days
-           FROM kline_etf_daily""",
-        """SELECT count(*) AS rows,
-                  min(date) AS earliest,
-                  max(date) AS latest,
-                  count(DISTINCT symbol) AS symbols,
-                  count(DISTINCT date) AS trading_days
-           FROM kline_index_daily
-           WHERE symbol IN (
-               SELECT DISTINCT symbol FROM instruments_index WHERE asset_type = 'etf'
-           )""",
-    ]
-    for sql in queries:
+def _count_etf_instruments_symbols(repo) -> int:
+    """ETF 标的数 — 优先 instruments_etf, 兼容旧 instruments_index.asset_type='etf'。"""
+    for sql in (
+        "SELECT count(DISTINCT symbol) FROM instruments_etf",
+        "SELECT count(DISTINCT symbol) FROM instruments_index WHERE asset_type = 'etf'",
+    ):
         try:
             row = repo.execute_one(sql)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("aggregate etf daily fallback failed: %s", e)
+        except Exception:  # noqa: BLE001
             continue
         if row and row[0]:
-            return {
-                "rows": int(row[0]),
-                "earliest_date": str(row[1]) if row[1] else None,
-                "latest_date": str(row[2]) if row[2] else None,
-                "symbols_covered": int(row[3] or 0),
-                "trading_days": int(row[4] or 0),
-            }
+            return int(row[0])
+    return 0
+
+
+def _safe_aggregate_etf_daily(repo) -> dict | None:
+    """ETF 日K统计 — 零数据扫描。
+
+    优先独立 kline_etf_daily 存储, 兼容旧 index 存储(此时日期范围取
+    kline_index_daily 分区, 标的数由 asset_type='etf' 过滤)。
+    原实现两条路径都是全表 COUNT, 冷缓存实测 ~14.5s。
+    """
+    for subdir in ("kline_etf_daily", "kline_index_daily"):
+        dates = _partition_date_range(repo, subdir)
+        if dates is None:
+            continue
+        symbols = _count_etf_instruments_symbols(repo)
+        # 旧 index 存储下仅 ETF 子集有数据, 无 ETF 标的则视为该路径无数据。
+        if symbols == 0:
+            continue
+        return {
+            "rows": 0,
+            "earliest_date": dates[0],
+            "latest_date": dates[-1],
+            "symbols_covered": symbols,
+            "trading_days": len(dates),
+        }
     return None
 
 
