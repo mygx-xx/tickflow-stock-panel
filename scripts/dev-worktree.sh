@@ -99,6 +99,19 @@ ok()   { printf '\033[0;32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[0;33m  !!\033[0m  %s\n' "$*"; }
 die()  { printf '\033[0;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# 判断目录是否为 NTFS 联接(Junction / symlink reparse point)。
+# 关键: Git Bash 的 `[[ -L ]]` 对 Junction **恒为 false** —— Junction 在 POSIX
+# 层就呈现为普通目录。只用 [[ -L ]] 会让 check 把"已建好的联接"误报成
+# "实体目录(占空间)", 也让幂等跳过失效(重复跑 create 会重复建)。
+# fsutil 输出是本地编码, 不能带 text 解码, 只取 bytes 做 ascii 匹配。
+is_link() {
+  local t="$1"
+  [[ -L "$t" ]] && return 0
+  fsutil reparsepoint query "$t" 2>/dev/null \
+    | tr -d '\r' \
+    | grep -qiE 'IO_REPARSE_TAG_(MOUNT_POINT|SYMLINK)'
+}
+
 # ============================================================
 # 端口工具
 # ============================================================
@@ -250,7 +263,11 @@ cmd_create() {
     else
       printf '\nPORT=%s\n' "$be_port" >> "$wt_dir/.env"
     fi
-    ok ".env 已复制, PORT -> $be_port"
+    # 注意: 刻意**不**写 FRONTEND_PORT 到 .env ——
+    # dev.ps1:57 只读环境变量 $env:FRONTEND_PORT, 不读 .env 里的该键,
+    # 写进去只会造成"已隔离"的错觉。vite.config.ts 的 server.port 硬编码 3011,
+    # 因此前端端口**只能**靠启动时显式传 -FrontendPort 生效。
+    ok ".env 已复制, PORT=$be_port (前端端口须靠启动参数传入)"
   else
     warn "主树无 .env, 新 worktree 需自行创建"
   fi
@@ -259,6 +276,12 @@ cmd_create() {
   ok "端口已登记: $PORT_REGISTRY"
 
   # ---------- data/ ----------
+  # 重要: 沙箱/IDE 环境下 setup_data_dirs 里的 Junction 创建会失败 ——
+  # 从 Bash 调powershell 会被安全策略拦("Invoking PowerShell from Bash
+  # bypasses PowerShell security checks"), 且 stderr 被吞, 表现为
+  # create 输出了 .env/端口几行就结束、data/ 为 0 项。
+  # 补救: 用 PowerShell 工具执行 New-Item -ItemType Junction,
+  #或直接跑 scripts/link-worktree-data.sh <目录名> 校验/补建。
   setup_data_dirs "$wt_dir"
 
   # ---------- 依赖 ----------
@@ -318,7 +341,7 @@ setup_data_dirs() {
     local dst="$wt_data/$d"
     [[ -e "$src" ]] || continue
     # 已有联接 = 上次跑过, 跳过(联接不可用 -e 判断为假, 所以显式查 -L)
-    if [[ -L "$dst" ]]; then
+    if is_link "$dst"; then
       linked=$((linked+1))
       continue
     fi
@@ -329,7 +352,7 @@ setup_data_dirs() {
     link_dir "$dst" "$src"
     # 不信link_dir 的返回值 —— 事后验证目标状态。
     # Junction 用[[ -L ]] 可判定; 万一退化成实体目录则删掉重来。
-    if [[ -L "$dst" ]]; then
+    if is_link "$dst"; then
       linked=$((linked+1))
     else
       warn "联接失败, 退回复制: $d"
@@ -453,7 +476,7 @@ cmd_check() {
   log "data/ 联接检查:"
   for d in "${SHARED_DATA_DIRS[@]}"; do
     local dst="$wt_dir/data/$d"
-    if [[ -L "$dst" ]]; then
+    if is_link "$dst"; then
       ok "  $d -> 联接"
     elif [[ -d "$dst" ]]; then
       printf '  \033[0;33m  !!\033[0m  %s 实体目录(占空间, 建议联接)\n' "$d"
@@ -465,7 +488,7 @@ cmd_check() {
   log "data/ 可写目录(必须是实体, 联接=串写风险):"
   for d in paper job_store cache user_data; do
     local dst="$wt_dir/data/$d"
-    if [[ -L "$dst" ]]; then
+    if is_link "$dst"; then
       warn "  $d 是联接 —— 会与主树串写, 必须删掉重建实体目录"
     elif [[ -d "$dst" ]]; then
       ok "  $d 独立"
@@ -491,7 +514,7 @@ cmd_remove() {
   local unlinked=0
   for d in "${SHARED_DATA_DIRS[@]}"; do
     local dst="$wt_dir/data/$d"
-    if [[ -L "$dst" ]]; then
+    if is_link "$dst"; then
       # cmd //c rmdir 只删 junction 本身, 不动目标内容
       cmd //c rmdir "$(cygpath -w "$dst" 2>/dev/null || echo "$dst")" >/dev/null 2>&1 || true
       unlinked=$((unlinked+1))
@@ -504,7 +527,7 @@ cmd_remove() {
   # 兜底: 若仍有残留联接, 拒绝强删, 避免误伤主树
   local remain=0
   for d in "${SHARED_DATA_DIRS[@]}"; do
-    [[ -L "$wt_dir/data/$d" ]] && remain=$((remain+1))
+    is_link "$wt_dir/data/$d" && remain=$((remain+1))
   done
   if [[ "$remain" -gt 0 ]]; then
     die "仍有 $remain 个联接未摘除, 已中止。请手动检查 $wt_dir/data 后再执行"
