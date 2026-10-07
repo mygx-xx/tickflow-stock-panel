@@ -172,13 +172,20 @@ LEDGER_TEMPLATE = """# {sid} 迭代台账
 - 思路: {idea}
 - 迭代区间: {iter_start} ~ {iter_end}
 - **留出集(封存): {holdout_start} ~ {holdout_end}** —— 任何一轮都不许用, 定型版本只在上面跑一次
-- 判定门槛(先于结果写下, 数字示例, 需按思路改):
+- 判定门槛 · **相对量**(衡量「改动有没有把好东西改坏」):
   - 全区间夏普 >= {base_sharpe} + 0.2
   - 分年最差 > 0
   - 样本外降幅 < 10%
   - 命中数变化 < 50%
+- 判定门槛 · **绝对量**(衡量「这东西本来好不好」, 必写, 见 docs §4.1):
+  - 留出集**超额收益 > 0**  ← 底线: 跑不赢基准一律不上线
+  - 留出集夏普 >= __
+  - 留出集最大回撤 >= __
 - 回退线: 样本外夏普降幅 > 20% 或 胜率 < 45% 或 敏感性陡变(±20% 扰动指标波动 > 30%)
 - 基线(v1): 夏普 __ / 回撤 __ / 胜率 __ / 盈亏比 __ / 命中 __
+- 运行配置(逐轮必须一致, 否则指标不可比):
+  - profile=__ max_positions=__ holding_days=__ regime_states=__
+  - 完整配置见同目录 run_config.json, iter_workbench.py run 会自动比对拦截
 - 待试清单:
   1. 
   2. 
@@ -256,6 +263,111 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     print(f"[remind] 别忘了在 LEDGER.md 追加本轮: 假设 / 改动 / 证据 / 判定 / 负知识 / 下一步")
 
 
+def cmd_final(args: argparse.Namespace) -> None:
+    """留出集终审(协议 §4)。**只能用一次**, 用过即封存。
+
+    背景: 留出集按协议是「最后 20%」, 实测只有 ~13 个月(419 天)。
+    而 validate.py 原先硬编码「区间 ≥500 天才跑样本外」, 导致:
+      留出集终审 → 样本外关卡永远被跳过 → §4 的「样本外降幅<10%」门槛
+      形同虚设。实测 419 天用默认窗口(252/63/63)正好能切 2 折,
+      而门槛 min_valid_folds=2 —— 设计上是自洽的, 只是被那个 500 天挡住了。
+    → 已把 validate.py 改为按区间长度自适应折窗口, 并如实报告实际折数。
+
+    纪律: 跑完写 holdout.json 的 consumed_at, 二次执行需再显式 --force,
+    以便在台账里留下「终审跑过几次」的可审计记录。
+    """
+    ho = read_holdout(args.strategy_id)
+    if ho is None:
+        raise SystemExit("[error] 未初始化。先跑 init。")
+    consumed = ho.get("consumed_at")
+    if consumed and not args.force:
+        raise SystemExit(
+            f"[error] 留出集已于 {consumed} 消耗过(协议 §4: 定型版本只在留出集上跑一次)。\n"
+            f"       再次运行会破坏多重检验防线。确需重跑请显式 --force, 并在台账说明原因。"
+        )
+
+    start, end = ho["holdout_start"], ho["holdout_end"]
+    span = (date.fromisoformat(end) - date.fromisoformat(start)).days
+    print(f"终审模式 · 留出集 {start} ~ {end} ({span} 天)")
+    print("[!] 这是留出集, 只应对定型版本执行一次。")
+
+    # 预估折数, 让操作者事先知道结论强度
+    w = _auto_fold_window(span)
+    if w:
+        n = max(0, (span - w[0] - w[1]) // w[2] + 1)
+        print(f"     自适应折窗口 train/test/step = {w[0]}/{w[1]}/{w[2]}"
+              f" → 预计 {n} 折(门槛 min_valid_folds="
+              f"{args.min_folds or '按档位'})")
+        if n < (args.min_folds or 2):
+            print(f"[warn] 预计折数 {n} < 常见门槛 {args.min_folds or 2}, "
+                  f"样本外结论会偏弱, 可用 --wf-train-days/--wf-test-days 调参")
+    else:
+        print("[warn] 该留出集长度连一折都切不出, 样本外关将跳过")
+
+    if args.dry_run:
+        print("[dry-run] 未执行回测, 留出集未消耗。去掉 --dry-run 才会真正跑。")
+        return
+
+    args.r = args.r or "final"
+    args.no_stage_all = False
+    args.require_oos = True  # 终审按老口径: 样本外不过即不通过
+    rc = cmd_run(args)
+
+    # 读报告结论: 只有「产出报告」才写消耗标记; 回测本身崩了不算消耗。
+    verdict = None
+    try:
+        rj = iter_dir(args.strategy_id) / "evidence" / f"{args.r}.json"
+        if rj.is_file():
+            raw = json.loads(rj.read_text(encoding="utf-8"))
+            reports = raw if isinstance(raw, list) else [raw]
+            rep = next(
+                (r for r in reports if r.get("strategy_id") == args.strategy_id), None
+            )
+            if rep is not None:
+                verdict = rep.get("verdict")
+    except Exception:  # noqa: BLE001
+        verdict = None
+
+    if verdict and consumed is None:
+        ho = read_holdout(args.strategy_id)
+        if ho is not None:
+            ho["consumed_at"] = date.today().isoformat()
+            ho["consumed_verdict"] = verdict
+            ho["consumed_note"] = (
+                "由 iter_workbench.py final 消耗; 折窗口 "
+                + ("/".join(str(x) for x in w) if w else "n/a")
+                + f"; 结论 {verdict}。终审无论通过与否都算消耗 —— "
+                "多重检验防线禁止「反复试到通过」。"
+            )
+            (iter_dir(args.strategy_id) / "holdout.json").write_text(
+                json.dumps(ho, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print()
+            print(f"[ok] 留出集已标记消耗: consumed_at={ho['consumed_at']} "
+                  f"verdict={verdict}")
+            print("[next] 用 draft 写入台账, 并对照协议 §4 判定门槛")
+            print("[next] 若判定为定型, 下一轮改动已无留出集可用 —— "
+                  "需要新留出集必须换数据终点重新 init")
+    elif verdict is None:
+        print()
+        print("[warn] 未拿到报告结论, 留出集**未**标记消耗(回测可能未完成)")
+
+    raise SystemExit(rc)
+
+
+def _auto_fold_window(total_days: int) -> tuple[int, int, int] | None:
+    """复刻 validate.py 的自适应折窗口选择, 用于跑前预估折数。"""
+    if total_days >= 252 + 63 + 1:
+        return (252, 63, 63)
+    if total_days >= 180 + 45 + 1:
+        return (180, 45, 45)
+    if total_days >= 120 + 30 + 1:
+        return (120, 30, 30)
+    if total_days >= 60 + 20 + 1:
+        return (60, 20, 20)
+    return None
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """跑一轮取证。
 
@@ -280,7 +392,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         )
     if args.full:  # 终审: 允许显式跑留出集, 但必须 --full 明示
         start, end = ho["holdout_start"], ho["holdout_end"]
-        print(f"[warn] 终审模式: 使用留出集 {start} ~ {end} —— 这一步只能用一次")
+        if getattr(args, "func", None) is cmd_run:
+            # 直接用 run --full 时提示正规入口; final 子命令自己已经提示过了
+            print(f"[warn] 终审模式: 使用留出集 {start} ~ {end}")
+            print("[hint] 建议改用 final 子命令: 它会预估折数并在跑完后标记留出集已消耗。")
     else:
         start, end = ho["iteration_start"], ho["iteration_end"]
         print(f"迭代区间: {start} ~ {end}(留出集 {ho['holdout_start']} ~ {ho['holdout_end']} 已封存)")
@@ -306,12 +421,14 @@ def cmd_run(args: argparse.Namespace) -> None:
         "iteration_end": end,
     }
     cfg_path = d / "run_config.json"
-    if cfg_path.is_file():
+    # 终审跑留出集, 区间本就与迭代区间不同 -> 不参与可比性比对, 也不覆盖基准。
+    # (留出集指标只与「留出集基线」比, 不与迭代轮次比)
+    if cfg_path.is_file() and not args.full:
         try:
             prev = json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             prev = {}
-        if prev and not args.full:
+        if prev:
             diffs = [
                 f"  {k}: 上一轮 {prev.get(k)!r} -> 本轮 {v!r}"
                 for k, v in cfg.items()
@@ -323,7 +440,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                     + "\n".join(diffs)
                     + "\n\n若确实要改(如收窄区间做快速试探), 确认代价后用 --reconfig 覆盖基准。"
                 )
-    if args.reconfig or not cfg_path.is_file():
+    if (args.reconfig or not cfg_path.is_file()) and not args.full:
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         if args.reconfig:
             print("[warn] 已用 --reconfig 覆盖运行配置基准")
@@ -342,6 +459,13 @@ def cmd_run(args: argparse.Namespace) -> None:
         cmd += ["--regime-states", *args.regime_states]
     if args.require_oos:
         cmd.append("--require-oos")
+    for flag, val in (
+        ("--wf-train-days", getattr(args, "wf_train_days", 0)),
+        ("--wf-test-days", getattr(args, "wf_test_days", 0)),
+        ("--wf-step-days", getattr(args, "wf_step_days", 0)),
+    ):
+        if val:
+            cmd += [flag, str(val)]
     if not args.no_stage_all:
         if not stage_all_supported(tool):
             print("[warn] 该 validate.py 不支持 --stage-all, 分年/敏感性/样本外可能被跳过"
@@ -365,7 +489,10 @@ def cmd_run(args: argparse.Namespace) -> None:
               f"{args.strategy_id} --from-json {out_json}")
     else:
         print("[warn] 未产出 JSON, 检查上面的报错")
-    raise SystemExit(rc)
+    # 返回退出码而非直接 raise: 让 final 子命令能在跑完后继续写「留出集已消耗」标记。
+    # 语义上**终审无论通过与否都算消耗** —— 多重检验防线的目的正是禁止
+    # 「反复试到通过为止」, 拒绝后再改参数重跑同样属于偷看留出集。
+    return rc
 
 
 def _fmt_pct(x) -> str:
@@ -530,11 +657,36 @@ def main() -> None:
     p.add_argument("--regime-states", nargs="*", default=None)
     p.add_argument("--require-oos", action="store_true")
     p.add_argument("--no-stage-all", action="store_true", help="不追加 --stage-all")
+    p.add_argument("--wf-train-days", type=int, default=0,
+                   help="walk-forward 训练窗口天数(默认按区间长度自适应)")
+    p.add_argument("--wf-test-days", type=int, default=0,
+                   help="walk-forward 测试窗口天数(默认按区间长度自适应)")
+    p.add_argument("--wf-step-days", type=int, default=0,
+                   help="walk-forward 窗口前移步长(默认=测试窗口)")
     p.add_argument("--reconfig", action="store_true",
                    help="确认要改运行配置(区间/档位/仓位)时覆盖基准, 使上一轮不可比")
     p.add_argument("--full", action="store_true",
-                   help="终审模式: 跑留出集(只能用一次, 会明确警告)")
+                   help="终审模式: 跑留出集(建议改用 final 子命令)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("final", help="留出集终审(只能用一次, 跑完标记已消耗)")
+    p.add_argument("strategy_id")
+    p.add_argument("--r", default="final", help="轮次标签")
+    p.add_argument("--profile", default="official",
+                   choices=["lenient", "official", "strict"],
+                   help="终审默认 official 档; 不要用 lenient")
+    p.add_argument("--max-positions", type=int, default=100)
+    p.add_argument("--holding-days", type=int, default=None)
+    p.add_argument("--regime-states", nargs="*", default=None)
+    p.add_argument("--wf-train-days", type=int, default=0)
+    p.add_argument("--wf-test-days", type=int, default=0)
+    p.add_argument("--wf-step-days", type=int, default=0)
+    p.add_argument("--min-folds", type=int, default=2, help="仅用于跑前预估提示")
+    p.add_argument("--force", action="store_true",
+                   help="留出集已消耗过, 强制重跑(须在台账说明原因)")
+    p.add_argument("--dry-run", action="store_true", help="只报预计折数, 不消耗留出集")
+    p.set_defaults(func=cmd_final, full=True, no_stage_all=False,
+                   require_oos=True, phase="终审", reconfig=False)
 
     p = sub.add_parser("draft", help="从报告 JSON 生成台账节(证据包)")
     p.add_argument("strategy_id")
