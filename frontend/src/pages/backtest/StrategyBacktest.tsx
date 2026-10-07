@@ -959,6 +959,11 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
   const [maxExposure, setMaxExposure] = useState(saved?.maxExposure ?? '100')
   const [initialCapital, setInitialCapital] = useState(saved?.initialCapital ?? '1000000')
   const [positionSizing, setPositionSizing] = useState<'equal' | 'score_weight'>(saved?.positionSizing ?? 'equal')
+  // 组合约束(空字符串 = 不启用, 传null 给后端, 与MatcherConfig 默认None 对齐)。
+  // 单票上限用百分比展示便于输入, 内部换算为比例。
+  const [maxPositionWeight, setMaxPositionWeight] = useState(saved?.maxPositionWeight ?? '')
+  const [maxIndustryWeight, setMaxIndustryWeight] = useState(saved?.maxIndustryWeight ?? '')
+  const [maxCorrelation, setMaxCorrelation] = useState(saved?.maxCorrelation ?? '')
   const [simMode, setSimMode] = useState<'position' | 'full'>(saved?.mode ?? 'position')
   const [holdingDays, setHoldingDays] = useState(saved?.holdingDays ?? '5')
   const [highGranularity, setHighGranularity] = useState(saved?.minuteFill ?? false)
@@ -1006,6 +1011,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
     if (cfg.slippage_bps != null) setSlippage(String(cfg.slippage_bps))
     if (cfg.max_positions != null) setMaxPositions(String(cfg.max_positions))
     if (cfg.max_exposure_pct != null) setMaxExposure(String(Math.round(Number(cfg.max_exposure_pct) * 100)))
+    if (cfg.max_position_weight != null) setMaxPositionWeight(String(Math.round(Number(cfg.max_position_weight) * 100)))
+    if (cfg.max_industry_weight != null) setMaxIndustryWeight(String(Math.round(Number(cfg.max_industry_weight) * 100)))
+    if (cfg.max_correlation != null) setMaxCorrelation(String(cfg.max_correlation))
     if (cfg.initial_capital != null) setInitialCapital(String(cfg.initial_capital))
     if (cfg.position_sizing === 'equal' || cfg.position_sizing === 'score_weight') {
       setPositionSizing(cfg.position_sizing)
@@ -1176,6 +1184,9 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
         maxExposure,
         initialCapital,
         positionSizing,
+        maxPositionWeight,
+        maxIndustryWeight,
+        maxCorrelation,
         mode: simMode,
         holdingDays,
         minuteFill: isMinuteStrategy ? false : highGranularity,
@@ -1210,6 +1221,10 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
       slippage_bps: Number(slippage),
       max_positions: Number(maxPositions),
       max_exposure_pct: Number(maxExposure) / 100,
+      // 空输入 = 不启用(传 null), 后端据此走原路径, 回测结果与未设时一致。
+      max_position_weight: maxPositionWeight === '' ? null : Number(maxPositionWeight) / 100,
+      max_industry_weight: maxIndustryWeight === '' ? null : Number(maxIndustryWeight) / 100,
+      max_correlation: maxCorrelation === '' ? null : Number(maxCorrelation),
       initial_capital: Number(initialCapital),
       position_sizing: positionSizing,
       params: strategyParams,
@@ -1932,6 +1947,38 @@ export function StrategyBacktest({ loadCandidate, onLoadConsumed }: {
             <input type="number" min={0} max={100} value={maxExposure} onChange={e => setMaxExposure(e.target.value)}
               className={INPUT_CLS} />
           </div>
+        </div>
+        )}
+        {simMode === 'position' && (
+        <div>
+          <div className="flex items-baseline justify-between mb-1.5">
+            <label className="text-xs font-medium text-secondary">组合约束</label>
+            <span className="text-[10px] text-tertiary">留空 = 不限制</span>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <div>
+              <label className="text-[10px] font-medium text-secondary block mb-1">单票上限(%)</label>
+              <input type="number" min={0} max={100} value={maxPositionWeight}
+                onChange={e => setMaxPositionWeight(e.target.value)}
+                placeholder="不限" className={INPUT_CLS} />
+            </div>
+            <div>
+              <label className="text-[10px] font-medium text-secondary block mb-1">单行业上限(%)</label>
+              <input type="number" min={0} max={100} value={maxIndustryWeight}
+                onChange={e => setMaxIndustryWeight(e.target.value)}
+                placeholder="不限" className={INPUT_CLS} />
+            </div>
+            <div>
+              <label className="text-[10px] font-medium text-secondary block mb-1">相关性上限</label>
+              <input type="number" min={0} max={1} step={0.05} value={maxCorrelation}
+                onChange={e => setMaxCorrelation(e.target.value)}
+                placeholder="不限" className={INPUT_CLS} />
+            </div>
+          </div>
+          <p className="text-[10px] text-tertiary mt-1.5 leading-relaxed">
+            单票上限可解除「评分加权被持仓数二次压制」；相关性上限剔除同涨同跌的重复标的。
+            行业上限需数据源提供行业分类，缺失时该项自动不生效。
+          </p>
         </div>
         )}
         {simMode === 'position' && (

@@ -150,6 +150,10 @@ export const storage = {
     maxExposure: string
     initialCapital: string
     positionSizing: 'equal' | 'score_weight'
+    // 组合约束 (空字符串 = 不启用, 传 null 给后端)
+    maxPositionWeight?: string
+    maxIndustryWeight?: string
+    maxCorrelation?: string
     mode: 'position' | 'full'
     holdingDays: string
     minuteFill?: boolean

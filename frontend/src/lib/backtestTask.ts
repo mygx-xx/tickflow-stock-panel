@@ -193,6 +193,10 @@ export function startBacktest(params: {
   slippage_bps?: number
   max_positions?: number
   max_exposure_pct?: number
+  // 组合约束 (不传/ null = 不启用, 后端走原路径)
+  max_position_weight?: number | null
+  max_industry_weight?: number | null
+  max_correlation?: number | null
   initial_capital?: number
   position_sizing?: string
   params?: Record<string, any> | null
@@ -227,6 +231,9 @@ export function startBacktest(params: {
     slippage_bps: params.slippage_bps,
     max_positions: params.max_positions,
     max_exposure_pct: params.max_exposure_pct,
+    max_position_weight: params.max_position_weight ?? undefined,
+    max_industry_weight: params.max_industry_weight ?? undefined,
+    max_correlation: params.max_correlation ?? undefined,
     initial_capital: params.initial_capital,
     position_sizing: params.position_sizing,
     params: params.params ? JSON.stringify(params.params) : undefined,

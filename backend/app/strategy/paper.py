@@ -1206,6 +1206,14 @@ def overview(data_dir: Path, price_map: dict[str, float] | None = None, account_
         "account_name": acc.get("name", account_id),
         "status": acc["status"],
         "queue_limit_orders": bool(acc.get("queue_limit_orders")),
+        # 仓位约束: 供设置弹窗回填与展示当前仓位水平。
+        # use .get 兼容本次新增前创建的旧账户文件(无这两个键时按不限制处理)。
+        "max_exposure_pct": acc.get("max_exposure_pct"),
+        "max_position_weight": acc.get("max_position_weight"),
+        "position_usage_pct": (
+            round(mv / (float(acc["cash"]) + mv) * 100, 2)
+            if (float(acc["cash"]) + mv) > 0 else 0.0
+        ),
         "cash": round(float(acc["cash"]), 2),
         "market_value": round(mv, 2),
         "total": round(float(acc["cash"]) + mv, 2),
