@@ -203,3 +203,10 @@ export const IconData = make(
     <rect x="4.5" y="15.5" width="15" height="5" />
   </>,
 )
+
+/** 系统自检 — 心跳线 + 体检十字, 与「数据」的层叠矩形区分开 */
+export const IconActivity = make(
+  <>
+    <path d="M2.5 12h4l2.5-7 4 14 2.5-7h6" />
+  </>,
+)

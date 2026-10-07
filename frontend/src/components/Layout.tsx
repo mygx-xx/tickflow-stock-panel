@@ -60,6 +60,7 @@ import {
   IconReview,
   IconIndices,
   IconData,
+  IconActivity,
   type BrandIconProps,
 } from './BrandIcons'
 import { Logo } from './Logo'
@@ -109,6 +110,7 @@ const nav = [
   { to: '/review',           label: '复盘',     icon: IconReview },
   { to: '/indices',          label: '指数',     icon: IconIndices },
   { to: '/data',             label: '数据',     icon: IconData },
+  { to: '/diagnostics',      label: '系统自检', icon: IconActivity },
 ] as const
 
 /** 亮/暗主题切换 — 状态存 localStorage, 生效见 lib/theme.ts */
