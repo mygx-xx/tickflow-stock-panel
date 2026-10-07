@@ -38,9 +38,10 @@ MAIN_FRONTEND_PORT=3011
 PORT_SCAN_STEP=10
 PORT_SCAN_TRIES=12
 
-# 自动扫描起点。避开主树 3018/3011, 也避开 portfolio 树历史占用的 3028/3021 ——
-# 3028/3021 现在空闲, 但一旦被重跑占用就会与新树相撞, 所以起点直接设在其后。
-DEFAULT_SCAN_START=3038
+# 自动扫描起点。起点只决定「从哪里开始找」, 真正的占用判定在collect_taken_ports ——
+# 它同时查 netstat 监听 + 登记簿 + 各 worktree 的 .env PORT, 所以即使几棵树都没启动,
+# 也不会全部拿到同一端口(2026-10-07 三棵树同时拿到 3038 就是只查监听导致的)。
+DEFAULT_SCAN_START=3048
 
 # 端口登记簿: 记录每个 worktree 实际占用的端口, 供 list/check 展示。
 PORT_REGISTRY="$MAIN_ROOT/../.tickflow-wt-ports"
