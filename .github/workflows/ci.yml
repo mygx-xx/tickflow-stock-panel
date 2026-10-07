@@ -37,19 +37,28 @@ jobs:
       - name: 后端全量测试
         run: uv run pytest tests -q -rf
 
-      # 把失败详情推到 GitHub 的 Checks 面板: 否则 Actions 页只有一行
-      # "process exited with code 1", 还得重新下载 200MB 日志才能定位。
-      # 这正是本 workflow 连续失败 10 次却难以定位的原因 —— 可见的日志
-      # 才是可排查的前提。
+      # 把失败详情推到 GitHub 页面: 否则 Actions 页只有一行
+      # "process exited with code 1", 还得有 admin 权限下载 200MB 日志才能定位
+      # (logs 端点对非 admin 返回 403) —— 这正是本 workflow 连续失败 10 次
+      # 却难以定位的原因。两条通道互补:
+      #   1) ::error:: 注解 → Checks/PR 页面的 inline 注释, 任何人可见;
+      #   2) $GITHUB_STEP_SUMMARY → run 页面的 Summary 区块。
       - name: 上报失败详情
         if: failure()
         run: |
+          set +e
+          uv run pytest tests -q -rf --tb=short > /tmp/pytest-out.txt 2>&1
+          tail -100 /tmp/pytest-out.txt > /tmp/pytest-tail.txt
           {
             echo "### pytest 失败摘要"
             echo '```'
-            uv run pytest tests -q -rf --tb=short 2>&1 | tail -120
+            cat /tmp/pytest-tail.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          # 逐行打成 error 注解(GitHub 单条上限 1KB, 故按行切分并限制条数)
+          echo "::group::pytest 失败输出"
+          sed -n 's/^/::error title=pytest::/p' /tmp/pytest-tail.txt | head -40
+          echo "::endgroup::"
 
   frontend:
     runs-on: ubuntu-latest
