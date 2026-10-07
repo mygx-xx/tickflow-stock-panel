@@ -16,6 +16,9 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+# pytest 用例自建的临时目录(未显式指定 --basetemp 时落在 cwd 下)
+backend/tmp_*/
+tmp_*/
 
 # ===== uv =====
 .uv/
