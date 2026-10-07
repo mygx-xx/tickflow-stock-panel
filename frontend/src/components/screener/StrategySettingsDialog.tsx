@@ -1,7 +1,14 @@
 ﻿import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { X, Settings2, RotateCcw, Save, ChevronDown, Filter, Star, TrendingUp, Sparkles, Download, Layers, Plus, Trash2 } from 'lucide-react'
-import { api, type StrategyDetail, type StrategyParamDef, type CompositeChildInfo, type ScoringDirection } from '@/lib/api'
+import { X, Settings2, RotateCcw, Save, ChevronDown, Filter, Star, TrendingUp, Sparkles, Download, Layers, Plus, Trash2, Activity, Loader2 } from 'lucide-react'
+import { api, type StrategyDetail, type StrategyParamDef, type CompositeChildInfo, type ScoringDirection, type StrategyStatus } from '@/lib/api'
+import {
+  StrategyStatusBadge,
+  STRATEGY_STATUS_META,
+  STRATEGY_STATUS_ORDER,
+  asStrategyStatus,
+  canTransitionStatus,
+} from './StrategyStatusBadge'
 import { toPercentages, normalizeWeights } from '@/lib/weights'
 import { BUILTIN_COLUMNS } from '@/lib/watchlist-columns'
 import { color } from '@/lib/colors'
@@ -32,6 +39,8 @@ interface Props {
   onSaved?: (displayLimit: number | null) => void
   onAiModify?: () => void
   onDeleted?: () => void
+  /** 生命周期状态迁移成功 — 调用方据此刷新策略列表(卡片徽标) */
+  onStatusChanged?: () => void
 }
 
 // ===== 可折叠区域 =====
@@ -175,11 +184,14 @@ function ParamField({ def, value, onChange }: {
   )
 }
 
-export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModify, onDeleted }: Props) {
+export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModify, onDeleted, onStatusChanged }: Props) {
   const [detail, setDetail] = useState<StrategyDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [resetting, setResetting] = useState(false)
+  // 生命周期状态迁移 (独立于「保存设置」: 走的是 /status 端点, 且后端会改写策略文件)
+  const [statusSaving, setStatusSaving] = useState<StrategyStatus | null>(null)
+  const [statusError, setStatusError] = useState('')
 
   // 编辑状态
   const [strategyName, setStrategyName] = useState('')
@@ -214,6 +226,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
   useEffect(() => {
     if (!strategyId) return
     setEditingChildId(null)
+    setStatusError('')
     setLoading(true)
     api.strategyGet(strategyId)
       .then(d => {
@@ -355,7 +368,29 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
     URL.revokeObjectURL(url)
   }
 
+  // 生命周期状态迁移。与「保存设置」分开: 该动作会重写策略文件 META.status 并
+  // reload 引擎, 非法迁移后端返回 409 —— 前端只放出合法迁移按钮, 但仍然兜住错误。
+  const handleSetStatus = async (target: StrategyStatus) => {
+    if (!strategyId) return
+    setStatusSaving(target)
+    setStatusError('')
+    try {
+      const r = await api.strategySetStatus(strategyId, target, '策略设置面板手动迁移')
+      setDetail(prev => prev
+        ? { ...prev, status: r.status, status_label: r.status_label, selectable: r.status === 'active' }
+        : prev)
+      onStatusChanged?.()
+    } catch (e: any) {
+      setStatusError(String(e?.message ?? '状态迁移失败'))
+    } finally {
+      setStatusSaving(null)
+    }
+  }
+
   if (!strategyId) return null
+
+  // 后端未声明 status 时归一为 draft (与 app.strategy.lifecycle.normalize_status 一致)
+  const curStatus = asStrategyStatus(detail?.status)
 
   return (
     <>
@@ -419,6 +454,55 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       className="w-14 h-8 px-1.5 rounded-lg bg-base border border-border/40 text-xs font-mono text-foreground text-center focus:outline-none focus:border-accent/50" />
                     <span className="text-[10px] text-muted/50">只</span>
                   </div>
+                </div>
+
+                {/* 生命周期状态 — 四态迁移。与 research_only(可见性)职责独立:
+                    本区块改的是 status(绩效可信度), 后端会重写策略文件 META.status。 */}
+                <div className="rounded-xl border border-border/40 bg-surface/30 px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <Activity className="h-3.5 w-3.5 shrink-0 text-muted" />
+                    <span className="text-[11px] font-medium text-foreground/70 shrink-0">生命周期状态</span>
+                    <StrategyStatusBadge status={curStatus} statusLabel={detail.status_label} hideDraft={false} />
+                    <span className="truncate text-[10px] text-muted">
+                      {detail.status_label ?? STRATEGY_STATUS_META[curStatus].desc}
+                    </span>
+                    {statusSaving && <Loader2 className="ml-auto h-3 w-3 shrink-0 animate-spin text-muted" />}
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                    {STRATEGY_STATUS_ORDER.map(st => {
+                      const meta = STRATEGY_STATUS_META[st]
+                      const isCur = st === curStatus
+                      const allowed = canTransitionStatus(curStatus, st)
+                      return (
+                        <button
+                          key={st}
+                          type="button"
+                          disabled={!allowed || statusSaving !== null}
+                          title={isCur ? '当前状态' : allowed ? `迁移到「${meta.label}」` : `不允许的迁移: ${curStatus} → ${st}`}
+                          onClick={() => handleSetStatus(st)}
+                          className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors ${
+                            isCur
+                              ? `${meta.cls} cursor-default`
+                              : allowed
+                                ? 'border-border/60 bg-base text-secondary hover:border-accent/40 hover:text-accent cursor-pointer'
+                                : 'border-border/30 bg-base/40 text-muted/40 cursor-not-allowed'
+                          }`}
+                        >
+                          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />
+                          {meta.label}
+                          {statusSaving === st && <Loader2 className="h-3 w-3 animate-spin" />}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div className="mt-1.5 text-[10px] leading-4 text-muted/60">
+                    自动判定只允许把 active 降级为 watch; 人工可在上面合法迁移内任意切换
+                    (误点「已激活」可点「未激活」一步撤回)。
+                    <b className="text-secondary/80">已归档(retired)</b> 立即生效 —— 单跑返回 409、批量扫描跳过, 迁回草稿即可复活。
+                  </div>
+                  {statusError && (
+                    <div className="mt-1.5 rounded-lg border border-danger/20 bg-danger/10 px-2 py-1 text-[10px] text-danger">{statusError}</div>
+                  )}
                 </div>
 
                 {/* 叠加策略: 子策略列表 + 权重(替换三列参数, composite 专属) */}
@@ -675,7 +759,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
-            className="w-[380px] bg-surface border border-border/50 rounded-2xl shadow-2xl p-6"
+            className="w-[380px] max-w-[92vw] bg-surface border border-border/50 rounded-2xl shadow-2xl p-6"
             onClick={e => e.stopPropagation()}
           >
             <div className="text-center space-y-3">

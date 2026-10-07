@@ -32,10 +32,17 @@ retired, 与因子侧 `app.factors.store.STATUSES` 同构(直接复用该常量,
 
 ## 迁移规则(单向衰减, 人工可回升)
 
-    draft ──(首次检验通过/ 人工激活)──▶ active ──(绩效衰减告警)──▶ watch
-      ▲                                    │                        │
-      │                                    ▼                        ▼
-      └──────(人工重新激活)──────────── retired ◀──(持续衰减 / 人工)──┘
+合法边(完整清单, 与 `TRANSITIONS` 一一对应):
+
+    draft   → active    人工激活 / 首次检验通过
+    draft   → watch     跳过激活直接标记观察(人工)
+    draft   → retired   直接归档(人工)
+    active  → watch     绩效衰减(**唯一允许自动触发的边**)
+    active  → draft     人工撤回激活(2026-10-07 新增, 缘由见下)
+    active  → retired   人工归档
+    watch   → active    人工复核通过(须重跑检验)
+    watch   → retired   人工归档
+    retired → draft     人工复活(retired 的唯一出路)
 
 - **自动降级只允许 active → watch**。这是本模块的核心约束: 绩效判定可以
   「保守」但不能「激进」—— 永远不自动晋升(draft→active / watch→active),
@@ -44,6 +51,20 @@ retired, 与因子侧 `app.factors.store.STATUSES` 同构(直接复用该常量,
 - `retired` 是终态, 只能人工回到 draft。
 - watch → active 的回升(人工)必须重新走检验, 故实现上视为 draft→active 的
   同一条路径。
+
+### 为什么允许 active → draft(2026-10-07 修订)
+
+原设计不允许这条边, 由 `test_active_不能直接回draft` 锁住, 理由是"不能一步
+回退抹掉衰减历史"。实战用下来该理由不成立、代价却真实:
+
+- **历史本来就没存**。status 是单字段, 不记流转日志; 走 `active→watch→
+  retired→draft` 三步同样不留痕(第一步就把 active 抹了)。想留痕得靠审计日志,
+  不是靠迁移图卡着。
+- **真实场景是误操作**。用户把还没准备好的策略点成 active 想撤回, 却被逼先
+  "降级"再"归档"再"复活" —— 三个语义都不对, 用户只会以为程序坏了。
+
+故放开这条边, 但**仍只走人工路径**(不在 `AUTOMATIC_TRANSITIONS` 里) ——
+自动判定最多降到 watch 这条底线不变。
 """
 from __future__ import annotations
 
@@ -71,11 +92,12 @@ __all__ = [
 DEFAULT_STATUS = "draft"
 
 #: 合法迁移图。key=当前状态, value=允许迁移到的目标状态集合。
-#: 注意 draft→watch / draft→retired 允许 —— 人工可以跳过激活直接归档,
+#: 注意 draft→watch / draft→retired 允许 —— 人工可以跳过激活直接归档;
+#: active→draft 也允许 —— 人工撤回误激活(详见模块 docstring 的修订说明)。
 #: 但**自动判定绝不走这些边**(见 AUTOMATIC_TRANSITIONS)。
 TRANSITIONS: dict[str, frozenset[str]] = {
     "draft": frozenset({"active", "watch", "retired"}),
-    "active": frozenset({"watch", "retired"}),
+    "active": frozenset({"draft", "watch", "retired"}),
     "watch": frozenset({"active", "retired"}),
     "retired": frozenset({"draft"}),
 }

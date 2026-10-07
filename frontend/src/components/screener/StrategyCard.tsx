@@ -1,6 +1,9 @@
 import { Settings2, TrendingDown, RadioTower } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { storage } from '@/lib/storage'
+import type { StrategyVerdictItem } from '@/lib/api'
+import { StrategyStatusBadge } from './StrategyStatusBadge'
+import { VerdictBadge } from './VerdictBadge'
 
 // ===== 卡片尺寸 =====
 
@@ -22,7 +25,7 @@ const CARD_STYLES: Record<CardSize, {
 }> = {
   mini: {
     wrap: 'gap-1',
-    card: 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full',
+    card: 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full max-w-full',
     name: 'text-[10px]',
     count: 'text-[11px]',
     desc: '',
@@ -98,12 +101,19 @@ interface StrategyCardProps {
   computing?: boolean
   /** 等待运行 (自动计算关闭/失败时的分钟策略): 数字未出时显示「待计算」点击引导 */
   awaitRun?: boolean
+  /** 生命周期状态 (draft/active/watch/retired); draft 不渲染徽标 */
+  status?: string
+  /** 后端下发的状态说明, 用作徽标 tooltip */
+  statusLabel?: string
+  /** 清单里的自述验证结论 (来自 README-策略清单.md) */
+  verdict?: StrategyVerdictItem
 }
 
 export function StrategyCard({
   name, description, source, active, count, expiredCount,
   loading, cardSize,
   onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing, awaitRun,
+  status, statusLabel, verdict,
 }: StrategyCardProps) {
   const cs = CARD_STYLES[cardSize]
   const activeCls = active
@@ -134,6 +144,8 @@ export function StrategyCard({
               {timeframeBadge && (
                 <span className="text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400">{timeframeBadge}</span>
               )}
+              <StrategyStatusBadge status={status} statusLabel={statusLabel} />
+              <VerdictBadge item={verdict} />
               <span className="text-xs font-medium truncate text-foreground">{name}</span>
             </div>
             {description && (
@@ -182,6 +194,8 @@ export function StrategyCard({
               {timeframeBadge && (
                 <span className="text-[9px] px-1 py-px rounded border font-medium leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400">{timeframeBadge}</span>
               )}
+              <StrategyStatusBadge status={status} statusLabel={statusLabel} />
+              <VerdictBadge item={verdict} />
               <span className="text-xs font-medium truncate text-foreground">{name}</span>
               {count != null && !loading && (
                 <span className={`text-xs font-mono font-bold tabular-nums shrink-0 ${countCls}`}>{count}</span>
@@ -219,22 +233,22 @@ export function StrategyCard({
         /* mini */
         <>
           <button onClick={onRun} disabled={disabled}
-            className="flex items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait">
-            <span className="text-[8px] px-0.5 rounded bg-secondary/10 text-muted border border-border font-medium leading-tight">{srcLabel}</span>
-            <span className="text-[10px] font-medium whitespace-nowrap text-foreground">{name}</span>
+            className="flex min-w-0 items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait">
+            <span className="text-[8px] px-0.5 rounded bg-secondary/10 text-muted border border-border font-medium leading-tight shrink-0 whitespace-nowrap">{srcLabel}</span>
+            <span className="text-[10px] font-medium truncate min-w-0 text-foreground">{name}</span>
             {count != null && !loading && (
-              <span className={`text-xs font-mono font-bold tabular-nums ${countCls}`}>{count}</span>
+              <span className={`text-xs font-mono font-bold tabular-nums shrink-0 ${countCls}`}>{count}</span>
             )}
             {count == null && !loading && computing && (
-              <span className="text-xs font-mono font-bold text-muted/50 animate-pulse">···</span>
+              <span className="text-xs font-mono font-bold text-muted/50 animate-pulse shrink-0">···</span>
             )}
             {count == null && !loading && !computing && awaitRun && (
               <span className="text-[9px] text-muted/60 transition-colors group-hover:text-accent/80 shrink-0" title="自动计算未开启或失败 — 点击卡片实时计算">待算</span>
             )}
             {hasExpired && (
-              <span className="text-[9px] font-mono text-red-400/70">{'-' + expiredCount}</span>
+              <span className="text-[9px] font-mono text-red-400/70 shrink-0">{'-' + expiredCount}</span>
             )}
-            {loading && <span className="w-4 h-2.5 rounded bg-elevated animate-pulse" />}
+            {loading && <span className="w-4 h-2.5 rounded bg-elevated animate-pulse shrink-0" />}
           </button>
           {onToggleMonitor && (
             <button onClick={(e) => { e.stopPropagation(); onToggleMonitor() }}

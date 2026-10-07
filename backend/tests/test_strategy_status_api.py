@@ -151,10 +151,24 @@ def test_非法迁移被拒409(client):
     assert "不允许" in r.json()["detail"]
 
 
-def test_active不能直接回draft(client):
+def test_active可人工撤回draft(client):
+    """active → draft 是允许的人工迁移边 (误激活的策略要能撤回)。
+
+    早前这里断言 409, 是在 active→draft 边加入之前写的; 边放开后契约变了, 测试同步。
+    """
     client.post("/api/strategies/custom_lifecycle/status", json={"status": "active"})
     r = client.post("/api/strategies/custom_lifecycle/status", json={"status": "draft"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "draft"
+
+
+def test_retired不能直接回active(client):
+    """retired 仍是强制闸门: 归档后必须先回 draft 再激活。"""
+    client.post("/api/strategies/custom_lifecycle/status", json={"status": "active"})
+    client.post("/api/strategies/custom_lifecycle/status", json={"status": "retired"})
+    r = client.post("/api/strategies/custom_lifecycle/status", json={"status": "active"})
     assert r.status_code == 409
+    assert "不允许" in r.json()["detail"]
 
 
 def test_不存在的策略404(client):

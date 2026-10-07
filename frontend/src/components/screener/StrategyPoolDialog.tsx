@@ -3,6 +3,7 @@ import { motion, AnimatePresence, Reorder } from 'framer-motion'
 import { X, Plus, GripVertical, Upload, Loader2, Trash2, ListPlus } from 'lucide-react'
 import { api, type StrategyDetail } from '@/lib/api'
 import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
+import { StrategyStatusBadge } from './StrategyStatusBadge'
 
 interface Props {
   pool: string[]
@@ -54,6 +55,8 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
   const [allStrategies, setAllStrategies] = useState<StrategyDetail[]>([])
   const [loading, setLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<SourceTab>('all')
+  // 只看已激活(active)的策略; draft/watch/retired 都可以执行, 这里只用于缩小范围
+  const [onlyActive, setOnlyActive] = useState(false)
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState('')
   const [importMsg, setImportMsg] = useState('')
@@ -110,6 +113,17 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
     return available.filter(s => s.source === activeTab)
   }, [available, activeTab])
 
+  // 已激活策略数 (生命周期 status === 'active'); 用于「仅已激活」过滤与计数
+  const activatedCount = useMemo(
+    () => available.filter(s => s.status === 'active').length,
+    [available],
+  )
+
+  const shownAvailable = useMemo(
+    () => (onlyActive ? filteredAvailable.filter(s => s.status === 'active') : filteredAvailable),
+    [filteredAvailable, onlyActive],
+  )
+
   const handleAdd = useCallback((id: string) => {
     setDraftPool(prev => prev.includes(id) ? prev : [...prev, id])
   }, [])
@@ -127,16 +141,16 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
     setDraftPool([])
   }, [])
 
-  // 一键加入当前 Tab 分组的全部待选策略
+  // 一键加入当前 Tab 分组的全部待选策略(受「仅已激活」过滤约束)
   const handleAddGroup = useCallback(() => {
     setDraftPool(prev => {
       const next = [...prev]
-      for (const s of filteredAvailable) {
+      for (const s of shownAvailable) {
         if (!next.includes(s.id)) next.push(s.id)
       }
       return next
     })
-  }, [filteredAvailable])
+  }, [shownAvailable])
 
   // 发布 research_only 草稿 → 刷新后进入公开列表
   const handlePublish = useCallback(async (id: string) => {
@@ -197,7 +211,7 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
           animate={{ opacity: 1, scale: 1, y: 0 }}
           exit={{ opacity: 0, scale: 0.95, y: 10 }}
           transition={{ duration: 0.15, ease: [0.16, 1, 0.3, 1] }}
-          className="w-[680px] max-h-[78vh] bg-surface border border-border rounded-card shadow-xl flex flex-col"
+          className="w-[680px] max-w-[94vw] max-h-[78vh] bg-surface border border-border rounded-card shadow-xl flex flex-col"
         >
           {/* 标题 */}
           <div className="flex items-center justify-between px-4 py-2.5 border-b border-border shrink-0">
@@ -267,8 +281,21 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                     )
                   })}
                   <button
+                    onClick={() => setOnlyActive(v => !v)}
+                    title="只显示生命周期状态为「已激活」的策略"
+                    className={`ml-1 inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-btn border px-2 py-1 text-[10px] transition-colors ${
+                      onlyActive
+                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400'
+                        : 'border-border/60 text-muted hover:bg-elevated hover:text-secondary'
+                    }`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${onlyActive ? 'bg-emerald-400' : 'bg-muted'}`} />
+                    仅已激活
+                    <span className="opacity-60">{activatedCount}</span>
+                  </button>
+                  <button
                     onClick={handleAddGroup}
-                    disabled={filteredAvailable.length === 0}
+                    disabled={shownAvailable.length === 0}
                     title="把当前分组剩余的策略全部加入策略池"
                     className="ml-auto inline-flex items-center gap-1 px-2 py-1 rounded-btn text-[10px] text-accent border border-accent/25 bg-accent/8 hover:bg-accent/15 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer shrink-0"
                   >
@@ -312,11 +339,13 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                     <div className="px-1 mb-1 text-[10px] font-medium text-muted">待选</div>
                   )}
                   <div className="space-y-0.5">
-                    {filteredAvailable.length === 0 ? (
+                    {shownAvailable.length === 0 ? (
                       <div className="flex items-center justify-center h-24 text-[11px] text-muted">
-                        {available.length === 0 ? '全部已加入策略池' : '此分组无待选策略'}
+                        {available.length === 0
+                          ? '全部已加入策略池'
+                          : onlyActive ? '此分组没有已激活的策略' : '此分组无待选策略'}
                       </div>
-                    ) : filteredAvailable.map(s => (
+                    ) : shownAvailable.map(s => (
                       <button
                         key={s.id}
                         onClick={() => handleAdd(s.id)}
@@ -332,6 +361,7 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                         <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[s.source] ?? SOURCE_CLS.builtin}`}>
                           {SOURCE_LABEL[s.source] ?? '内置'}
                         </span>
+                        <StrategyStatusBadge status={s.status} statusLabel={s.status_label} />
                         {s.timeframes?.includes('1m') && (
                           <span className={TF_BADGE_CLS}>分钟</span>
                         )}
@@ -389,6 +419,7 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                             <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[src] ?? SOURCE_CLS.builtin}`}>
                               {SOURCE_LABEL[src] ?? '内置'}
                             </span>
+                            <StrategyStatusBadge status={s?.status} statusLabel={s?.status_label} />
                             {s?.timeframes?.includes('1m') && (
                               <span className={TF_BADGE_CLS}>分钟</span>
                             )}

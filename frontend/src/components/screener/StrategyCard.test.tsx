@@ -71,3 +71,34 @@ it('onRun fires when the card is clicked', () => {
 
   expect(onRun).toHaveBeenCalledTimes(1)
 })
+
+// 生命周期徽标: draft 是默认态(本项目 177 个策略全为 draft), 若也渲染徽标会把
+// 整个策略列表刷满「未激活」; 只有非默认态才需要露出。
+it.each([
+  ['active', '已激活'],
+  ['watch', '观察中'],
+  ['retired', '已归档'],
+])('renders the lifecycle badge for status=%s', (status, label) => {
+  render({ status })
+
+  expect(container.textContent).toContain(label)
+})
+
+it('hides the badge for draft (default status)', () => {
+  render({ status: 'draft' })
+
+  expect(container.textContent).not.toContain('未激活')
+})
+
+it('hides the badge when status is absent', () => {
+  render({})
+
+  expect(container.textContent).not.toContain('未激活')
+  expect(container.textContent).not.toContain('已激活')
+})
+
+it('prefers the backend status_label as the badge tooltip', () => {
+  render({ status: 'watch', statusLabel: '观察中: 绩效衰退待复核' })
+
+  expect(container.querySelector('[title="观察中: 绩效衰退待复核"]')).not.toBeNull()
+})

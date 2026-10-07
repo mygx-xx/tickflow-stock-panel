@@ -105,9 +105,19 @@ def test_retired_是终态():
     assert TRANSITIONS["retired"] == {"draft"}
 
 
-def test_active_不能直接回draft():
-    """active 要退草稿必须先降级或归档, 不能一步回退抹掉衰减历史。"""
-    assert not can_transition("active", "draft")
+def test_active_可人工撤回draft():
+    """active 可一步回退到 draft —— 2026-10-07 放开(原设计禁止)。
+
+    缘由: status 是单字段、本就不存流转历史, 走 active→watch→retired→draft
+    三步同样不留痕; 而真实场景是"误点激活想撤回", 逼用户走三步降级/归档/复活
+    语义全错。放开的同时**必须确认它不在自动路径上** —— 自动判定最多降到 watch,
+    这条底线不能被这次放开带松。
+    """
+    assert can_transition("active", "draft")
+    assert "draft" in TRANSITIONS["active"]
+    # 放开的是人工路径, 自动判定依旧只认 active → watch
+    assert not is_transition_automatic("active", "draft")
+    assert AUTOMATIC_TRANSITIONS == {("active", "watch")}
 
 
 def test_is_selectable_只有active进自动池():
