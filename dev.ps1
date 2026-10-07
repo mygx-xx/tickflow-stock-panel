@@ -57,8 +57,27 @@ if ($BackendPort -le 0) {
 if ($FrontendPort -le 0) { $FrontendPort = if ($env:FRONTEND_PORT) { [int]$env:FRONTEND_PORT } else { 3011 } }
 
 # Force UTF-8 console output so child process logs aren't garbled
+#
+# 根因 (实测 2026-10-07, 本机 Console.InputEncoding 默认 gb2312):
+# Start-Job 子进程按控制台代码页解码子进程输出, 而后端是 UTF-8 字节 ->
+#   "使用**进程内**传输".encode("utf-8").decode("gb2312")
+#     = "浣跨敤**杩涚▼鍐?*浼犺緭"  (与实际日志逐字一致)
+# ASCII 不受影响, 故现象是「英文正常、中文乱码」。
+#
+# 对照实验(先 chcp 936 强制复现乱码, 再逐项验证):
+#   仅 chcp 65001                 -> 仍乱码   ✗
+#   仅 OutputEncoding             -> 仍乱码   ✗
+#   仅 PYTHONIOENCODING=gbk       -> 有效     ✓ 但与 app/__init__.py 的
+#                                              UTF-8 reconfigure 冲突
+#   chcp65001 + InputEncoding
+#              + OutputEncoding   -> 有效     ✓ 采用
+#
+# 关键: [Console]::InputEncoding 才是「读取子进程原生 stdout」的解码开关;
+# OutputEncoding 只管 PowerShell 自身输出流, 单独设它无效。
 try {
+    $null = & chcp.com 65001 2>&1
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+    [Console]::InputEncoding  = New-Object System.Text.UTF8Encoding $false
     $OutputEncoding           = New-Object System.Text.UTF8Encoding $false
 } catch {}
 
@@ -191,31 +210,50 @@ Write-Host ''
 $backendPidFile  = [System.IO.Path]::GetTempFileName()
 $frontendPidFile = [System.IO.Path]::GetTempFileName()
 
+# 各子进程的日志落盘文件 (UTF-8)。
+# 为什么不直接 Receive-Job 拿对象: Start-Job 读子进程**原生 stdout** 时,
+# 解码由子进程的 InputEncoding/控制台代码页 决定, 本机默认 gb2312,
+# 而后端与 pnpm 都输出 UTF-8 => 中文乱码 (已在日志中逐字复现:
+# "使用**进程内**传输" -> "浣跨敤**杩涚▼鍐?*浼犺緭")。
+# 实测对照 (在 gb2312 环境下强制复现后逐项验证):
+#   仅 chcp 65001                     -> 仍乱码  ✗
+#   仅 [Console]::OutputEncoding      -> 仍乱码  ✗
+#   chcp65001 + Input/OutputEncoding   -> 仍乱码  ✗  ← 曾在用, 无效
+#   cmd /c "chcp 65001 && cmd > file" -> 正确    ✓ 采用
+# 末选方案: 让 cmd 在 UTF-8 代码页下把子进程 stdout **直接重定向到文件**,
+# 字节不经过 PowerShell 的原生 stdout 管道, 从根上绕开错误解码;
+# 主进程再用 [IO.File]::ReadAllLines(path, UTF8) 按行 tail。
+$backendLogFile  = [System.IO.Path]::GetTempFileName()
+$frontendLogFile = [System.IO.Path]::GetTempFileName()
+
 $backendJob = Start-Job -Name 'backend' -ScriptBlock {
-    param($pidFile, $dir, $envFile, $bindAddress, $port)
-    # Start-Job 开的是全新 powershell.exe 子进程, 不继承主进程的 UTF-8 设置,
-    # 默认用系统 ANSI (中文 Windows = GBK/cp936) 解码后端 UTF-8 输出 → 中文乱码。
-    # 这里强制子进程用 UTF-8, 与 app/__init__.py 的 stdout/stderr 编码对齐。
-    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
-    $OutputEncoding           = New-Object System.Text.UTF8Encoding $false
+    param($pidFile, $dir, $envFile, $bindAddress, $port, $logFile)
+    # 日志经 cmd 在 UTF-8 代码页下直接重定向到文件, 绕开 PowerShell 对
+    # 原生 stdout 的错误解码(本机默认 gb2312 会把UTF-8 读成乱码)。
+    # 详见 $backendLogFile 处的对照实验记录。
     $PID | Out-File -FilePath $pidFile -Encoding ascii -Force
     $env:PYTHONUNBUFFERED = '1'
+    $env:PYTHONIOENCODING = 'utf-8'
     Set-Location $dir
     $envArgs = if (Test-Path $envFile) { @('--env-file', $envFile) } else { @() }
-    & .\.venv\Scripts\python.exe -m uvicorn app.main:app @envArgs --reload --host $bindAddress --port $port 2>&1
-} -ArgumentList $backendPidFile, $BackendDir, $EnvFile, $BindAddress, $BackendPort
+    $cmd = 'chcp 65001 >nul && .\.venv\Scripts\python.exe -m uvicorn app.main:app'
+    if ($envArgs.Count -gt 0) { $cmd += ' ' + ($envArgs -join ' ') }
+    $cmd += ' --reload --host ' + $bindAddress + ' --port ' + $port
+    $cmd += ' > "' + $logFile + '" 2>&1'
+    $null = & cmd.exe /c $cmd
+} -ArgumentList $backendPidFile, $BackendDir, $EnvFile, $BindAddress, $BackendPort, $backendLogFile
 
 $frontendJob = Start-Job -Name 'frontend' -ScriptBlock {
-    param($pidFile, $dir, $bindAddress, $backendPort, $port)
-    # 同上: job 子进程默认 GBK, pnpm/前端工具链也是 UTF-8 输出, 需对齐。
-    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
-    $OutputEncoding           = New-Object System.Text.UTF8Encoding $false
+    param($pidFile, $dir, $bindAddress, $backendPort, $port, $logFile)
+    # 同 backend: 走 cmd + UTF-8 代码页 + 文件重定向。pnpm/vite 输出 UTF-8。
     $PID | Out-File -FilePath $pidFile -Encoding ascii -Force
     Set-Location $dir
     $env:BACKEND_HOST = $bindAddress
     $env:BACKEND_PORT = [string]$backendPort
-    & pnpm dev --host $bindAddress --port $port 2>&1
-} -ArgumentList $frontendPidFile, $FrontendDir, $BindAddress, $BackendPort, $FrontendPort
+    $cmd = 'chcp 65001 >nul && pnpm dev --host ' + $bindAddress + ' --port ' + $port
+    $cmd += ' > "' + $logFile + '" 2>&1'
+    $null = & cmd.exe /c $cmd
+} -ArgumentList $frontendPidFile, $FrontendDir, $BindAddress, $BackendPort, $FrontendPort, $frontendLogFile
 
 # Wait up to 5 seconds for the PID files to materialise
 function Read-JobPid($file) {
@@ -251,7 +289,7 @@ function Cleanup-All {
             Remove-Job $j -Force -ErrorAction SilentlyContinue
         }
     }
-    foreach ($f in @($backendPidFile, $frontendPidFile)) {
+    foreach ($f in @($backendPidFile, $frontendPidFile, $backendLogFile, $frontendLogFile)) {
         Remove-Item $f -Force -ErrorAction SilentlyContinue
     }
     Log-Ok 'bye'
@@ -269,6 +307,26 @@ $prevCtrlC = $null
 if ($interactive) {
     $prevCtrlC = [Console]::TreatControlCAsInput
 }
+
+# 日志 tail 状态: 每个文件记住已读到的行数, 增量打印。
+# 不用 Receive-Job 是因为它读子进程原生 stdout 时会按本机代码页(gb2312)
+# 解码 UTF-8 输出 -> 中文乱码; 详见 $backendLogFile 处注释。
+$logCursor = @{}
+function Write-NewLogLines($logPath, $tag, $color) {
+    if (-not (Test-Path $logPath)) { return }
+    try {
+        $all = [System.IO.File]::ReadAllLines($logPath, [System.Text.Encoding]::UTF8)
+    } catch { return }
+    $from = 0
+    if ($logCursor.ContainsKey($logPath)) { $from = $logCursor[$logPath] }
+    if ($all.Length -le $from) { return }
+    for ($i = $from; $i -lt $all.Length; $i++) {
+        Write-Host $tag -NoNewline -ForegroundColor $color
+        Write-Host $all[$i]
+    }
+    $logCursor[$logPath] = $all.Length
+}
+
 try {
     if ($interactive) {
         [Console]::TreatControlCAsInput = $true
@@ -282,21 +340,8 @@ try {
             }
         }
 
-        $bOut = Receive-Job $backendJob -ErrorAction SilentlyContinue
-        if ($bOut) {
-            foreach ($line in $bOut) {
-                Write-Host '[backend ] ' -NoNewline -ForegroundColor Blue
-                Write-Host $line
-            }
-        }
-
-        $fOut = Receive-Job $frontendJob -ErrorAction SilentlyContinue
-        if ($fOut) {
-            foreach ($line in $fOut) {
-                Write-Host '[frontend] ' -NoNewline -ForegroundColor Green
-                Write-Host $line
-            }
-        }
+        Write-NewLogLines $backendLogFile  '[backend ] ' 'Blue'
+        Write-NewLogLines $frontendLogFile '[frontend] ' 'Green'
 
         if ($backendJob.State -ne 'Running' -or $frontendJob.State -ne 'Running') {
             Log-Warn 'one of the processes exited; closing the other...'
