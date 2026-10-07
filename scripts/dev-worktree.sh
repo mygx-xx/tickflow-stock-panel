@@ -23,9 +23,29 @@
 
 set -euo pipefail
 
-# ---------- 主树定位: 本脚本在主树的 scripts/ 下 ----------
+# ---------- 主树定位 ----------
+# 本脚本会被复制到每个 worktree 后运行, 因此不能靠脚本自身位置推导主树 ——
+# 在 worktree 里跑时 SCRIPT_DIR 指向的是该 worktree, MAIN_ROOT 会变成它自己,
+# 导致 glob 把自己的 .env 匹配两次(list 报假冲突) 且主树端口判定失效。
+#
+# 权威判据是 `git worktree list` 的**第一个条目**: git 始终把主树列在最前。
+# 不用「同级目录里有 .git」来猜 —— 同级可能存在其他 git 项目(如 AxData),
+# 会抓错目标。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MAIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+_SELF_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+_self_base="$(basename "$_SELF_ROOT")"
+if [[ "$_self_base" == tickflow-wt-* ]]; then
+  # 在 worktree 内: 借 git 查主树 (worktree list 首行即主树)
+  MAIN_ROOT="$(git -C "$_SELF_ROOT" rev-parse --path-format=absolute \
+    --git-common-dir 2>/dev/null | sed 's/\/\.git$//' || true)"
+  if [[ -z "$MAIN_ROOT" || ! -d "$MAIN_ROOT" ]]; then
+    MAIN_ROOT="$(git -C "$_SELF_ROOT" worktree list --porcelain 2>/dev/null \
+      | head -1 | awk '{print $1}')"
+  fi
+  MAIN_ROOT="${MAIN_ROOT:-$(cd "$_SELF_ROOT/.." && pwd)}"
+else
+  MAIN_ROOT="$_SELF_ROOT"
+fi
 
 # ---------- 隔离默认值 ----------
 MAIN_BACKEND_PORT=3018
@@ -221,21 +241,26 @@ cmd_create() {
   dirname="${dirname:-${branch//\//-}}"
   local wt_dir="$MAIN_ROOT/../tickflow-wt-$dirname"
 
-  # ---- 端口: 显式指定 or 自动扫描 ----
+  # 端口: 已存在的 worktree **必须沿用它自己的端口**, 否则每重跑一次
+  # create 就换一个端口, 登记簿被反复改写, 之前记下的启动命令全部失效。
   local be_port fe_port
+  local existing_ports=""
+  if [[ -f "$wt_dir/.env" ]]; then
+    existing_ports="$(grep -E '^PORT=' "$wt_dir/.env" | head -1 | cut -d= -f2)"
+  fi
+
   if [[ -n "$want_b" || -n "$want_f" ]]; then
     be_port="${want_b:-$((want_f - 3))}"
     fe_port="${want_f:-$((be_port + 3))}"
     if port_busy "$be_port" || port_busy "$fe_port"; then
       warn "指定端口 $be_port/$fe_port 已被占用 —— 继续执行, 但启动时会杀掉占用进程"
     fi
+  elif [[ -n "$existing_ports" ]]; then
+    be_port="$existing_ports"
+    fe_port="$((be_port + 3))"
+    log "沿用该worktree 已有端口"
   else
-    # 重建已有 worktree 时, 允许复用它自己已登记的端口
-    local self_ports=""
-    if [[ -f "$wt_dir/.env" ]]; then
-      self_ports="$(grep -E '^PORT=' "$wt_dir/.env" | cut -d= -f2)"
-    fi
-    local scanned; scanned="$(alloc_ports "$DEFAULT_SCAN_START" "$self_ports")"
+    local scanned; scanned="$(alloc_ports "$DEFAULT_SCAN_START")"
     be_port="${scanned% *}"
     fe_port="${scanned#* }"
   fi
@@ -245,8 +270,32 @@ cmd_create() {
   log "分支: $branch"
   log "端口: backend=$be_port frontend=$fe_port (主树 $MAIN_BACKEND_PORT/$MAIN_FRONTEND_PORT)"
 
-  # 分支已存在? 复用而不是报错(git worktree add 会拒绝已存在的分支)
-  if git show-ref --verify --quiet "refs/heads/$branch"; then
+  # 目录已存在 => 该 worktree 已挂载过。
+  # 这是常见场景(重跑 create 补建隔离), 不能 fatal 退出,
+  # 否则用户无法在不删树的前提下重跑隔离初始化。
+  #
+  # 本机实测的三处格式差异(必须全部归一):
+  #   git --porcelain : "d:/users/.../tickflow-wt-x"
+  #   pwd -P          : "/d/users/.../tickflow-wt-x"
+  # →差异1: git 无前导斜杠; 差异2: pwd 的盘符不带冒号(要补成 "d:")
+  local norm_wt
+  norm_wt="$( (cd "$wt_dir" 2>/dev/null && pwd -P) || printf '%s' "$wt_dir" )"
+  norm_wt="$(printf '%s' "$norm_wt" | tr 'A-Z' 'a-z' | tr '\\' '/')"
+  norm_wt="${norm_wt#/}"          # 去前导斜杠
+  # 补盘符冒号: "d/users/..." -> "d:/users/..."
+  # 注意不能用 ${var/:\//:} —— 该模式在 bash 里转义有歧义, 实测不生效。
+  norm_wt="$(printf '%s' "$norm_wt" | sed -E 's|^([a-z])/|\1:/|')"
+  local git_norm
+  git_norm="$(git worktree list --porcelain \
+    | sed -n 's/^[Ww][Oo][Rr][Kk][Tt][Rr][Ee][Ee] //p' \
+    | tr 'A-Z' 'a-z' | tr '\\' '/')"
+  if [[ -d "$wt_dir" ]] && printf '%s\n' "$git_norm" | grep -qxF "$norm_wt"; then
+    warn "worktree 已存在, 跳过挂载, 仅重跑隔离初始化"
+  elif [[ -e "$wt_dir" ]]; then
+    die "目录已存在但不是 git worktree: $wt_dir
+   请先手动清理该目录, 或换一个目录名(create <分支> <新目录名>)"
+  elif git show-ref --verify --quiet "refs/heads/$branch"; then
+    # 分支已存在但目录不存在 —— 挂载该分支
     warn "分支 $branch 已存在, 将直接挂载该分支"
     git worktree add "$wt_dir" "$branch"
   else
@@ -327,21 +376,29 @@ setup_data_dirs() {
   # `/J` 改写成 `D:\J` 之类的路径, cmd 报「无效开关」, 静默失败后脚本会
   # 退化成 cp -r(白拷 1.5G)。必须走 PowerShell 的 New-Item -ItemType Junction。
   if [[ "$(uname -s)" =~ MINGW|MSYS|CYGWIN ]]; then
+    # 注意: 从 Bash 调 powershell 会被沙箱安全策略拦
+    # ("Invoking PowerShell from Bash bypasses PowerShell security checks")。
+    # 该失败会**静默发生**, 因此下面必须 `|| true` 兜住 ——
+    # 否则 set -e 会把 setup_data_dirs 整个中止, 表现为:
+    #   create 输出了 .env/端口几行就结束、data/ 为 0 项,
+    #   连可写目录(paper/job_store)都没建, 后端起来直接写不进去。
     link_dir() {
       powershell -NoProfile -NonInteractive -Command \
         "New-Item -ItemType Junction -Path '$1' -Target '$2' -ErrorAction Stop | Out-Null" \
-        >/dev/null 2>&1
+        >/dev/null 2>&1 || true
     }
   else
-    link_dir() { ln -s "$2" "$1"; }
+    link_dir() { ln -s "$2" "$1" || true; }
   fi
 
-  local linked=0 copied=0
+  local linked=0 failed=0
   for d in "${SHARED_DATA_DIRS[@]}"; do
     local src="$MAIN_ROOT/data/$d"
     local dst="$wt_data/$d"
     [[ -e "$src" ]] || continue
-    # 已有联接 = 上次跑过, 跳过(联接不可用 -e 判断为假, 所以显式查 -L)
+    # 已有联接 = 上次跑过, 跳过。
+    # 必须用 is_link(而非 [[ -e ]] / [[ -L ]]): Junction 在 POSIX 层
+    # 就是普通目录, [[ -e ]] 对它为真会被误判成"已存在实体"。
     if is_link "$dst"; then
       linked=$((linked+1))
       continue
@@ -352,17 +409,22 @@ setup_data_dirs() {
     fi
     link_dir "$dst" "$src"
     # 不信link_dir 的返回值 —— 事后验证目标状态。
-    # Junction 用[[ -L ]] 可判定; 万一退化成实体目录则删掉重来。
     if is_link "$dst"; then
       linked=$((linked+1))
     else
-      warn "联接失败, 退回复制: $d"
-      [[ -e "$dst" ]] && rm -rf "$dst"
-      cp -r "$src" "$dst"
-      copied=$((copied+1))
+      #绝不退化成 cp -r: 只读行情合计 1.9G, 白拷一遍还让人误以为已隔离。
+      # 明确报出待执行的 PowerShell 命令, 由调用方用 PowerShell 工具执行。
+      failed=$((failed+1))
     fi
   done
-  ok "data/ 只读联接 $linked 个, 复制 $copied 个"
+  if [[ "$linked" -gt 0 ]]; then
+    ok "data/ 只读联接 $linked 个"
+  fi
+  if [[ "$failed" -gt 0 ]]; then
+    warn "data/ 有 $failed 个只读联接未建成(当前环境不允许从 Bash 调 powershell)"
+    warn "请用 PowerShell 工具执行以下命令补建, 或直接跑 scripts/link-worktree-data.sh <目录名>"
+    printf '     New-Item -ItemType Junction -Path <worktree>\\data\\<name> -Target <main>\\data\\<name>\n'
+  fi
 
   # 派生文件: 无法 Junction, 直接复制(体积KB级)
   local fcopied=0
