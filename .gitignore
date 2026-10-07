@@ -109,3 +109,12 @@ TickFlowStockPanel.app/
 TickFlowStockPanel-macos*.dmg
 TickFlowStockPanel-macos*.zip
 reports/cursor_tickflow_pro_rate_limit_p0.bundle
+
+# ===== AI 助手本地工作区 (个人笔记与会话记忆, 不属于仓库内容) =====
+.workbuddy/
+
+# ===== 研究资料 (本地查阅的 PDF/笔记, 体量大且与代码无关) =====
+research_pdfs/
+
+# ===== 策略研究笔记 (个人分析文档, 不入库) =====
+scripts/strategy-tools/
