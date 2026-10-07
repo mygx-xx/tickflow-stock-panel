@@ -651,7 +651,7 @@ def replay_positions(
             total_cost = pos["avg_cost"] * pos["qty"] + qty * price + fee
             pos["qty"] += qty
             pos["avg_cost"] = round(total_cost / pos["qty"], 6) if pos["qty"] else 0.0
-            pos["lots"].append({"date": f.get("date", ""), "qty": qty})
+            pos["lots"].append({"date": f.get("date", ""), "qty": qty, "src": f.get("source") or "manual"})
         else:
             cash += qty * price - fee
             pos = positions.get(symbol)
@@ -675,6 +675,119 @@ def replay_positions(
                 pos["avg_cost"] = 0.0
         pos["available_qty"] = _available_of(pos)
     return positions, round(cash, 2)
+
+
+def replay_attribution(
+    data_dir: Path,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+) -> dict:
+    """按成交来源重放台账 — 策略归因的唯一权威实现。
+
+    与 replay_positions 的区别: 后者只按 symbol 聚合, 本函数按 (symbol, source)
+    二维聚合, 用来回答「哪个策略带来的持仓 / 已实现盈亏」。
+
+    卖出按 FIFO 消耗批次, 盈亏归属到**被消耗批次**的来源 —— 这样「策略买的票
+    被手动卖出」也记回策略账, 而不会记成手动平仓。买入费用计入成本、卖出费用
+    从收入中扣除, 与 replay_positions 的成本口径一致。
+
+    浮动盈亏不在此处计算 (需要现价), 由前端用行情价换算。
+    """
+    fills = load_fills(data_dir, account_id)
+    # book[symbol][source] = {qty, cost}
+    book: dict[str, dict[str, dict]] = {}
+    stats: dict[str, dict] = {}
+
+    def _st(src: str) -> dict:
+        return stats.setdefault(src, {
+            "source": src,
+            "realized_pnl": 0.0,
+            "buy_count": 0,
+            "sell_count": 0,
+            "buy_qty": 0.0,
+            "sell_qty": 0.0,
+            "buy_amount": 0.0,
+            "sell_amount": 0.0,
+            "first_trade_at": None,
+            "last_trade_at": None,
+        })
+
+    for f in fills:
+        src = f.get("source") or "manual"
+        symbol = f["symbol"]
+        st = _st(src)
+        ts = f.get("ts") or ""
+        if st["first_trade_at"] is None or (ts and ts < st["first_trade_at"]):
+            st["first_trade_at"] = ts or None
+        if ts and (st["last_trade_at"] is None or ts > st["last_trade_at"]):
+            st["last_trade_at"] = ts
+
+        per = book.setdefault(symbol, {})
+        if f.get("kind") == "corp_action":
+            # 除权: 股数按 factor 缩放, 单位成本反向调整 —— 总成本不变
+            # (与 replay_positions 的 qty×factor / avg_cost÷factor 同口径)
+            factor = float(f["factor"])
+            for s in per:
+                per[s]["qty"] = round(per[s]["qty"] * factor, 6)
+            continue
+
+        side = f["side"]
+        qty, price, fee = int(f["qty"]), float(f["price"]), float(f.get("fee", 0))
+        if side == "buy":
+            lot = per.setdefault(src, {"qty": 0.0, "cost": 0.0})
+            lot["qty"] = round(lot["qty"] + qty, 6)
+            lot["cost"] = round(lot["cost"] + qty * price + fee, 4)
+            st["buy_count"] += 1
+            st["buy_qty"] += qty
+            st["buy_amount"] = round(st["buy_amount"] + qty * price + fee, 2)
+        else:
+            st["sell_count"] += 1
+            st["sell_qty"] += qty
+            st["sell_amount"] = round(st["sell_amount"] + qty * price - fee, 2)
+            # 卖出费用按成交量单位分摊, 归到实际被消耗的批次
+            fee_unit = fee / qty if qty else 0.0
+            remain = qty
+            for s in list(per.keys()):          # FIFO: 先买入的先消耗
+                if remain <= 1e-9:
+                    break
+                lot = per[s]
+                if lot["qty"] <= 1e-9:
+                    per.pop(s, None)
+                    continue
+                take = min(lot["qty"], remain)
+                avg = lot["cost"] / lot["qty"] if lot["qty"] else 0.0
+                # 盈亏 = 卖出净收入(扣费) - 对应批次的含费成本
+                _st(s)["realized_pnl"] = round(
+                    _st(s)["realized_pnl"] + take * (price - fee_unit - avg), 2
+                )
+                lot["qty"] = round(lot["qty"] - take, 6)
+                lot["cost"] = round(lot["cost"] - take * avg, 4)
+                remain = round(remain - take, 6)
+            for s in [s for s, l in per.items() if l["qty"] <= 1e-9]:
+                per.pop(s, None)
+
+    sources = []
+    for src, st in stats.items():
+        held_qty = held_cost = 0.0
+        held_symbols = 0
+        for per in book.values():
+            lot = per.get(src)
+            if lot and lot["qty"] > 1e-9:
+                held_qty += lot["qty"]
+                held_cost += lot["cost"]
+                held_symbols += 1
+        sources.append({
+            **st,
+            "realized_pnl": round(st["realized_pnl"], 2),
+            "held_qty": round(held_qty, 2),
+            "held_cost": round(held_cost, 2),
+            "held_symbols": held_symbols,
+        })
+    # 排序: 有持仓的在前, 其次按成交额 — 归因视图关心"现在还拿着多少"
+    sources.sort(key=lambda x: (-x["held_symbols"], -x["held_cost"]))
+    return {
+        "sources": sources,
+        "total_realized": round(sum(s["realized_pnl"] for s in sources), 2),
+    }
 
 
 def _available_of(pos: dict, today: str | None = None) -> int:
@@ -794,6 +907,10 @@ def _fill_order(data_dir: Path, order: dict, raw_price: float, day: str, account
         "price": price,
         "fee": fee,
         "kind": "fill",
+        # 来源继承自订单 (manual / auto:{rule_id})。归因链路的起点:
+        # 少了它, 持仓与已实现盈亏都无法拆到「哪个策略带来的」。
+        # 旧台账无此字段, 回放时按 manual 兜底。
+        "source": order.get("source") or "manual",
     }
     _append_fill(data_dir, fill, account_id)
 

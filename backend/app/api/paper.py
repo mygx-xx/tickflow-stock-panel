@@ -13,7 +13,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from app.strategy import paper
+from app.strategy import monitor_rules, paper
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +206,43 @@ def list_positions(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_
     data_dir = _data_dir(request)
     ov = paper.overview(data_dir, account_id=_acc(request, account))
     return {"holdings": ov.get("holdings", []), "initialized": ov.get("initialized", False)}
+
+
+@router.get("/attribution")
+def get_attribution(request: Request, account: str = Query(paper.DEFAULT_ACCOUNT_ID)):
+    """按来源归因 — 哪个策略带来的持仓与已实现盈亏。
+
+    台账里的 source 形如 manual / auto:{rule_id}; 这里把 auto:* 解析回监控规则,
+    挂上 strategy_id 与规则名, 前端即可按策略聚合展示。
+    """
+    data_dir = _data_dir(request)
+    result = paper.replay_attribution(data_dir, account_id=_acc(request, account))
+    for row in result["sources"]:
+        row.update(_resolve_source(data_dir, row["source"]))
+    return result
+
+
+def _resolve_source(data_dir: Path, source: str) -> dict:
+    """source → 归因身份。auto:{rule_id} 反查监控规则拿 strategy_id; 规则已删则降级标注。"""
+    if not source.startswith("auto:"):
+        return {"kind": "manual", "strategy_id": None, "rule_id": None, "label": "手动下单"}
+    rule_id = source[5:]
+    try:
+        rule = monitor_rules.load_one(data_dir, rule_id)
+    except Exception as e:                       # 规则文件损坏不应让整个归因接口挂掉
+        logger.warning("attribution: monitor rule load failed %s: %s", rule_id, e)
+        rule = None
+    if rule is None:
+        return {
+            "kind": "orphan", "strategy_id": None, "rule_id": rule_id,
+            "label": f"自动规则 {rule_id}（已删除）",
+        }
+    return {
+        "kind": "strategy",
+        "strategy_id": rule.get("strategy_id"),
+        "rule_id": rule_id,
+        "label": rule.get("name") or rule_id,
+    }
 
 
 @router.get("/nav")

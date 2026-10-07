@@ -9,7 +9,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import * as echarts from 'echarts'
 import { Banknote, CircleDollarSign, GitCompare, PieChart, Plus, Settings, TrendingUp, Wallet, X } from 'lucide-react'
-import { api, type PaperCompareRow, type PaperFill, type PaperOrder } from '@/lib/api'
+import { api, type PaperAttributionRow, type PaperCompareRow, type PaperFill, type PaperOrder } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { cn } from '@/lib/cn'
 import { fmtPct, priceColorClass } from '@/lib/format'
@@ -1087,6 +1087,93 @@ function AutoRuleForm({ acc, onDone, onCancel }: { acc: string; onDone: () => vo
   )
 }
 
+/**
+ * 按来源归因 — 回答「哪个策略带来的票在赚钱」。
+ * 台账里成交记录带 source (manual / auto:{rule_id}), 卖出按 FIFO 回冲到被消耗的
+ * 买入批次, 所以手动平仓策略持仓时, 盈亏仍记在该策略账上。
+ * 浮动盈亏需现价, 不在此展示 (持仓表已有逐票盈亏)。
+ */
+function AttributionCard({ rows, totalRealized, loading }: {
+  rows: PaperAttributionRow[]
+  totalRealized: number
+  loading: boolean
+}) {
+  const kindTag = (k: PaperAttributionRow['kind']) => (
+    <span className={cn(
+      'shrink-0 rounded px-1 py-px text-[9px] font-medium leading-tight',
+      k === 'strategy' ? 'bg-accent/15 text-accent'
+        : k === 'orphan' ? 'bg-amber-500/15 text-amber-400'
+          : 'bg-elevated text-muted',
+    )}>
+      {k === 'strategy' ? '策略' : k === 'orphan' ? '规则已删' : '手动'}
+    </span>
+  )
+  return (
+    <div className="rounded-card border border-border bg-surface p-4">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-sm font-medium">
+          按策略归因
+          <span className="ml-1 text-[10px] font-normal text-muted">卖出按先进先出回冲到买入来源</span>
+        </div>
+        <div className="shrink-0 text-right">
+          <div className="text-[10px] text-muted">已实现合计</div>
+          <div className={cn('font-mono text-sm font-bold', priceColorClass(totalRealized))}>
+            {(totalRealized >= 0 ? '+' : '') + fmtMoney(totalRealized)}
+          </div>
+        </div>
+      </div>
+      {loading ? (
+        <div className="py-6 text-center text-xs text-muted">加载中…</div>
+      ) : rows.length === 0 ? (
+        <div className="py-6 text-center text-xs text-muted">
+          暂无成交 — 在策略页开启策略监控后, 自动跟单的持仓会按策略分账
+        </div>
+      ) : (
+        <div className="mt-2 overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-[10px] text-muted">
+                <th className="py-1.5 font-normal">来源</th>
+                <th className="py-1.5 text-right font-normal">持仓</th>
+                <th className="py-1.5 text-right font-normal">持仓成本</th>
+                <th className="py-1.5 text-right font-normal">已实现</th>
+                <th className="py-1.5 text-right font-normal">买/卖</th>
+                <th className="py-1.5 text-right font-normal">末次交易</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r => (
+                <tr key={r.source} className="border-t border-border/50 transition-colors hover:bg-elevated/40"
+                  title={`买入 ${fmtMoney(r.buy_amount)} · 卖出 ${fmtMoney(r.sell_amount)}`}>
+                  <td className="py-1.5">
+                    <div className="flex items-center gap-1.5">
+                      {kindTag(r.kind)}
+                      <span className="truncate text-foreground" title={r.label}>{r.label}</span>
+                    </div>
+                  </td>
+                  <td className="py-1.5 text-right font-mono">
+                    {r.held_symbols > 0 ? `${r.held_symbols} 只 / ${r.held_qty}` : '—'}
+                  </td>
+                  <td className="py-1.5 text-right font-mono text-secondary">
+                    {r.held_cost > 0 ? fmtMoney(r.held_cost, 0) : '—'}
+                  </td>
+                  <td className={cn('py-1.5 text-right font-mono', priceColorClass(r.realized_pnl))}>
+                    {r.realized_pnl !== 0 ? (r.realized_pnl > 0 ? '+' : '') + fmtMoney(r.realized_pnl, 0) : '—'}
+                  </td>
+                  <td className="py-1.5 text-right font-mono text-muted">{r.buy_count}/{r.sell_count}</td>
+                  <td className="py-1.5 text-right font-mono text-muted">
+                    {r.last_trade_at ? r.last_trade_at.slice(5, 16).replace('T', ' ') : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function Paper() {
   const qc = useQueryClient()
   const [tab, setTab] = useState<'orders' | 'trades'>('orders')
@@ -1107,6 +1194,7 @@ export function Paper() {
   const tradesQ = useQuery({ queryKey: QK.paperTrades(accId), queryFn: () => api.paperTrades(accId) })
   const navQ = useQuery({ queryKey: QK.paperNav(accId), queryFn: () => api.paperNav(accId) })
   const statsQ = useQuery({ queryKey: QK.paperStats(accId), queryFn: () => api.paperStats(accId) })
+  const attrQ = useQuery({ queryKey: QK.paperAttribution(accId), queryFn: () => api.paperAttribution(accId) })
 
   // 'paper' 前缀兜底失效: 覆盖全部账户的全部查询 (订单变动可能影响净值/统计)
   const invalidateAll = () => qc.invalidateQueries({ queryKey: QK.paperAll })
@@ -1328,6 +1416,12 @@ export function Paper() {
                 </table>
               )}
             </div>
+
+            <AttributionCard
+              rows={attrQ.data?.sources ?? []}
+              totalRealized={attrQ.data?.total_realized ?? 0}
+              loading={attrQ.isLoading}
+            />
 
             {/* 订单 / 成交流水 */}
             <div className="rounded-card border border-border bg-surface p-4">
