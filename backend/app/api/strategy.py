@@ -61,12 +61,35 @@ def _get_engine(request: Request) -> StrategyEngine:
 
 
 def _get_public_strategy(engine: StrategyEngine, strategy_id: str) -> StrategyDef:
+    """取**可查看**的策略: 只对research_only 草稿做404 隐身。
+
+    注意这里**不拦 retired** —— 归档策略的详情必须仍可读, 否则人工无法看到
+    它被归档、归档理由是什么, "仅人工可复活"就无从谈起(要先能看到才能复活)。
+    执行类端点用 `_get_executable_strategy` 额外拦 retired。
+    """
     try:
         strategy = engine.get(strategy_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if strategy.meta.get("research_only"):
         raise HTTPException(status_code=404, detail=f"unknown strategy: {strategy_id}")
+    return strategy
+
+
+def _get_executable_strategy(engine: StrategyEngine, strategy_id: str) -> StrategyDef:
+    """取**可执行**的策略: retired 归档状态直接 409 拒绝。
+
+    retired 是人工确认「退出全部自动流程」, 不该再被执行(自动选股/监控都不该碰它)。
+    只拦 retired 而不拦 draft/watch:
+    - draft 仍需可跑, 否则新策略无法测试;
+    - watch 是"待人工复核", 复核的前提就是能跑。
+    """
+    strategy = _get_public_strategy(engine, strategy_id)
+    if normalize_status(strategy.meta.get("status")) == "retired":
+        raise HTTPException(
+            status_code=409,
+            detail=f"策略 {strategy_id} 已归档(retired), 不可执行; 如需复活请先迁回 draft",
+        )
     return strategy
 
 
@@ -383,7 +406,10 @@ def get_strategy(strategy_id: str, request: Request):
 @router.post("/run")
 def run_strategy(req: RunRequest, request: Request):
     engine = _get_engine(request)
-    _get_public_strategy(engine, req.strategy_id)
+    # 执行入口用 executable 变体: retired 归档策略不允许再跑选股。
+    # 配置管理/看源码/详情仍用 _get_public_strategy —— 归档后人工还要能
+    # 看到它、改参数、复活它。
+    _get_executable_strategy(engine, req.strategy_id)
     data_dir = _data_dir(request)
 
     # 读取用户覆盖配置
@@ -442,10 +468,14 @@ def run_all(req: RunAllRequest, request: Request):
         return {"as_of": None, "results": {}}
 
     all_overrides = strategy_config.list_overrides(data_dir)
+    # retired(已归档)与 research_only(草稿)都跳过: 前者是人工确认退出,
+    # 后者尚未 publish。批量执行必须与单策略 run 的准入口径一致 ——
+    # 否则单跑被拒、批量却仍会跑它。
     strategy_ids = [
         meta["id"]
         for meta in engine.list_strategies()
         if not meta.get("research_only")
+        and normalize_status(meta.get("status")) != "retired"
         and req.asset_type in meta.get("asset_types", ["stock"])
         and req.timeframe in meta.get("timeframes", ["1d"])
     ]
@@ -607,9 +637,74 @@ def _set_meta_string_field(block: str, field: str, value: str) -> str:
     return _insert_meta_field(block, field, _py_string(value))
 
 
+def _top_level_meta_pairs(single_line: str) -> list[tuple[str, str]] | None:
+    """解析单行 META 的顶层键值对, 返回 [(键文本, 值源码), ...]。
+
+    用 `ast.literal_eval` 取真实Python 值再重新渲染, 而不是正则切分 ——
+    嵌套 dict/list(如 params、scoring)里的逗号与引号会切错正则。
+
+    返回 None 表示无法安全解析(调用方应拒绝改写而不是产出坏代码)。
+    """
+    start = single_line.find("{")
+    end = single_line.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = ast.literal_eval(single_line[start:end + 1])
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(value, dict):
+        return None
+    pairs: list[tuple[str, str]] = []
+    for key, item in value.items():
+        # 键统一用双引号(与项目 META 风格一致, repr 对字符串会出单引号,
+        # 混用会让改写后的文件与原文风格不一致, 污染 diff)。
+        # 字符串值也统一双引号 —— _py_string 走 json.dumps, 中文与转义都正确。
+        if isinstance(item, str):
+            rendered = _py_string(item)
+        elif isinstance(item, (int, float, bool, type(None))):
+            rendered = repr(item)
+        else:
+            try:
+                rendered = repr(ast.literal_eval(repr(item)))
+            except Exception:  # noqa: BLE001
+                return None
+        pairs.append(('"' + str(key).replace('"', '\\"') + '"', rendered))
+    return pairs
+
+
 def _insert_meta_field(block: str, field: str, value_repr: str) -> str:
-    """在 META 字典末尾(闭合 `}` 之前)插入一个字段。value_repr 已是 Python 源码。"""
+    """在 META 字典末尾(闭合 `}` 之前)插入一个字段。value_repr 已是 Python 源码。
+
+    **单行 META 必须先展开**: `META = {"id": "x", "name": "y"}` 这种写法下,
+    闭合 `}` 在行尾而非行首, 下面找 `}` 的循环会一路落到 len(lines) ——
+    于是新字段被插到 `}` **之后**, 产出
+        META = {"id": "x", "name": "y"},
+               "status": "active",
+    这种非法 Python, `engine.reload()` 报IndentationError / SyntaxError,
+    策略整个加载失败(实测确认)。故单行时直接重排成多行再插入。
+    """
     lines = block.splitlines(keepends=True)
+    # 找闭合 `}` 所在行: 要求该行 lstrip 后**以** `}` 开头(否则是单行 META,
+    # `}` 只是行尾字符)。
+    insert_at = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip().startswith("}"):
+            insert_at = i
+            break
+
+    if insert_at is None:
+        # 单行 META: 拆成规范多行, 之后走标准路径。
+        indent = re.match(r"^(\s*)", lines[0]).group(1) if lines else ""
+        # 用 ast 精确取键顺序, 避免正则切分嵌套结构(如 params/scoring 内有 dict)
+        body = "".join(lines).rstrip()
+        pairs = _top_level_meta_pairs(body)
+        if pairs is None:
+            raise ValueError("META 是单行且无法安全解析其键, 请先展开为多行再设置 status")
+        rendered = "".join(f'{indent}    {k}: {v},\n' for k, v in pairs)
+        lines = [f"{indent}META = {{\n", rendered, f"{indent}}}\n"]
+        insert_at = len(lines) - 1
+
     key_indent = None
     for line in lines:
         m = re.match(r"^(\s*)[\"'][^\"']+[\"']\s*:", line)
@@ -617,8 +712,9 @@ def _insert_meta_field(block: str, field: str, value_repr: str) -> str:
             key_indent = m.group(1)
             break
     if key_indent is None:
-        first_indent = re.match(r"^(\s*)", lines[0] if lines else "")
-        key_indent = (first_indent.group(1) if first_indent else "") + "    "
+        first = lines[0] if lines else ""
+        brace = first.find("{")
+        key_indent = " " * ((brace + 4) if brace >= 0 else 4)
 
     insert_at = len(lines)
     for i in range(len(lines) - 1, -1, -1):

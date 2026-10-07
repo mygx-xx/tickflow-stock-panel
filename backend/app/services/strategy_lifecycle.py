@@ -49,7 +49,7 @@ from typing import Any
 
 from app.backtest.optimizer import _MINIMIZE_OBJECTIVES
 from app.backtest.stats_v2 import deflated_sharpe_psr, expected_max_sharpe
-from app.strategy.lifecycle import DEFAULT_STATUS, normalize_status
+from app.strategy.lifecycle import normalize_status
 
 logger = logging.getLogger(__name__)
 
@@ -401,16 +401,22 @@ def sharpe_baseline(data_dir: Any) -> tuple[int | None, float | None]:
     if not directory.exists():
         return None, None
     sharpes: list[float] = []
+    # 只扫一级目录, 不递归: claim 存在 _claims/ 子目录下, 结构上就够隔离。
     for file in sorted(directory.glob("*.json")):
-        # 幂等 claim 文件不是缓存, 跳过
-        if file.name.startswith("_"):
-            continue
+        # 判据是「内容里的 strategy_id 与文件 stem 一致」, 而不是文件名前缀 ——
+        # 策略 id 的校验正则 [A-Za-z0-9_-]+ **允许** 以下划线开头, 用
+        # `name.startswith("_")` 当过滤条件会把这类合法策略误跳过(实测确认)。
         try:
             payload = json.loads(file.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             logger.warning("夏普基准: 跳过损坏缓存 %s: %s", file.name, exc)
             continue
-        if not isinstance(payload, dict) or payload.get("objective") != "sharpe":
+        if not isinstance(payload, dict):
+            continue
+        # 缓存文件必然带 strategy_id; claim 等元数据文件没有 -> 天然被排除。
+        if payload.get("strategy_id") != file.stem:
+            continue
+        if payload.get("objective") != "sharpe":
             continue
         value = (payload.get("summary") or {}).get("avg_oos_objective")
         if isinstance(value, (int, float)) and math.isfinite(value):

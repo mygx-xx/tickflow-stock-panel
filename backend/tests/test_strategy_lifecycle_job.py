@@ -95,7 +95,7 @@ def _activate(app_state, tmp_path, engine):
 
 
 def _claim_exists(tmp_path):
-    return any(tmp_path.joinpath("strategy_lifecycle").glob("_claim_*.json"))
+    return any(tmp_path.joinpath("strategy_lifecycle", "_claims").glob("*.json"))
 
 
 # ── 默认关闭 ───────────────────────────────────────────────────────
@@ -145,6 +145,94 @@ def test_同一天只巡检一次(env, monkeypatch):
 
     second = dp._strategy_lifecycle_task(env.app_state)
     assert second is None, "同日第二次应被 claim 拦下"
+
+
+def test_巡检异常时当天可重试(env, monkeypatch):
+    """回归防护: claim 必须在巡检**成功之后**才写。
+
+    若先写 claim 再跑, 一次偶发异常会让当天永远不再重试 —— 整天没有绩效
+    判定且无任何线索(claim 已存在, 日志只说"今日已巡检")。
+    """
+    monkeypatch.setattr(dp, "_holiday_skip", lambda label: False)
+    preferences.set_strategy_lifecycle_schedule(True, 16, 30, False)
+
+    empty_report = {
+        "status": "ok", "examined": 0,
+        "degraded": [], "healthy": [], "skipped": [],
+    }
+
+    def boom(*_a, **_k):
+        raise RuntimeError("模拟巡检内部异常")
+
+    monkeypatch.setattr(
+        "app.services.strategy_lifecycle.sweep_strategy_lifecycle", boom
+    )
+    with pytest.raises(RuntimeError):
+        dp._strategy_lifecycle_task(env.app_state)
+
+    assert not _claim_exists(env.tmp_path), "巡检失败不该写 claim"
+
+    # 恢复正常后当天应能重试(用 monkeypatch 上下文, 不污染其他 patch)
+    monkeypatch.setattr(
+        "app.services.strategy_lifecycle.sweep_strategy_lifecycle",
+        lambda *a, **k: dict(empty_report),
+    )
+    retried = dp._strategy_lifecycle_task(env.app_state)
+    assert retried is not None, "修复后当天应可重试"
+    assert _claim_exists(env.tmp_path), "成功后才写 claim"
+
+
+def test_claim写在独立子目录不污染缓存(env, monkeypatch):
+    """claim 是调度元数据, 必须与策略绩效缓存分开存放。
+
+    混在一处时 sharpe_baseline 的 glob 会读到 claim 文件。
+    """
+    monkeypatch.setattr(dp, "_holiday_skip", lambda label: False)
+    preferences.set_strategy_lifecycle_schedule(True, 16, 30, False)
+    dp._strategy_lifecycle_task(env.app_state)
+
+    claims = list(env.tmp_path.joinpath("strategy_lifecycle").glob("*.json"))
+    assert claims == [], f"claim 不该落在缓存目录根: {[p.name for p in claims]}"
+    sub = list(env.tmp_path.joinpath("strategy_lifecycle", "_claims").glob("*.json"))
+    assert len(sub) == 1
+
+
+def test_下划线开头策略不污染夏普基准(env, monkeypatch):
+    """策略 id 允许 `_` 开头([A-Za-z0-9_-]+), 不能被当 claim 误跳过。"""
+    from app.services import strategy_lifecycle as sl
+    from app.services import walkforward_store
+
+    for i, sp in enumerate([1.0, 2.0, 3.0], start=1):
+        walkforward_store.save_walkforward_result(
+            env.tmp_path,
+            f"s{i}",
+            {
+                "objective": "sharpe",
+                "direction": "max",
+                "n_folds": 4,
+                "folds": [{"index": j, "test_end": "x", "is_score": sp,
+                           "oos_objective": sp, "oos_stats": {"n_trades": 30}}
+                          for j in range(1, 5)],
+                "summary": {"n_folds": 4, "degradation": 0.0, "consistency": 1.0,
+                            "avg_oos_objective": sp},
+            },
+        )
+    walkforward_store.save_walkforward_result(
+        env.tmp_path,
+        "_under",
+        {
+            "objective": "sharpe",
+            "direction": "max",
+            "n_folds": 4,
+            "folds": [{"index": j, "test_end": "x", "is_score": 9.0,
+                       "oos_objective": 9.0, "oos_stats": {"n_trades": 30}}
+                      for j in range(1, 5)],
+            "summary": {"n_folds": 4, "degradation": 0.0, "consistency": 1.0,
+                        "avg_oos_objective": 9.0},
+        },
+    )
+    n_trials, _ = sl.sharpe_baseline(env.tmp_path)
+    assert n_trials == 4, f"4 个策略都该计入, 实际 {n_trials}"
 
 
 # ── 只报告不落盘(默认) ─────────────────────────────────────────────

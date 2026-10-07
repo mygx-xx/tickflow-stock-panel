@@ -923,7 +923,6 @@ def _strategy_lifecycle_task(app_state) -> dict | None:
     人工核对 degradation 阈值(按 objective 分别定, 量纲差异大)再开落盘。
     """
     from app.services import strategy_lifecycle as lifecycle_svc
-    from app.services import walkforward_store
 
     if _holiday_skip("strategy_lifecycle"):
         return None
@@ -940,18 +939,23 @@ def _strategy_lifecycle_task(app_state) -> dict | None:
         return None
 
     data_dir = repo.store.data_dir
-    # 每日幂等claim: 同一天重复触发(含重启后补跑)只执行一次。
-    # 巡检是"读缓存 + 判定 + 可选降级", 重复跑除浪费外还会让降级日志变噪声。
     from app.services.mining_schedule import beijing_date
 
-    claim_dir = data_dir / "strategy_lifecycle"
+    # 每日幂等 claim: 同一天重复触发(含重启后补跑)只执行一次。巡检是
+    # "读缓存 + 判定 + 可选降级", 重复跑除浪费外还会让降级日志变噪声。
+    #
+    # claim 目录与缓存目录分开: claim 是调度元数据, 缓存是策略绩效数据,
+    # 混在一处会让 sharpe_baseline 的glob 读到 claim 文件。
+    claim_dir = data_dir / "strategy_lifecycle" / "_claims"
     claim_dir.mkdir(parents=True, exist_ok=True)
-    claim_file = claim_dir / f"_claim_{beijing_date().isoformat()}.json"
+    claim_file = claim_dir / f"{beijing_date().isoformat()}.json"
     if claim_file.exists():
         logger.info("strategy_lifecycle 跳过: 今日已巡检(%s)", claim_file.name)
         return None
-    claim_file.write_text('{"claimed": true}', encoding="utf-8")
 
+    # claim **在巡检成功之后**才写: 若先写, 巡检中途抛异常会让当天
+    # 永远不再重试 —— 一次偶发故障导致整天没有绩效判定, 且无任何日志线索。
+    # 先写 claim 再跑是"至多一次", 这里要的是"至少一次成功才算数"。
     n_trials, sharpe_variance = lifecycle_svc.sharpe_baseline(data_dir)
     report = lifecycle_svc.sweep_strategy_lifecycle(
         data_dir,
@@ -959,6 +963,15 @@ def _strategy_lifecycle_task(app_state) -> dict | None:
         n_trials=n_trials,
         sharpe_variance=sharpe_variance,
     )
+
+    # 判定已成功产出, 此时才登记 claim。
+    # 用 atomic_write_text(项目统一写盘约定)而非 write_text: 巡检是低频任务,
+    # 但与 SSE 落盘并发时仍可能读到半截文件。
+    # 内容只存日期字符串 —— claim 的唯一作用是"今天跑过了", 不需要 JSON,
+    # 也避免为此在本模块引入 json 依赖(该模块顶层未导入 json)。
+    from app.services.fs_utils import atomic_write_text
+
+    atomic_write_text(claim_file, f"claimed_at={beijing_date().isoformat()}\n")
 
     degraded = report.get("degraded") or []
     logger.info(

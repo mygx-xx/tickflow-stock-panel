@@ -272,6 +272,151 @@ def test_check读取已缓存的walkforward(client, tmp_path):
     assert client.get("/api/strategies/custom_lifecycle").json()["status"] == "active"
 
 
+# ── retired 的执行语义 ─────────────────────────────────────────────
+
+
+def test_retired详情与源码仍可读(client):
+    """归档后人工要能看到它、改它、复活它 —— 详情/源码不能被拦。
+
+    这是我第一版的错误: 把 retired 的拦截放在 `_get_public_strategy`
+    (详情也走它), 结果归档策略连详情都 409, "仅人工可复活"无从谈起。
+    """
+    client.post("/api/strategies/custom_lifecycle/status", json={"status": "retired"})
+    assert client.get("/api/strategies/custom_lifecycle").status_code == 200
+    assert client.get("/api/strategies/custom_lifecycle/source").status_code == 200
+    assert client.get("/api/strategies/custom_lifecycle/lifecycle").status_code == 200
+
+
+def test_retired不可执行选股(client):
+    """归档策略不应再被执行(拦截层即拒绝, 不进业务逻辑)。"""
+    client.post("/api/strategies/custom_lifecycle/status", json={"status": "retired"})
+    r = client.post("/api/strategies/run", json={"strategy_id": "custom_lifecycle"})
+    assert r.status_code == 409, f"实际 {r.status_code}: {r.text[:200]}"
+    assert "retired" in r.json()["detail"]
+
+
+def test_draft与watch不被retired拦截(client):
+    """不能误伤: draft 要能跑(否则新策略无法测试), watch 要能跑(复核前提)。
+
+    只断言**拦截层**放行 —— run 之后的选股逻辑需要真实 repo(repo/行情),
+    本用例用 SimpleNamespace 撑不住那部分, 断言 500/503 之类没意义。
+    """
+    from app.api.strategy import _get_executable_strategy
+
+    engine = client.app.state.strategy_engine
+    # draft: META 未声明 status, 归一为 draft
+    _get_executable_strategy(engine, "custom_lifecycle")
+
+    for target in ("active", "watch", "active", "watch"):
+        client.post(
+            "/api/strategies/custom_lifecycle/status", json={"status": target}
+        )
+        _get_executable_strategy(engine, "custom_lifecycle")
+
+
+def test_retired被拦截层拒绝(client):
+    """归档策略在拦截层就该被拒, 不该走到业务逻辑。"""
+    from fastapi import HTTPException
+
+    from app.api.strategy import _get_executable_strategy
+
+    client.post("/api/strategies/custom_lifecycle/status", json={"status": "retired"})
+    engine = client.app.state.strategy_engine
+    with pytest.raises(HTTPException) as exc:
+        _get_executable_strategy(engine, "custom_lifecycle")
+    assert exc.value.status_code == 409
+
+
+# ── META 文本改写的形状鲁棒性 ─────────────────────────────────────
+#
+# 以下用例针对 _insert_meta_field 的真实缺陷。策略源码是用户/AI 生成的
+# 自由文本, META 可能写成一行 —— 那种写法下闭合 `}` 在行尾而非行首,
+# 插入位置会落到 `}` 之后, 产出非法 Python 导致策略整体加载失败。
+
+
+@pytest.mark.parametrize(
+    ("label", "source"),
+    [
+        ("单行 META", 'META = {"id": "x", "name": "t"}\n'),
+        ("单行含嵌套", 'META = {"id": "x", "params": [{"id": "a", "default": 1}]}\n'),
+        ("单行含中文", 'META = {"id": "x", "name": "测试策略"}\n'),
+        ("多行 META", 'META = {\n    "id": "x",\n}\n'),
+        ("带前后代码", 'X = 1\nMETA = {\n    "id": "a",\n}\nY = 2\n'),
+    ],
+)
+def test_写入status对各种META形状都产出合法Python(label, source):
+    import ast
+
+    from app.api.strategy import _write_meta_status
+
+    out = _write_meta_status(source, "active")
+    ast.parse(out), f"{label} 写入后语法错误:\n{out}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'META = {"id": "x", "name": "t"}\n',
+        'META = {"id": "x", "params": [{"id": "a", "default": 1}]}\n',
+    ],
+)
+def test_单行META原有键值不被破坏(source):
+    """单行展开成多行时必须保住所有原有键, 不能丢内容。"""
+    import ast
+
+    from app.api.strategy import _write_meta_status
+
+    out = _write_meta_status(source, "active")
+    tree = ast.parse(out)
+    meta = next(
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") == "META"
+    )
+    keys = {k.value for k in meta.keys}
+    assert "id" in keys
+    assert "status" in keys
+
+
+def test_单行META重复写入不累积status():
+    import ast
+
+    from app.api.strategy import _write_meta_status
+
+    once = _write_meta_status('META = {"id": "x"}\n', "active")
+    twice = _write_meta_status(once, "watch")
+    ast.parse(twice)
+    assert twice.count('"status"') == 1, f"重复写入产生多个 status:\n{twice}"
+    assert '"watch"' in twice
+
+
+def test_无法解析的META拒绝改写而非产出坏代码():
+    """META 含非字面量(无法 literal_eval)时应拒绝, 不能默默写出坏代码。"""
+    from app.api.strategy import _write_meta_status
+
+    # 值是函数调用 —— 不是字面量, 无法安全重渲染
+    src = 'META = {"id": "x", "tags": list_of_tags()}\n'
+    try:
+        out = _write_meta_status(src, "active")
+    except ValueError:
+        return  # 明确拒绝, 符合预期
+    # 若未拒绝, 至少产出必须仍是合法 Python(不能是坏代码)
+    import ast
+
+    ast.parse(out)
+
+
+def test_空META可写入():
+    import ast
+
+    from app.api.strategy import _write_meta_status
+
+    out = _write_meta_status("META = {\n}\n", "active")
+    ast.parse(out)
+    assert '"status"' in out
+
+
 # ── 批量巡检 ───────────────────────────────────────────────────────
 
 
