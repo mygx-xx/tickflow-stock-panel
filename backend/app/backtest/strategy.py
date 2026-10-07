@@ -566,6 +566,14 @@ class StrategyBacktestConfig:
     max_exposure_pct: float = 1.0
     initial_capital: float = 1_000_000.0
     position_sizing: Literal["equal", "score_weight"] = "equal"
+    # ---------- 组合约束（默认 None = 不启用, 回测结果与未设时逐位一致）----------
+    # max_position_weight: 单票权重上限。显式给出可解除 score_weight 被
+    #   1/max_positions 二次压制的既存缺陷（详见 portfolio_constraints 模块 docstring）。
+    # max_industry_weight / max_correlation: 行业暴露上限 / 相关性上限,
+    #   需回测侧注入分类与相关性数据才生效, 默认不注入时自动不启用。
+    max_position_weight: float | None = None
+    max_industry_weight: float | None = None
+    max_correlation: float | None = None
     mode: Literal["position", "full"] = "position"
     asset_type: str = "stock"
     holding_days: int = 5
@@ -1327,6 +1335,9 @@ class StrategyBacktestService:
             score_max=score_max,
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
+            max_position_weight=config.max_position_weight,
+            max_industry_weight=config.max_industry_weight,
+            max_correlation=config.max_correlation,
             minute_fill=config.minute_fill,
             asset_type=config.asset_type,
         )
@@ -1916,6 +1927,9 @@ class StrategyBacktestService:
             score_max=score_max,
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
+            max_position_weight=config.max_position_weight,
+            max_industry_weight=config.max_industry_weight,
+            max_correlation=config.max_correlation,
             # 分钟策略的成交价由 entry_price_override 提供 (触发分钟收盘),
             # 不再叠加日线口径的分钟成交细化。
             minute_fill=False,
@@ -2520,6 +2534,9 @@ class StrategyBacktestService:
             "max_exposure_pct": c.max_exposure_pct,
             "initial_capital": c.initial_capital,
             "position_sizing": c.position_sizing,
+            "max_position_weight": c.max_position_weight,
+            "max_industry_weight": c.max_industry_weight,
+            "max_correlation": c.max_correlation,
             "mode": c.mode,
             "holding_days": c.holding_days,
             "minute_fill": c.minute_fill,

@@ -60,6 +60,12 @@ _SESSION_OPEN = _time(9, 30)
 _SESSION_CLOSE = _time(15, 0)
 LOT_SIZE = 100                     # 一手 100 股 (股票/ETF 同)
 MAX_POSITION_SYMBOLS = 50          # 持仓标的数上限 (防误操作)
+# 仓位约束默认值 — 与回测 MatcherConfig 口径对齐。
+# 回测侧 max_exposure_pct (总仓位上限) 默认 1.0; paper 侧此前完全没有这两个约束,
+# 导致「回测设了 60% 仓位, 模拟盘却满仓」的口径不一致。默认 None = 不限制,
+# 保持既有账户行为不变。
+DEFAULT_MAX_EXPOSURE_PCT = None    # 总仓位上限 (占净值比例)
+DEFAULT_MAX_POSITION_WEIGHT = None # 单票权重上限
 DEFAULT_ACCOUNT_ID = "default"
 _ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
@@ -165,6 +171,8 @@ def create_account(
     stamp_tax_pct: float = DEFAULT_STAMP_TAX_PCT,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     queue_limit_orders: bool = False,
+    max_exposure_pct: float | None = DEFAULT_MAX_EXPOSURE_PCT,
+    max_position_weight: float | None = DEFAULT_MAX_POSITION_WEIGHT,
 ) -> dict:
     """创建账户 (同 id 已存在则原样返回, 不覆盖 — 幂等)。"""
     validate_account_id(account_id)
@@ -174,6 +182,8 @@ def create_account(
             return existing
         if isinstance(initial_cash, bool) or not isinstance(initial_cash, (int, float)) or initial_cash <= 0:
             raise ValueError("初始资金必须是正数")
+        exposure = _validate_ratio("max_exposure_pct", max_exposure_pct)
+        pos_weight = _validate_ratio("max_position_weight", max_position_weight)
         acc = {
             "id": account_id,
             "name": (name or "").strip() or account_id,
@@ -183,6 +193,9 @@ def create_account(
             "stamp_tax_pct": float(stamp_tax_pct),
             "slippage_bps": float(slippage_bps),
             "queue_limit_orders": bool(queue_limit_orders),
+            # 仓位约束 (None = 不限制, 与回测 MatcherConfig 同口径)
+            "max_exposure_pct": exposure,
+            "max_position_weight": pos_weight,
             "status": "active",  # active / frozen
             "created_at": _now_iso(),
         }
@@ -233,9 +246,12 @@ def list_accounts(data_dir: Path) -> list[dict]:
 
 
 def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fields) -> dict:
-    """更新账户设置 (涨跌停排队 / 费用三参数); 未知字段忽略。返回更新后账户。
+    """更新账户设置 (涨跌停排队 / 费用三参数 / 仓位约束); 未知字段忽略。
 
     费用只影响之后的新成交 (与回测费用模型同口径), 已有台账不重算。
+    仓位约束 (max_exposure_pct / max_position_weight) 只校验不追溯:
+    设了之后的下单才受约束, 已持仓不因调小上限而被强平 ——
+    与回测「约束只作用于新开仓」一致。
     """
     with PAPER_LOCK:
         acc = get_account(data_dir, account_id)
@@ -255,6 +271,10 @@ def update_settings(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID, **fiel
             if not (lo <= v <= hi):
                 raise ValueError(f"{key} 超出合理范围 ({lo}~{hi})")
             acc[key] = v
+        # 仓位约束: 显式传 None 表示「不限制」, 传数值则校验后写入。
+        for key in ("max_exposure_pct", "max_position_weight"):
+            if key in fields:
+                acc[key] = _validate_ratio(key, fields[key])
         save_account(data_dir, acc, account_id)
         return acc
 
@@ -393,6 +413,14 @@ def create_order(
             est_price = float(ref_price) if ref_price else 0.0
             if est_price > 0 and qty * est_price * (1 + acc["slippage_bps"] / 10000) + buy_fee(qty, est_price, acc["commission_pct"]) > acc_cash:
                 return None, f"可用资金不足 (需约 {qty * est_price:.0f}, 可用 {acc_cash:.0f})"
+            # 仓位约束预检 (与回测 MatcherConfig 同口径, 未设则不限制)。
+            # 放行时用参考价估算市值; 无参考价时跳过 —— 真实约束在撮合时按成交价二次校验。
+            if est_price > 0:
+                reason = _check_position_constraints(
+                    acc, symbol, qty * est_price, data_dir, account_id
+                )
+                if reason:
+                    return None, reason
         else:
             pos = load_positions(data_dir, account_id).get(symbol)
             if pos is None or pos["qty"] <= 0:
@@ -477,6 +505,100 @@ def load_fills(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> list[dic
         except Exception as e:
             logger.warning("paper fill line skipped: %s", e)
     return out
+
+
+# ── 仓位约束校验 ─────────────────────────────────────────
+def _validate_ratio(name: str, value) -> float | None:
+    """校验仓位比例类约束。None = 不限制 (返回 None)。
+
+    口径与回测 MatcherConfig 对齐: 合法区间 (0, 1]。传 0 或负数一律拒绝 ——
+    「设成 0」几乎总是「以为能全空仓」或「手滑」的误解, 不该静默接受。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须是数字或 None")
+    v = float(value)
+    if not (0.0 < v <= 1.0):
+        raise ValueError(f"{name} 超出合理范围 (0~1], 收到 {v}")
+    return v
+
+
+def _estimated_nav(acc: dict, data_dir: Path, account_id: str) -> float:
+    """估算净值 = 现金 + 持仓市值。
+
+    持仓估值优先用 `avg_cost`（无实时价时的保守口径）, 与 `overview` 一致。
+    这里不能用实时价: 下单预检发生在盘中也可能拿不到快照, 用成本价可保证
+    校验始终可用且偏保守（成本价通常低于现价, 净值偏低, 约束更严）。
+    """
+    mv = 0.0
+    for pos in load_positions(data_dir, account_id).values():
+        qty = pos.get("qty", 0)
+        if qty > 0:
+            mv += qty * float(pos.get("avg_cost", 0.0))
+    return float(acc["cash"]) + mv
+
+
+def _check_position_constraints(
+    acc: dict,
+    symbol: str,
+    add_value: float,
+    data_dir: Path,
+    account_id: str = DEFAULT_ACCOUNT_ID,
+) -> str | None:
+    """买入前的仓位约束校验。返回拒绝原因 (None = 放行)。
+
+    两个约束, 口径与回测 `MatcherConfig` 一致:
+      max_exposure_pct: 总仓位上限 (现金 + 持仓市值 合计不超过净值 × 上限)
+      max_position_weight: 单票权重上限 (该票市值不超过净值 × 上限)
+
+    约束只作用于**新买入**: 调小上限不会强平已有持仓 (与回测一致)。
+    已有持仓超限时不阻止加仓以外的操作, 但会阻止进一步买入该票 ——
+    超限的票继续加仓会让偏离越走越大。
+    """
+    exposure_cap = acc.get("max_exposure_pct")
+    weight_cap = acc.get("max_position_weight")
+    if exposure_cap is None and weight_cap is None:
+        return None
+    if add_value <= 0:
+        return None
+
+    nav = _estimated_nav(acc, data_dir, account_id)
+    if nav <= 0:
+        return None  # 净值非正 (不应发生) 时不拦, 交给资金预检报错
+
+    positions = load_positions(data_dir, account_id)
+    mv_after = sum(
+        float(p.get("qty", 0)) * float(p.get("avg_cost", 0.0))
+        for p in positions.values()
+        if p.get("qty", 0) > 0
+    )
+
+    # 总仓位上限: 买入后 (市值 + 本次买入) 不超过净值 × 上限
+    if exposure_cap is not None:
+        limit_value = nav * float(exposure_cap)
+        if mv_after + add_value > limit_value + 1e-6:
+            used_pct = mv_after / nav if nav else 0.0
+            return (
+                f"超出总仓位上限 {float(exposure_cap) * 100:.1f}% "
+                f"(当前仓位 {used_pct * 100:.1f}%, "
+                f"买入后 {(mv_after + add_value) / nav * 100:.1f}%)"
+            )
+
+    # 单票权重上限: 该票买入后市值不超过净值 × 上限
+    if weight_cap is not None:
+        pos = positions.get(symbol)
+        cur_mv = (
+            float(pos.get("qty", 0)) * float(pos.get("avg_cost", 0.0))
+            if pos else 0.0
+        )
+        limit_value = nav * float(weight_cap)
+        if cur_mv + add_value > limit_value + 1e-6:
+            return (
+                f"超出单票权重上限 {float(weight_cap) * 100:.1f}% "
+                f"(买入后占净值 {(cur_mv + add_value) / nav * 100:.1f}%)"
+            )
+    return None
 
 
 def load_positions(data_dir: Path, account_id: str = DEFAULT_ACCOUNT_ID) -> dict[str, dict]:

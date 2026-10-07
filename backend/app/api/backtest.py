@@ -340,6 +340,14 @@ class StrategyBacktestRequest(BaseModel):
     max_exposure_pct: float = 1.0
     initial_capital: float = 1_000_000.0
     position_sizing: Literal["equal", "score_weight"] = "equal"
+    # ---------- 组合约束（默认 None = 不启用）----------
+    # max_position_weight: 单票权重上限, 显式给出可解除 score_weight 被
+    #   1/max_positions 二次压制的既存缺陷。
+    # max_industry_weight / max_correlation: 行业暴露与相关性上限,
+    #   需注入分类/相关性数据才生效, 默认自动不启用。
+    max_position_weight: float | None = None
+    max_industry_weight: float | None = None
+    max_correlation: float | None = None
     mode: Literal["position", "full"] = "position"
     holding_days: int = 5
     asset_type: str = "stock"
@@ -403,6 +411,9 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         max_exposure_pct=req.max_exposure_pct,
         initial_capital=req.initial_capital,
         position_sizing=req.position_sizing,
+        max_position_weight=req.max_position_weight,
+        max_industry_weight=req.max_industry_weight,
+        max_correlation=req.max_correlation,
         mode=req.mode,
         holding_days=req.holding_days,
         asset_type=req.asset_type,
@@ -482,8 +493,13 @@ def _make_job_key(
     asset_type: str = "stock",
     minute_fill: bool = False,
     regime_filter: str | None = None,
+    max_position_weight: float | None = None,
+    max_industry_weight: float | None = None,
+    max_correlation: float | None = None,
 ) -> str:
-    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{regime_filter}"
+    # 组合约束字段必须进键: 约束不同 -> 权重分配不同 -> 回测结果不同。
+    # 漏掉会导致「改了约束但命中旧缓存」, 表现为改了没反应且难排查。
+    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{regime_filter}|{max_position_weight}|{max_industry_weight}|{max_correlation}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -512,6 +528,9 @@ async def strategy_stream(
     asset_type: str = "stock",
     minute_fill: bool = False,
     regime_filter: str | None = None,
+    max_position_weight: float | None = None,
+    max_industry_weight: float | None = None,
+    max_correlation: float | None = None,
 ):
     """SSE 流式策略回测: 实时推送进度, 完成后推送结果, 支持重连 (刷新/切页后恢复)。
 
@@ -555,6 +574,9 @@ async def strategy_stream(
         asset_type=asset_type,
         minute_fill=minute_fill,
         regime_filter=regime_filter,
+        max_position_weight=max_position_weight,
+        max_industry_weight=max_industry_weight,
+        max_correlation=max_correlation,
     )
 
     _cleanup_stale_jobs()
@@ -611,6 +633,9 @@ async def strategy_stream(
                 max_exposure_pct=float(max_exposure_pct),
                 initial_capital=float(initial_capital),
                 position_sizing=position_sizing,
+                max_position_weight=max_position_weight,
+                max_industry_weight=max_industry_weight,
+                max_correlation=max_correlation,
                 mode=mode,
                 holding_days=int(holding_days),
                 asset_type=asset_type,
@@ -755,6 +780,11 @@ _OPT_BT_FIELDS = [
     "max_positions", "max_exposure_pct", "initial_capital", "position_sizing",
     "mode", "holding_days",
 ]
+# 组合约束字段: 未启用时不出现在 bt_kwargs 中, 故签名用 .get() 取。
+# 必须在签名内 —— 约束不同则权重规则不同, 漏掉会命中旧缓存 (改了没反应)。
+_OPT_BT_CONSTRAINT_FIELDS = [
+    "max_position_weight", "max_industry_weight", "max_correlation",
+]
 
 
 def _make_opt_job_key(
@@ -780,8 +810,11 @@ def _make_opt_job_key(
 def _opt_backtest_kwargs(
     matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
     max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+    max_position_weight=None, max_industry_weight=None, max_correlation=None,
 ) -> dict:
-    return {
+    # 组合约束必须一并透传: 否则优化/走查会用另一套权重规则跑,
+    # 优化出的参数在真实组合约束下不成立 (结果看似正常实则不可用)。
+    kwargs = {
         "matching": matching,
         "fees_pct": fees_pct,
         "commission_pct": commission_pct,
@@ -794,6 +827,14 @@ def _opt_backtest_kwargs(
         "mode": mode,
         "holding_days": int(holding_days),
     }
+    # 仅在显式给出时才写入, 保持未启用时与其他路径逐位一致。
+    if max_position_weight is not None:
+        kwargs["max_position_weight"] = float(max_position_weight)
+    if max_industry_weight is not None:
+        kwargs["max_industry_weight"] = float(max_industry_weight)
+    if max_correlation is not None:
+        kwargs["max_correlation"] = float(max_correlation)
+    return kwargs
 
 
 @router.get("/optimize/stream")
@@ -821,6 +862,9 @@ async def optimize_stream(
     position_sizing: str = "equal",
     mode: str = "position",
     holding_days: int = 5,
+    max_position_weight: float | None = None,
+    max_industry_weight: float | None = None,
+    max_correlation: float | None = None,
 ):
     """SSE 流式参数优化: 并行跑各参数组回测, 按 objective 排序。
 
@@ -850,8 +894,12 @@ async def optimize_stream(
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+        max_position_weight, max_industry_weight, max_correlation,
     )
-    bt_sig = "|".join(f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS)
+    bt_sig = "|".join(
+        [f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS]
+        + [f"{k}={bt_kwargs.get(k)}" for k in _OPT_BT_CONSTRAINT_FIELDS]
+    )
     job_key = _make_opt_job_key(
         strategy_id,
         symbols,
@@ -1046,6 +1094,9 @@ async def walkforward_stream(
     position_sizing: str = "equal",
     mode: str = "position",
     holding_days: int = 5,
+    max_position_weight: float | None = None,
+    max_industry_weight: float | None = None,
+    max_correlation: float | None = None,
 ):
     """SSE 流式 walk-forward: 每折训练区间网格优化 -> 测试区间 OOS 回测。
 
@@ -1068,8 +1119,12 @@ async def walkforward_stream(
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+        max_position_weight, max_industry_weight, max_correlation,
     )
-    bt_sig = "|".join(f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS)
+    bt_sig = "|".join(
+        [f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS]
+        + [f"{k}={bt_kwargs.get(k)}" for k in _OPT_BT_CONSTRAINT_FIELDS]
+    )
     windows = f"{train_days}/{test_days}/{step_days}"
     job_key = _make_wf_job_key(
         strategy_id,
