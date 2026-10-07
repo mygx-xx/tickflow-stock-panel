@@ -5,6 +5,7 @@ import gzip
 import json
 import logging
 import math
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1581,7 +1582,11 @@ async def repair_daily(request: Request):
 
 @router.post("/rebuild_enriched")
 async def rebuild_enriched(request: Request):
-    """全量重算 enriched 表 — 不获取任何数据,仅基于已有 kline_daily + adj_factor 重算复权+指标。
+    """重算 enriched 表 — 不获取任何数据,仅基于已有 kline_daily + adj_factor 复算。
+
+    默认按实际差异自动选最省的方式(全量 / 末尾增量 / 局部重算 / 什么都不做),
+    理由见 app/services/enriched_rebuild_plan.py。传 ?mode=full 可强制全量重写。
+    mode=plan 只返回将要采用的计划,不执行 —— 用来在不冒险的前提下先看差异。
 
     返回 job_id,可轮询 /api/pipeline/jobs 查看进度。
     """
@@ -1591,6 +1596,25 @@ async def rebuild_enriched(request: Request):
 
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
         from app.api.data import invalidate_storage_cache
+        from app.indicators.pipeline import run_pipeline
+        from app.services import enriched_rebuild_plan as planner
+        from app.enriched_generation import enriched_publication_incomplete
+
+        data_dir = repo.store.data_dir
+        params = request.query_params
+        want_mode = params.get("mode", "auto")
+
+        plan = planner.plan_rebuild(
+            data_dir,
+            publication_incomplete=enriched_publication_incomplete(data_dir, "stock"),
+            force_full=want_mode == "full",
+        )
+        # 前端要能解释"为什么这次这么快/这么慢", 故把依据一起返回
+        logger.info("rebuild_enriched plan: mode=%s reason=%s savings=%s",
+                    plan["mode"], plan["reason"], plan["savings"])
+
+        if want_mode == "plan":
+            return {"status": "planned", "plan": plan}
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1608,8 +1632,22 @@ async def rebuild_enriched(request: Request):
                                    stage_pct=stage_pct, skip_log=skip_log)
 
             try:
-                progress("rebuild_enriched", 10, "全量计算 enriched…")
-                from app.indicators.pipeline import run_pipeline
+                if plan["mode"] == "noop":
+                    # 已经对齐还去跑全量, 在 1454 天/720 万行的库上是纯浪费的 49 秒
+                    enriched_days = plan["enriched_days"]
+                    progress("rebuild_enriched", 100, "无需重算: " + plan["reason"])
+                    job_store.succeed(job_id, {
+                        "enriched_days": enriched_days,
+                        "enriched_rows": 0,
+                        "mode": "noop",
+                        "reason": plan["reason"],
+                    })
+                    return
+
+                mode_label = {"full": "全量", "forward": "增量", "local": "局部"}[plan["mode"]]
+                progress("rebuild_enriched", 10, f"{mode_label}计算 enriched… ({plan['reason']})")
+
+                kwargs = dict(plan["run_kwargs"])
 
                 def _batch_progress(cur: int, tot: int) -> None:
                     pct = 10 + int(85 * cur / tot)
@@ -1617,16 +1655,18 @@ async def rebuild_enriched(request: Request):
                              f"计算指标 批次 {cur}/{tot}",
                              stage_pct=int(100 * cur / tot), skip_log=True)
 
+                t0 = time.perf_counter()
                 written = await loop.run_in_executor(
                     _long_task_executor, run_with_capacity, job_id,
-                    lambda: run_pipeline(on_batch_done=_batch_progress),
+                    lambda: run_pipeline(on_batch_done=_batch_progress, **kwargs),
                 )
+                elapsed = time.perf_counter() - t0
 
-                enriched_dir = repo.store.data_dir / "kline_daily_enriched"
+                enriched_dir = data_dir / "kline_daily_enriched"
                 enriched_days = len(list(enriched_dir.glob("date=*"))) if enriched_dir.exists() else 0
 
                 # 刷新视图
-                d = repo.store.data_dir.as_posix()
+                d = data_dir.as_posix()
                 for view_name, glob in [
                     ("kline_enriched", f"{d}/kline_daily_enriched/**/*.parquet"),
                 ]:
@@ -1642,6 +1682,10 @@ async def rebuild_enriched(request: Request):
                 job_store.succeed(job_id, {
                     "enriched_days": enriched_days,
                     "enriched_rows": written,
+                    "mode": plan["mode"],
+                    "reason": plan["reason"],
+                    "savings": plan["savings"],
+                    "elapsed_sec": round(elapsed, 2),
                 })
                 invalidate_storage_cache()
             except JobCancelledError:
