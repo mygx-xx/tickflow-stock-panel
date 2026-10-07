@@ -39,6 +39,9 @@ class AccountModel(BaseModel):
     stamp_tax_pct: float = paper.DEFAULT_STAMP_TAX_PCT
     slippage_bps: float = paper.DEFAULT_SLIPPAGE_BPS
     queue_limit_orders: bool = False
+    # 仓位约束 (0,1]; None = 不限制, 与回测 MatcherConfig 同口径。
+    max_exposure_pct: float | None = None
+    max_position_weight: float | None = None
 
 
 class OrderModel(BaseModel):
@@ -55,6 +58,9 @@ class SettingsModel(BaseModel):
     commission_pct: float | None = None   # 佣金率 (0.00025 = 万2.5)
     stamp_tax_pct: float | None = None    # 印花税 (0.001 = 千1, 仅卖出)
     slippage_bps: float | None = None     # 滑点 (5 = 5bps)
+    # 仓位约束 (0,1] 比例; null = 不限制。与回测 MatcherConfig 同口径。
+    max_exposure_pct: float | None = None
+    max_position_weight: float | None = None
 
 
 def _resolve_asset_type(request: Request, symbol: str) -> str:
@@ -113,6 +119,8 @@ def create_account(request: Request, body: AccountModel):
             stamp_tax_pct=body.stamp_tax_pct,
             slippage_bps=body.slippage_bps,
             queue_limit_orders=body.queue_limit_orders,
+            max_exposure_pct=body.max_exposure_pct,
+            max_position_weight=body.max_position_weight,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

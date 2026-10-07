@@ -1047,6 +1047,10 @@ export interface PaperAccount {
   stamp_tax_pct: number
   slippage_bps: number
   queue_limit_orders?: boolean
+  // 仓位约束 (null/ 不存在 = 不限制, 与回测 MatcherConfig 同口径)
+  max_exposure_pct?: number | null
+  max_position_weight?: number | null
+  position_usage_pct?: number
   status: 'active' | 'frozen'
   created_at: string
 }
@@ -1108,6 +1112,10 @@ export interface PaperOverview {
   account_name?: string
   status?: 'active' | 'frozen'
   queue_limit_orders?: boolean
+  // 仓位约束 (null/ 不存在 = 不限制, 与回测 MatcherConfig 同口径)
+  max_exposure_pct?: number | null
+  max_position_weight?: number | null
+  position_usage_pct?: number
   cash?: number
   market_value?: number
   total?: number
@@ -3800,13 +3808,13 @@ export const api = {
   paperOverview: (account?: string) =>
     request<PaperOverview>(accUrl('/api/paper/overview', account)),
 
-  paperCreateAccount: (body: { initial_cash: number; account_id?: string; name?: string; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number; queue_limit_orders?: boolean }) =>
+  paperCreateAccount: (body: { initial_cash: number; account_id?: string; name?: string; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number; queue_limit_orders?: boolean; max_exposure_pct?: number | null; max_position_weight?: number | null }) =>
     request<{ account: PaperAccount }>('/api/paper/account', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
 
-  paperSettings: (body: { queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number }, account?: string) =>
+  paperSettings: (body: { queue_limit_orders?: boolean; commission_pct?: number; stamp_tax_pct?: number; slippage_bps?: number; max_exposure_pct?: number | null; max_position_weight?: number | null }, account?: string) =>
     request<{ account: PaperAccount }>(accUrl('/api/paper/settings', account), {
       method: 'POST',
       body: JSON.stringify(body),

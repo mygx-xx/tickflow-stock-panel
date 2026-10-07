@@ -594,10 +594,12 @@ function CandidateCompareCard({ paper }: { paper: PaperCompareStats }) {
 // 费用与撮合设置 (当前账户弹窗): 佣金/印花税/滑点 + 涨跌停排队。
 // 只影响之后的新成交, 不重算历史台账 (口径与回测费用模型一致)。
 // ================================================================
-function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
+function FeeSettingsModal({ accId, fees, queue, limits, onSaved, onClose }: {
   accId: string
   fees: { commission_pct: number; stamp_tax_pct: number; slippage_bps: number }
   queue: boolean
+  // 仓位约束 (null = 不限制)。与回测 MatcherConfig 同口径。
+  limits: { max_exposure_pct?: number | null; max_position_weight?: number | null }
   onSaved: () => void
   onClose: () => void
 }) {
@@ -605,6 +607,13 @@ function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
   const [stampQian, setStampQian] = useState((fees.stamp_tax_pct * 1000).toFixed(2))
   const [slippageBps, setSlippageBps] = useState(String(fees.slippage_bps))
   const [queueOn, setQueueOn] = useState(queue)
+  // 仓位约束: 空字符串 = 不限制(传 null, 后端不启用该约束)
+  const [exposurePct, setExposurePct] = useState(
+    limits.max_exposure_pct != null ? String(Math.round(limits.max_exposure_pct * 100)) : '',
+  )
+  const [posWeightPct, setPosWeightPct] = useState(
+    limits.max_position_weight != null ? String(Math.round(limits.max_position_weight * 100)) : '',
+  )
   const [err, setErr] = useState<string | null>(null)
   const qc = useQueryClient()
   const m = useMutation({
@@ -613,6 +622,8 @@ function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
       stamp_tax_pct: Number(stampQian) / 1000,         // 千 X → pct
       slippage_bps: Number(slippageBps),
       queue_limit_orders: queueOn,
+      max_exposure_pct: exposurePct === '' ? null : Number(exposurePct) / 100,
+      max_position_weight: posWeightPct === '' ? null : Number(posWeightPct) / 100,
     }, accId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: QK.paperAll })
@@ -624,6 +635,9 @@ function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
   const valid = Number(commissionWan) >= 0 && Number(commissionWan) <= 100
     && Number(stampQian) >= 0 && Number(stampQian) <= 50
     && Number(slippageBps) >= 0 && Number(slippageBps) <= 200
+    // 后端区间是 (0, 1], 故 0 非法(设 0 通常是"以为能全空仓"的误解)
+    && (exposurePct === '' || (Number(exposurePct) > 0 && Number(exposurePct) <= 100))
+    && (posWeightPct === '' || (Number(posWeightPct) > 0 && Number(posWeightPct) <= 100))
   const inputCls = 'mt-1 w-full rounded-btn border border-border bg-base px-2 py-1.5 font-mono text-sm outline-none focus:border-accent/50'
   return (
     <Modal onClose={onClose} labelledBy="fee-settings-title">
@@ -651,6 +665,27 @@ function FeeSettingsModal({ accId, fees, queue, onSaved, onClose }: {
             <label className="block text-[11px] text-muted">滑点 (bps)</label>
             <input type="number" step="1" min="0" max="200" value={slippageBps} onChange={e => setSlippageBps(e.target.value)} className={inputCls} />
           </div>
+        </div>
+        <div className="mt-4">
+          <div className="flex items-baseline justify-between">
+            <span className="text-[11px] text-muted">仓位约束</span>
+            <span className="text-[10px] text-muted">留空 = 不限制</span>
+          </div>
+          <div className="mt-1.5 grid grid-cols-2 gap-2">
+            <div>
+              <label className="block text-[11px] text-muted">总仓位上限 (%)</label>
+              <input type="number" min="0" max="100" value={exposurePct} placeholder="不限"
+                onChange={e => setExposurePct(e.target.value)} className={inputCls} />
+            </div>
+            <div>
+              <label className="block text-[11px] text-muted">单票上限 (%)</label>
+              <input type="number" min="0" max="100" value={posWeightPct} placeholder="不限"
+                onChange={e => setPosWeightPct(e.target.value)} className={inputCls} />
+            </div>
+          </div>
+          <p className="mt-1.5 text-[10px] leading-relaxed text-muted">
+            仅拦截新买入, 调小上限不会强平已有持仓; 卖出不受约束。与回测口径一致。
+          </p>
         </div>
         <label className="mt-4 flex cursor-pointer items-center justify-between rounded-btn border border-border bg-base px-3 py-2">
           <span className="text-xs text-secondary">
@@ -1436,6 +1471,10 @@ export function Paper() {
           accId={accId}
           fees={ov.fees}
           queue={!!ov.queue_limit_orders}
+          limits={{
+            max_exposure_pct: ov.max_exposure_pct ?? null,
+            max_position_weight: ov.max_position_weight ?? null,
+          }}
           onSaved={() => setFeeOpen(false)}
           onClose={() => setFeeOpen(false)}
         />
