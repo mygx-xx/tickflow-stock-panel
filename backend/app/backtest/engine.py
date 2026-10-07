@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Literal
@@ -25,6 +25,11 @@ from app.backtest.matrix import (
     build_market_matrix,
     load_market_data_matrix_from_parquet,
 )
+from app.backtest.portfolio_constraints import (
+    Candidate,
+    PortfolioConstraintSpec,
+    build_target_weights,
+)
 from app.config import settings
 from app.enriched_generation import EnrichedGenerationUnavailableError
 from app.parquet import scan_enriched_parquet
@@ -38,6 +43,99 @@ def _matrix_entry_score(matrix: MarketMatrix, time_id: int, asset_id: int) -> fl
     if source_time < 0:
         return 0.0
     return float(matrix.score[source_time, asset_id])
+
+
+# ================================================================
+# 组合约束接缝
+#
+# engine 只在两处仓位分配调用 `app.backtest.portfolio_constraints`:
+# 矩阵路径 `_simulate_portfolio_matrix` 与标量路径
+# `simulate_independent_candidates`。以下是唯一的 glue, 便于单测直接替换。
+# ================================================================
+
+def _portfolio_constraints(
+    config: MatcherConfig,
+    equity: float,
+    category_of: Callable[[str], str | None] | None = None,
+    correlation_of: Callable[[str], Mapping[str, float] | None] | None = None,
+):
+    """按配置构造约束 spec；**全部未启用时返回 None**。
+
+    返回 None 是关键设计: 调用方据此走原有仓位分配代码路径,
+    保证未开启约束的回测与改动前**逐位一致**。
+
+    category_of / correlation_of 由上层注入 (行业分类与相关性数据来自
+    运行时 provider, 回测默认不注入 —— 此时行业/相关性约束自动不生效)。
+    """
+    if (
+        config.max_position_weight is None
+        and config.max_industry_weight is None
+        and config.max_correlation is None
+    ):
+        return None
+    return PortfolioConstraintSpec(
+        position_sizing=config.position_sizing,
+        max_weight=config.max_position_weight,
+        industry_max=config.max_industry_weight,
+        max_corr=config.max_correlation,
+        category_of=category_of,
+        correlation_of=correlation_of,
+        total_budget=equity,
+    )
+
+
+def _matrix_symbol_reader(matrix: MarketMatrix) -> Callable[[int], str] | None:
+    """从矩阵取 asset_id -> symbol 的映射函数; 无symbols 时返回 None。"""
+    symbols = getattr(matrix, "symbols", None)
+    if not symbols:
+        return None
+
+    def resolve(asset_id: int) -> str:
+        if 0 <= asset_id < len(symbols):
+            return str(symbols[asset_id])
+        return str(asset_id)
+
+    return resolve
+
+
+def _resolve_buy_weights(
+    selected: Sequence[tuple],
+    constraints,
+    count: int,
+    *,
+    symbol_of: Callable[[int], str] | None = None,
+) -> np.ndarray:
+    """产出买入权重序列。
+
+    constraints 为 None → 复刻原逻辑（等权或 score 归一, 之后仍被
+    调用方的 1/max_positions target_value 二次压制）。
+    constraints 非 None → 走组合层投影, 解除该压制。
+
+    selected 元素为 (asset_id, score) 或 (asset_id, symbol, score)。
+    三元组时直接用其中的 symbol 查分类/相关性; 二元组时才需要
+    symbol_of 把 asset_id 映射回业务 symbol。
+    两者都缺失时分类与相关性映射无从匹配, 相关约束自动退化为不生效。
+    """
+    if constraints is None:
+        return np.repeat(1 / count, count)
+
+    cands: list[Candidate] = []
+    for item in selected:
+        if len(item) >= 3:
+            asset_id, symbol, score = int(item[0]), str(item[1]), float(item[2])
+        else:
+            asset_id, score = int(item[0]), float(item[1])
+            symbol = (
+                str(symbol_of(asset_id))
+                if symbol_of is not None
+                else str(asset_id)
+            )
+        cands.append(Candidate(asset_id=asset_id, symbol=symbol, score=score))
+
+    result = build_target_weights(cands, constraints)
+    return np.array(
+        [result.weights.get(c.asset_id, 0.0) for c in cands], dtype=float
+    )
 
 
 # ================================================================
@@ -69,6 +167,20 @@ class MatcherConfig:
     score_max: float | None = None
     initial_capital: float = 1_000_000.0
     position_sizing: Literal["equal", "score_weight"] = "equal"
+    # ---------- 组合约束（组合层, 与上面的单票级风控正交）----------
+    # 全部默认 None = 不启用, 此时仓位分配与引入本组字段前**逐位一致**
+    # (存量回测结果不因新增字段而变化)。
+    #
+    # max_position_weight: 单票权重上限。现状用1/max_positions 作为隐式单票
+    #   上限, 在 score_weight 档位下会二次压制评分权重并使资金闲置
+    #   (实测10候选/max_positions=10 场景: 最高分权重 0.1818->0.1000,
+    #    5 只被截断, 总仓位仅约 73%)。显式给出该值即解除该压制。
+    # max_industry_weight: 单一行业暴露上限。需配合 paper/回测侧注入分类映射,
+    #   未提供分类时该约束不生效 (不因数据缺失让回测失败)。
+    # max_correlation: 两两相关性上限, 超过则剔除评分较低者。
+    max_position_weight: float | None = None
+    max_industry_weight: float | None = None
+    max_correlation: float | None = None
     # 分钟K精确成交: 开启后, 信号触发日的成交价用当日分钟K优化
     # (有参考线→穿越价, 无参考线→VWAP)。数据缺失时降级为日K口径。
     minute_fill: bool = False
@@ -2095,12 +2207,30 @@ class BacktestEngine:
                     if equity_before <= 0 or exposure_capacity <= 0 or max_exposure_pct <= 0:
                         execution_stats["buy_exposure"] += len(selected)
                     else:
-                        weights = np.repeat(1 / len(selected), len(selected))
-                        if config.position_sizing == "score_weight":
-                            raw_weights = np.array([max(item[1], 0.0) for item in selected])
-                            if raw_weights.sum() > 0:
-                                weights = raw_weights / raw_weights.sum()
-                        total_budget = min(cash, exposure_capacity, target_value * len(selected))
+                        # 组合约束未启用时保持原逻辑逐位不变 (max_position_weight 等
+                        # 全为 None 时 constraints is None, 走下方legacy 分支)。
+                        constraints = _portfolio_constraints(config, equity_before)
+                        weights = _resolve_buy_weights(
+                            selected, constraints, len(selected),
+                            symbol_of=_matrix_symbol_reader(matrix),
+                        )
+                        if constraints is None:
+                            total_budget = min(
+                                cash, exposure_capacity, target_value * len(selected)
+                            )
+                            cap_value = target_value
+                        else:
+                            # 约束档位: 预算按权重总额折算, 单票上限改由组合层给出,
+                            # 不再用 1/max_positions 二次压制评分权重。
+                            total_budget = min(
+                                cash, exposure_capacity,
+                                equity_before * min(constraints.total_weight, 1.0),
+                            )
+                            cap_value = (
+                                equity_before * constraints.max_weight
+                                if constraints.max_weight is not None
+                                else equity_before
+                            )
                         for (asset_id, entry_score), weight in zip(selected, weights):
                             if len(positions) >= max_positions:
                                 _count("buy_no_slot")
@@ -2108,7 +2238,7 @@ class BacktestEngine:
                             market_value = _market_value()
                             equity = cash + market_value
                             capacity = equity * max_exposure_pct - market_value
-                            allocation = min(total_budget * float(weight), target_value, cash, capacity)
+                            allocation = min(total_budget * float(weight), cap_value, cash, capacity)
                             if allocation <= 0:
                                 _count("buy_exposure")
                                 continue
@@ -2644,12 +2774,22 @@ class BacktestEngine:
                 execution_stats["buy_exposure"] += len(selected)
                 return
 
-            weights = np.repeat(1 / len(selected), len(selected))
-            if config.position_sizing == "score_weight":
-                raw = np.array([max(x[2], 0.0) for x in selected], dtype=float)
-                if raw.sum() > 0:
-                    weights = raw / raw.sum()
-            total_budget = min(cash, exposure_capacity, target_position_value * len(selected))
+            # 组合约束未启用时 (constraints is None) 完全走原逻辑, 逐位不变。
+            constraints = _portfolio_constraints(config, account_equity_before_buy)
+            weights = _resolve_buy_weights(selected, constraints, len(selected))
+            if constraints is None:
+                total_budget = min(cash, exposure_capacity, target_position_value * len(selected))
+                cap_value = target_position_value
+            else:
+                total_budget = min(
+                    cash, exposure_capacity,
+                    account_equity_before_buy * min(constraints.total_weight, 1.0),
+                )
+                cap_value = (
+                    account_equity_before_buy * constraints.max_weight
+                    if constraints.max_weight is not None
+                    else account_equity_before_buy
+                )
 
             for (idx, sym, _score), weight in zip(selected, weights):
                 if len(positions) >= max_positions:
@@ -2658,7 +2798,7 @@ class BacktestEngine:
                 current_market_value = _market_value()
                 current_equity = cash + current_market_value
                 current_exposure_capacity = current_equity * max_exposure_pct - current_market_value
-                allocation = min(total_budget * float(weight), target_position_value, cash, current_exposure_capacity)
+                allocation = min(total_budget * float(weight), cap_value, cash, current_exposure_capacity)
                 if allocation <= 0:
                     _count("buy_exposure")
                     continue
