@@ -79,6 +79,20 @@ EXPECTED_OPEN_ENDPOINTS: set[str] = {
     "GET /api/strategies",
     "GET /api/strategies/ai/status",
     "GET /api/strategies/{strategy_id}",
+    # 策略生命周期只读视图 (方向二)。它进入开放面是api_gateway 前缀匹配的
+    # **结果**而非显式声明: 规则表里只有 ("GET", "/api/strategies", "read:analysis"),
+    # L91 的 startswith(prefix + "/") 顺带覆盖了本路径。
+    #
+    # 已核实这是安全的, 且语义恰当:
+    #   1) 只有 GET 命中。规则表对该前缀只声明了 GET 方法, 因此同域的
+    #      POST /{id}/lifecycle/check 与 POST /lifecycle/sweep 返回 None,
+    #      **不开放** —— 实测 required_scope 确为 None。跑一次绩效判定或
+    #      批量巡检会消耗算力, 属写操作, 不该给只读 Token。
+    #   2) 端点语义就是「读取策略的绩效状态」, 与同域的 /{id}/source、
+    #      /{id} 同为策略元信息读取, 二开方拿到 lifecycle 合理。
+    # 若将来要收紧, 须在 api_gateway 加显式排除规则(参照 read:ext 域内
+    # /api-key 的处理), 而不是改这份快照。
+    "GET /api/strategies/{strategy_id}/lifecycle",
     "GET /api/strategies/{strategy_id}/source",
 }
 
