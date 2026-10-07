@@ -17,6 +17,11 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',   // dev.sh / dev.ps1 会用 CLI --host 覆盖
     port: 3011,
+    // dev 源模块一律不落浏览器/中间代理缓存: 改完刷新必为最新代码,
+    // 避免出现「代码已改但页面仍是旧样式、硬刷新也无效」的假象。
+    headers: {
+      'Cache-Control': 'no-store, no-cache, must-revalidate',
+    },
     proxy: {
       // dev 时 /api 转发到与启动脚本相同的 FastAPI 地址
       '/api': {

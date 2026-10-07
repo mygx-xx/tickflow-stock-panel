@@ -216,10 +216,10 @@ export function ScreenerTable({
       const sourceField = `${configId}.${fieldName}`
       const dimensionKind = dimensionKindForSourceField(sourceField)
       const tdClass = val == null || Number.isNaN(val)
-        ? 'px-3 py-2 text-center text-muted'
+        ? 'px-2.5 py-1.5 text-center text-muted'
         : typeof val === 'number'
-          ? 'px-3 py-2 text-right num tabular-nums'
-          : 'px-3 py-2 text-center'
+          ? 'px-2.5 py-1.5 text-right num tabular-nums'
+          : 'px-2.5 py-1.5 text-center'
       const style: CSSProperties = {}
       if (col.extDisplay?.maxWidth) style.maxWidth = col.extDisplay.maxWidth
       return (
@@ -244,7 +244,7 @@ export function ScreenerTable({
         const board = boardTag(r.symbol)
         const inWatchlist = watchlistSet.has(r.symbol)
         return (
-          <td key={col.id} className="px-4 py-2">
+          <td key={col.id} className="px-2.5 py-1.5">
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -308,13 +308,13 @@ export function ScreenerTable({
         const cfgMaxTags = col.extDisplay?.maxTags ?? 0
         const maxTags = strategyTagsExpanded ? 0 : (cfgMaxTags > 0 ? cfgMaxTags : 3)
         return (
-          <td key={col.id} className="px-3 py-2">
+          <td key={col.id} className="px-2.5 py-1.5">
             {renderTagList(tags, col, expanded, () => toggleExpand(cellKey), STRATEGY_TAG_CLS, undefined, maxTags)}
           </td>
         )
       }
       case 'score': {
-        const numCls = 'px-3 py-2 text-right num tabular-nums'
+        const numCls = 'px-2.5 py-1.5 text-right num tabular-nums'
         return (
           <td key={col.id} className={numCls}>
             {r.score != null ? (
@@ -330,7 +330,7 @@ export function ScreenerTable({
       case 'signals': {
         const signals = getSignals(r)
         return (
-          <td key={col.id} className="px-3 py-2">
+          <td key={col.id} className="px-2.5 py-1.5">
             {signals.length > 0 ? (
               <div className="flex flex-wrap gap-0.5">
                 {signals.slice(0, 3).map((s) => (
@@ -395,6 +395,7 @@ export function ScreenerTable({
         renderCell={renderCell}
         sort={sort}
         onSortToggle={onSortToggle}
+        dense
         minWidth={Math.max(900, columns.filter(c => c.visible).length * 110)}
         rowKey={(r: any) => `${r.symbol}${r._expired ? '-expired' : ''}`}
         rowClassName={(r: any) => cn(

@@ -40,13 +40,16 @@ export interface StockDataTableProps {
   renderHeaderContent?: (col: ColumnConfig) => ReactNode | undefined
   /** 外层容器 className */
   className?: string
+  /** 紧凑模式: 表头与字号更小, 单屏可见更多行 (如策略页结果表) */
+  dense?: boolean
 }
 
-function alignThClass(align: ColumnConfig['align']): string {
+function alignThClass(align: ColumnConfig['align'], dense = false): string {
   // 表头一律不换行: 窄列(如收起的图表列)中标签/排序箭头折行会把整行表头顶高
-  if (align === 'right') return 'px-3 py-2.5 font-medium text-right whitespace-nowrap'
-  if (align === 'center') return 'px-3 py-2.5 font-medium text-center whitespace-nowrap'
-  return 'px-3 py-2.5 font-medium whitespace-nowrap'
+  const pad = dense ? 'px-2.5 py-1.5' : 'px-3 py-2.5'
+  if (align === 'right') return `${pad} font-medium text-right whitespace-nowrap`
+  if (align === 'center') return `${pad} font-medium text-center whitespace-nowrap`
+  return `${pad} font-medium whitespace-nowrap`
 }
 
 export function StockDataTable({
@@ -62,6 +65,7 @@ export function StockDataTable({
   extraHeader,
   renderHeaderContent,
   className = 'rounded-card border border-border overflow-x-auto',
+  dense = false,
 }: StockDataTableProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const visibleColumns = columns.filter(c => c.visible)
@@ -117,7 +121,7 @@ export function StockDataTable({
 
   return (
     <div ref={containerRef} className={className}>
-      <table className="w-full text-sm" style={{ minWidth: computedMinWidth }}>
+      <table className={dense ? 'w-full text-[13px]' : 'w-full text-sm'} style={{ minWidth: computedMinWidth }}>
         <thead className={theadClass}>
           <tr className="text-left text-secondary">
             {visibleColumns.map(col => {
@@ -128,7 +132,7 @@ export function StockDataTable({
               return (
                 <th
                   key={col.id}
-                  className={`${alignThClass(col.align)} ${sortable ? 'cursor-pointer select-none group' : ''}`}
+                  className={`${alignThClass(col.align, dense)} ${sortable ? 'cursor-pointer select-none group' : ''}`}
                   onClick={sortable ? () => onSortToggle!(col.id) : undefined}
                 >
                   {contentOverride !== undefined ? contentOverride : col.label}

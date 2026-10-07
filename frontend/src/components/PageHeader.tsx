@@ -13,14 +13,17 @@ export function PageHeader({ title, subtitle, titleExtra, right, className }: Pr
   return (
     <header
       className={cn(
-        'px-5 pt-3 pb-2 border-b border-border flex items-center justify-between gap-4',
+        // 标题行与控件行默认各占一行 (控件组近 1100px, 与标题挤一行必然换行错乱);
+        // 仅超宽屏 (≥1800px) 才合并为单行两端对齐。
+        // 标题行左侧留出悬浮汉堡按钮的空间; sm 起恢复 px-5。
+        'flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border pb-2 pt-3 pl-12 pr-4 sm:px-5',
         className,
       )}
     >
-      <div className="flex items-center gap-2">
-        <h1 className="text-lg font-semibold tracking-tight">{title}</h1>
+      <div className="flex w-full min-w-0 items-center gap-2 min-[1800px]:w-auto">
+        <h1 className="shrink-0 text-lg font-semibold tracking-tight">{title}</h1>
         {titleExtra}
-        {subtitle && <span className="text-xs text-muted">{subtitle}</span>}
+        {subtitle && <span className="hidden min-w-0 truncate text-xs text-muted sm:inline">{subtitle}</span>}
       </div>
       {right}
     </header>
