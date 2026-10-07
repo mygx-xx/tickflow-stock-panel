@@ -44,6 +44,12 @@ export const QK = {
   screener:             ['screener'] as const,
   screenerStrategies:   (assetType: string = 'stock', timeframe: '1d' | '1m' | 'all' = '1d') => ['screener-strategies', assetType, timeframe] as const,
   screenerCachedSummary: ['screener-cached', 'summary'] as const,
+  screenerHitsDaily:    (asOf: string) => ['screener-hits-daily', asOf] as const,
+  diagnostics:          ['diagnostics'] as const,
+
+  strategyVerdicts:     ['strategy-verdicts'] as const,
+
+  enrichedRebuildPlan:  ['enriched-rebuild-plan'] as const,
   screenerCachedResult: (strategyId: string, asOf?: string, ext?: string) => ['screener-cached', 'strategy', strategyId, asOf ?? '', ext ?? ''] as const,
   screenerCached:       (asOf?: string, ext?: string) => ['screener-cached', 'all', asOf ?? '', ext ?? ''] as const,
   screenerKlineBatch:   (symbols: string) => ['screener-kline-batch', symbols] as const,
@@ -115,6 +121,7 @@ export const QK = {
   paperTrades:          (acc: string) => ['paper', 'trades', acc] as const,
   paperNav:             (acc: string) => ['paper', 'nav', acc] as const,
   paperStats:           (acc: string) => ['paper', 'stats', acc] as const,
+  paperAttribution:     (acc: string) => ['paper', 'attribution', acc] as const,
   paperCompare:         ['paper', 'compare'] as const,
   paperAutoRules:       (acc: string) => ['paper', 'auto-rules', acc] as const,
   alerts:               (source?: string) => ['alerts', source ?? ''] as const,

@@ -18,6 +18,7 @@ from app.api import (
     analysis,
     backtest,
     data,
+    diagnostics,
     ext_data,
     events,
     factors,
@@ -517,6 +518,8 @@ app.include_router(indices.router)
 app.include_router(overview.router)
 app.include_router(paper.router)
 app.include_router(abnormal.router)
+app.include_router(diagnostics.router)
+app.include_router(diagnostics.verdict_router)
 app.include_router(regime.router)
 app.include_router(analysis.router)
 app.include_router(pipeline.router)
@@ -527,6 +530,7 @@ app.include_router(stock_analysis.router)
 app.include_router(market_recap.router)
 app.include_router(settings_api.router)
 app.include_router(strategy.router)
+app.include_router(strategy.bundle_router)
 app.include_router(signals.router)
 app.include_router(monitor_rules.router)
 app.include_router(lots.router)

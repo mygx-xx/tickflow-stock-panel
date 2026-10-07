@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, SlidersHorizontal } from 'lucide-react'
-import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
+import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, SlidersHorizontal, History } from 'lucide-react'
+import { api, genRuleId, type ScreenerStrategy, type ScreenerResult, type ScreenerHitsDaily } from '@/lib/api'
 import { fetchMinuteBatchIncremental } from '@/lib/minuteBatchIncremental'
 import { DEFAULT_STRATEGY_NOTIFY_EVENTS } from '@/lib/strategyMonitorEvents'
 import { toast } from '@/components/Toast'
@@ -20,9 +20,11 @@ import { useStrategyPool } from '@/lib/useStrategyPool'
 import { StrategyCard, CardSize, loadCardSize } from '@/components/screener/StrategyCard'
 import { ScreenerTable } from '@/components/screener/ScreenerTable'
 import { ScreenerFilter as ScreenerFilterType, defaultFilter, filterActive, countActiveFilters, applyFilter, FilterPanel } from '@/components/screener/ScreenerFilter'
+import { filterByResonance, sortByResonance } from '@/components/screener/resonance'
 import { StrategySettingsDialog } from '@/components/screener/StrategySettingsDialog'
 import { DefaultStrategyParamsDialog } from '@/components/screener/DefaultStrategyParamsDialog'
 import { StrategyPoolDialog } from '@/components/screener/StrategyPoolDialog'
+import { CoverageWarningBanner, collectCoverageWarnings } from '@/components/screener/CoverageWarningBanner'
 import { StrategyBuilderDialog } from '@/components/screener/StrategyBuilderDialog'
 import { StrategyStoreDialog } from '@/components/screener/StrategyStoreDialog'
 import { CompositeStrategyDialog } from '@/components/screener/CompositeStrategyDialog'
@@ -41,11 +43,95 @@ import {
 // 获取策略为占位功能, 暂时隐藏入口; 恢复时改回 true
 const SHOW_STRATEGY_STORE = false
 
+/**
+ * dev 模式下的「本模块加载时刻」: 模块每次被浏览器重新拉取都会求值,
+ * 页头把它显示成 dev·HH:MM:SS。刷新后时间戳不变 = 浏览器仍在用旧代码,
+ * 用来一眼区分「代码没生效」和「样式确实还错」。
+ */
+const DEV_BUILD_TS = import.meta.env.DEV
+  ? new Date().toLocaleTimeString('zh-CN', { hour12: false })
+  : ''
+
+/**
+ * 命中日报 — 全市场层面「今天选了什么 / 相比上一交易日进出如何」。
+ * 默认收起成一行, 点开看各策略的命中数与增减; 首个归档日无基准, 明示而非谎报"0 变化"。
+ */
+function HitsDailyBar({ data, loading }: { data?: ScreenerHitsDaily; loading: boolean }) {
+  const [open, setOpen] = useState(false)
+  if (loading) {
+    return <div className="h-9 animate-pulse rounded-card border border-border bg-surface/40" />
+  }
+  if (!data?.date || data.strategies.length === 0) return null
+  const u = data.universe
+  return (
+    <div className="rounded-card border border-border bg-surface/60 px-3 py-1.5">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex w-full items-center gap-2 text-left"
+        title={data.baseline ? '首个归档日, 明日起显示相对上一交易日的增减' : `与 ${data.prev_date} 对比`}
+      >
+        <History className="h-3.5 w-3.5 shrink-0 text-accent" />
+        <span className="shrink-0 text-xs font-medium text-foreground">命中日报</span>
+        <span className="shrink-0 font-mono text-[10px] text-muted">{data.date}</span>
+        {data.baseline ? (
+          <span className="truncate text-[10px] text-muted/70">
+            基准日 · 共 {u.current} 只 · 明日起显示增减
+          </span>
+        ) : (
+          <>
+            <span className="shrink-0 text-[10px] text-muted">较 {data.prev_date}</span>
+            <span className="shrink-0 font-mono text-[10px] text-bull">+{u.added}</span>
+            <span className="shrink-0 font-mono text-[10px] text-bear">-{u.dropped}</span>
+            <span className="shrink-0 font-mono text-[10px] text-muted">留存 {u.held}</span>
+            <span className="truncate text-[10px] text-muted/70">
+              {data.strategies.filter(s => s.added.length || s.dropped.length).length} 个策略有变动
+            </span>
+          </>
+        )}
+        <span className="ml-auto shrink-0 text-[10px] text-muted">{open ? '收起' : '展开'}</span>
+      </button>
+      {open && (
+        <div className="mt-2 max-h-64 overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-surface">
+              <tr className="text-left text-[10px] text-muted">
+                <th className="py-1 font-normal">策略</th>
+                <th className="py-1 text-right font-normal">今日</th>
+                <th className="py-1 text-right font-normal">{data.baseline ? '—' : '前日'}</th>
+                <th className="py-1 text-right font-normal">新增</th>
+                <th className="py-1 text-right font-normal">剔除</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.strategies.map(s => (
+                <tr key={s.strategy_id} className="border-t border-border/50">
+                  <td className="max-w-0 truncate py-1 pr-2 text-foreground" title={s.name}>{s.name}</td>
+                  <td className="py-1 text-right font-mono">{s.matched}</td>
+                  <td className="py-1 text-right font-mono text-muted">{data.baseline ? '—' : s.prev_matched}</td>
+                  <td className="py-1 text-right font-mono text-bull">{data.baseline ? '—' : (s.added.length ? `+${s.added.length}` : '—')}</td>
+                  <td className="py-1 text-right font-mono text-bear">{data.baseline ? '—' : (s.dropped.length ? `-${s.dropped.length}` : '—')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function Screener() {
   const [assetType, setAssetType] = useState<'stock' | 'etf'>('stock')
+  // dev 调试: 把构建时刻写进浏览器标签标题。全项目无其它地方设置 document.title,
+  // 因此不会被覆盖; 刷新后标签时间不变即代表浏览器没拿到新代码 (比看布局更可靠)。
+  useEffect(() => {
+    if (DEV_BUILD_TS) document.title = `策略 · dev·${DEV_BUILD_TS}`
+  }, [])
   // 周期显示筛选: 全部 / 日线 / 分钟 — 只过滤卡片显示, 不影响池和执行;
   // 执行按每个策略自己声明的 timeframes 路由 (日线走盘后缓存, 分钟走本地分钟K分区)
   const [tfFilter, setTfFilter] = useState<'all' | '1d' | '1m'>('all')
+  /** 左栏结论筛选: all=不筛 / trusted=只看清单认可(粗筛通过或已验证表在列) */
+  const [verdictFilter, setVerdictFilter] = useState<'all' | 'trusted'>('all')
   const [activeStrategy, setActiveStrategy] = useState<string | null>(null)
   const [result, setResult] = useState<ScreenerResult | null>(null)
   const [asOf, setAsOf] = useState<string>('')
@@ -97,6 +183,8 @@ export function Screener() {
   // 截断提示可关闭 (仅本次会话, 不持久化)
   const [intradayCapDismissed, setIntradayCapDismissed] = useState(false)
   const [showAll, setShowAll] = useState(false)
+  // 「全部」模式共振阈值: 只显示被 >= minHits 个策略同时命中的个股 (1 = 不过滤)
+  const [minHits, setMinHits] = useState(1)
   const [showFilter, setShowFilter] = useState(false)
   const [filter, setFilter] = useState<ScreenerFilterType>(defaultFilter)
   const filterMap = useRef<Map<string, ScreenerFilterType>>(new Map())
@@ -233,12 +321,48 @@ export function Screener() {
   )
   const visiblePool = useMemo(() => pool.filter(id => availableStrategyIds.has(id)), [pool, availableStrategyIds])
 
+  // 清单里的自述验证结论 (README-策略清单.md)。缺失时 items 为空, 下方 UI 自动隐藏。
+  const verdicts = useQuery({ queryKey: QK.strategyVerdicts, queryFn: api.strategyVerdicts })
+  const verdictMap = useMemo(
+    () => verdicts.data?.items ?? {},
+    [verdicts.data],
+  )
+  const verdictStats = useMemo(() => {
+    const d = verdicts.data
+    if (!d?.meta.available) return null
+    return {
+      screened: d.by_verdict.screened ?? 0,
+      failed: d.by_verdict.failed ?? 0,
+      untagged: d.by_verdict.untagged ?? 0,
+      verified: d.meta.verified_count,
+      consistent: d.meta.consistent,
+      unknownWording: d.meta.unknown_wording,
+    }
+  }, [verdicts.data])
+
   // 卡片显示: 按周期筛选 (all=全部, 1d=仅日线, 1m=仅分钟); 未声明 timeframes 视为日线
   const displayPool = useMemo(() => visiblePool.filter(id => {
     if (tfFilter === 'all') return true
     const isMinute = strategyMap.get(id)?.timeframes?.includes('1m') ?? false
     return tfFilter === '1m' ? isMinute : !isMinute
   }), [visiblePool, strategyMap, tfFilter])
+
+  // 「只看清单认可」: 保留清单判为粗筛通过或列入已验证表的策略。
+  // 刻意**不含** verified 之外的 untagged —— 65 个未标注里可能混着没测过的。
+  const displayPoolAfterVerdict = useMemo(() => {
+    if (verdictFilter === 'all') return displayPool
+    return displayPool.filter(id => {
+      const v = verdictMap[id]
+      return !!v && (v.verdict === 'screened' || v.verified)
+    })
+  }, [displayPool, verdictFilter, verdictMap])
+
+  // 已激活策略数 (生命周期 status === 'active')。draft/watch/active 目前都可执行,
+  // 该计数只表达「可信度标记」的覆盖情况, 不改变卡片是否运行。
+  const activatedCount = useMemo(
+    () => displayPoolAfterVerdict.filter(id => strategyMap.get(id)?.status === 'active').length,
+    [displayPoolAfterVerdict, strategyMap],
+  )
 
   // runAll/盘后缓存只覆盖日线策略; 分钟策略不落盘后缓存 (strategy_cache 为日线语义),
   // 由下方 runAllMinute 进入页面时异步批量计算点亮卡片
@@ -403,6 +527,14 @@ export function Screener() {
     return Object.fromEntries(entries)
   }, [fullCachedQuery.data, asOf])
 
+  // 数据充足性提示 (#303): 单策略走 /cached-result(或 /run_preset), 「全部」走
+  // /cached 里各策略的结果。两处都收集后去重 —— 该提示要能解释「为什么 0 命中」,
+  // 所以必须渲染在结果区之外, 否则没命中时整块不渲染就看不到它。
+  const coverageWarnings = useMemo(
+    () => collectCoverageWarnings(effectiveResults, result?.warnings),
+    [effectiveResults, result],
+  )
+
   // symbol → 所属策略列表。单策略接口同时返回轻量归属映射，保留策略列原有展示。
   const symbolStrategyMap = useMemo(() => {
     const map = new Map<string, string[]>()
@@ -443,6 +575,17 @@ export function Screener() {
     return merged
   }, [effectiveResults])
 
+  // "全部" 模式共振: 在「并集」之上再按命中策略数取交集 —— 只保留被 >= minHits
+  // 个策略同时命中的个股。symbolStrategyMap 已算好归属, 交集几乎零成本。
+  const hitsOf = useCallback(
+    (symbol: string) => symbolStrategyMap.get(symbol)?.length ?? 0,
+    [symbolStrategyMap],
+  )
+  const resonanceRows = useMemo(
+    () => filterByResonance(allRows, hitsOf, minHits),
+    [allRows, hitsOf, minHits],
+  )
+
   // 计算当前策略的失效行: 今日曾命中但当前已不命中。
   const expiredRows = useMemo(() => {
     const everRows = singleCachedQuery.data?.today_ever_rows
@@ -459,12 +602,15 @@ export function Screener() {
   // 当前显示的行数据 (全部模式 或 单策略模式) + 失效行
   const displayRows = useMemo(() => {
     let rows = showAll
-      ? applyFilter(allRows, filter)
+      ? applyFilter(resonanceRows, filter)
       : filteredRows
-    // 排序：用户点了表头则按该列，否则默认评分降序
+    // 排序：用户点了表头则按该列；否则「全部」模式按 命中策略数 → 评分 降序
+    // (共振优先，多策略共识的个股排前面)，单策略模式按评分降序
     rows = sort
       ? sortRows(rows, columns)
-      : [...rows].sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity))
+      : showAll
+        ? sortByResonance(rows, hitsOf)
+        : [...rows].sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity))
     const limit = !showAll && activeStrategy
       ? strategyLimits[activeStrategy] ?? null
       : null
@@ -477,7 +623,7 @@ export function Screener() {
       }
     }
     return mainRows
-  }, [showAll, allRows, filteredRows, filter, activeStrategy, strategyLimits, expiredRows, sort, sortRows, columns])
+  }, [showAll, allRows, resonanceRows, hitsOf, filteredRows, filter, activeStrategy, strategyLimits, expiredRows, sort, sortRows, columns])
 
   // 日k列是否启用 → 决定是否加载批量 kline 数据
   const candleColumn = useMemo(() =>
@@ -700,6 +846,13 @@ export function Screener() {
     },
   })
 
+  // 命中日报: 全市场层面的当日命中与增减 (asOf 变化即重新拉, 保证跑完策略后刷新)
+  const hitsDailyQ = useQuery({
+    queryKey: QK.screenerHitsDaily(asOf || 'latest'),
+    queryFn: () => api.screenerHitsDaily(),
+    enabled: !!asOf,
+  })
+
   // 策略监控: 查询规则, 建立 assetType:strategyId → ruleId 映射 (只看 type=strategy 且 enabled)
   const monitorRules = useQuery({ queryKey: QK.monitorRules, queryFn: api.monitorRulesList })
   const strategyMonitorMap = useMemo(() => {
@@ -743,6 +896,60 @@ export function Screener() {
     }
   }
 
+  // 池内已开启监控的策略数 (批量按钮的禁用态依据)
+  const monitoredInPool = useMemo(
+    () => displayPoolAfterVerdict.filter(id => strategyMonitorMap.has(`${assetType}:${id}`)).length,
+    [displayPoolAfterVerdict, strategyMonitorMap, assetType],
+  )
+
+  /**
+   * 批量开通/关闭池内策略的监控。
+   * 单条链路边 (toggleStrategyMonitor) 已就绪, 这里只做批量编排:
+   * 逐个建/删 type=strategy 规则, 幂等 —— 已监控的跳过, 不会重复创建。
+   * 串行而非 Promise.all: 规则写盘是一对象一文件, 串行可避免并发写同一目录。
+   */
+  const batchMonitor = useMutation({
+    mutationFn: async (action: 'on' | 'off') => {
+      const keyOf = (sid: string) => `${assetType}:${sid}`
+      // on → 只处理未监控的; off → 只处理已监控的
+      const targets = displayPoolAfterVerdict.filter(id => strategyMonitorMap.has(keyOf(id)) !== (action === 'on'))
+      for (const id of targets) {
+        if (action === 'off') {
+          await api.monitorRuleDelete(strategyMonitorMap.get(keyOf(id))!)
+        } else {
+          await api.monitorRuleSave({
+            id: genRuleId(),
+            name: `策略监控 · ${strategyIdToName[id] ?? id}`,
+            enabled: true,
+            type: 'strategy',
+            asset_type: assetType,
+            scope: 'all',
+            symbols: [],
+            sector: null,
+            strategy_id: id,
+            direction: 'entry',
+            notify_events: [...DEFAULT_STRATEGY_NOTIFY_EVENTS],
+            conditions: [],
+            logic: 'or',
+            cooldown_seconds: 3600,
+            severity: 'info',
+            message: '',
+          })
+        }
+      }
+      return targets.length
+    },
+    onSuccess: async (n, action) => {
+      await qc.invalidateQueries({ queryKey: QK.monitorRules })
+      if (n === 0) {
+        toast(action === 'on' ? '池内策略均已开启监控' : '池内没有已开启的监控', 'success')
+      } else {
+        toast(action === 'on' ? `已为 ${n} 个策略开启监控` : `已关闭 ${n} 个策略监控`, 'success')
+      }
+    },
+    onError: (e: Error) => toast(`批量操作失败 · ${e.message}`, 'error'),
+  })
+
   const handleBatchAdd = (groupId: string | null) => {
     if (!displayRows.length) return
     const symbols = displayRows.map((r: any) => r.symbol)
@@ -764,9 +971,16 @@ export function Screener() {
       <PageHeader
         title="策略"
         subtitle="基于本地 enriched 表 · 毫秒级 SQL"
-        className="flex-wrap"
+        titleExtra={DEV_BUILD_TS ? (
+          <span
+            className="shrink-0 rounded bg-accent/20 px-1.5 py-0.5 font-mono text-[10px] font-bold leading-none text-accent ring-1 ring-accent/40"
+            title="dev 构建时刻 — 刷新后若时间不变, 说明浏览器未加载到最新代码"
+          >
+            dev·{DEV_BUILD_TS}
+          </span>
+        ) : undefined}
         right={
-          <div className="flex flex-wrap items-center justify-end gap-2 ml-auto">
+          <div className="flex w-full flex-wrap items-center justify-between gap-x-2 gap-y-2 min-[1800px]:ml-auto min-[1800px]:w-auto min-[1800px]:justify-start">
             {/* 资产类型切换: 股票 / ETF (分钟策略 asset_types 仅股票, ETF 列表自然不含) */}
             <div className="flex items-center h-7 rounded-btn border border-border overflow-hidden">
               {(['stock', 'etf'] as const).map(t => (
@@ -836,6 +1050,28 @@ export function Screener() {
             >
               <Network className="h-3.5 w-3.5" />
             </button>
+            {/* 共振阈值: 仅「全部」模式可见 — 只保留被 N 个及以上策略同时命中的个股 */}
+            {showAll && (
+              <div
+                className="flex items-center h-7 rounded-btn border border-border overflow-hidden"
+                title="共振筛选: 只显示被 N 个及以上策略同时命中的个股(多策略共识)"
+              >
+                <span className="px-1.5 text-[10px] text-muted shrink-0">共振≥</span>
+                {[1, 2, 3, 4].map(n => (
+                  <button
+                    key={n}
+                    onClick={() => setMinHits(n)}
+                    className={`h-full px-2 text-[10px] font-medium transition-colors cursor-pointer
+                      ${minHits === n
+                        ? 'bg-accent/10 text-accent'
+                        : 'text-muted hover:text-secondary hover:bg-elevated'
+                      }`}
+                  >
+                    {n === 4 ? '4+' : n}
+                  </button>
+                ))}
+              </div>
+            )}
             {/* 卡片尺寸切换 */}
             <div className="flex items-center h-7 rounded-btn border border-border overflow-hidden">
               {(['hidden', 'mini', 'normal', 'large'] as const).map(sz => (
@@ -912,30 +1148,98 @@ export function Screener() {
       />
 
       <div className="h-full min-h-0">
-        <div className={`grid h-full min-h-0 grid-cols-1 gap-4 p-4 ${cardSize === 'hidden' ? '' : 'lg:grid-cols-[16rem_minmax(0,1fr)]'}`}>
+        <div className={`grid h-full min-h-0 grid-cols-1 gap-3 p-3 ${cardSize === 'hidden' ? '' : 'lg:grid-cols-[16rem_minmax(0,1fr)]'}`}>
         {/* 左栏: 策略列表 (独立滚动, 策略多也不挤结果) */}
         {cardSize !== 'hidden' && (
         <aside className="flex max-h-[40vh] min-h-0 flex-col overflow-hidden rounded-card border border-border bg-surface/60 lg:h-full lg:max-h-none">
-          <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-            <span className="text-xs font-medium text-foreground">
-              策略 <span className="font-mono text-[10px] text-muted">{displayPool.length}</span>
+          {/* 头部: 左计数 + 右当前策略。统一 leading-none 做基线对齐, 两段文字横向单行,
+              右侧「当前 xxx」按剩余空间截断 (左段不参与压缩) */}
+          <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5">
+            <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs font-medium leading-none text-foreground">
+              策略
+              <span className="font-mono text-[10px] leading-none text-muted">{displayPoolAfterVerdict.length}</span>
+              {displayPoolAfterVerdict.length > 0 && (
+                <span
+                  className={`text-[10px] leading-none ${activatedCount > 0 ? 'text-emerald-400/80' : 'text-muted/60'}`}
+                  title="生命周期状态为「已激活」的策略数 — 在策略设置里可迁移状态; 「已归档」会立即阻止该策略执行"
+                >
+                  · 已激活 {activatedCount}
+                </span>
+              )}
             </span>
             {activeStrategy && (
-              <span className="truncate text-[10px] text-muted">
+              <span
+                className="min-w-0 flex-1 truncate text-right text-[10px] leading-none text-muted"
+                title={`当前 ${strategyIdToName[activeStrategy] ?? activeStrategy}`}
+              >
                 当前 {strategyIdToName[activeStrategy] ?? activeStrategy}
               </span>
             )}
           </div>
+          {/* 清单结论筛选 + 统计。清单文件缺失时不渲染(verdictStats 为 null)。
+              文案刻意用「清单」二字: 这是 README-策略清单.md 里人工汇总的自述结论,
+              不是本系统跑的回测, 不能让人误读成系统已验证。 */}
+          {verdictStats && !verdictStats.consistent && (
+            <div className="shrink-0 border-b border-border bg-amber-500/5 px-2 py-1 text-[10px] leading-tight text-amber-400">
+              清单自报统计与实际解析不一致（可能已被手工改动），下方结论仅供参考
+            </div>
+          )}
+          {verdictStats && (
+            <div className="flex shrink-0 items-center justify-between gap-1 border-b border-border px-2 py-1.5">
+              <span
+                className="text-[10px] leading-none text-muted"
+                title="来自 data/strategies/custom/README-策略清单.md —— 人工/脚本汇总的自述回测结论，非本系统回测"
+              >
+                清单粗筛 {verdictStats.screened} · 重点 {verdictStats.verified}
+                {verdictStats.unknownWording > 0 && ` · 未登记措辞 ${verdictStats.unknownWording}`}
+              </span>
+              <button
+                onClick={() => setVerdictFilter(f => (f === 'all' ? 'trusted' : 'all'))}
+                disabled={verdictStats.screened + verdictStats.verified === 0}
+                className={`h-5 shrink-0 rounded px-1.5 text-[10px] font-medium leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                  verdictFilter === 'trusted'
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : 'text-muted hover:bg-elevated hover:text-foreground'
+                }`}
+                title="只看清单判为「通过粗筛」或列入「已验证可用」表的策略"
+              >
+                {verdictFilter === 'trusted' ? '取消只看' : '只看清单认可'}
+              </button>
+            </div>
+          )}
+          {/* 批量监控: 池内策略一键开启/关闭 (逐张卡片点 RadioTower 在池子大时不可行) */}
+          {displayPoolAfterVerdict.length > 0 && (            <div className="flex shrink-0 items-center justify-between gap-1 border-b border-border px-2 py-1.5">
+              <span className="text-[10px] leading-none text-muted">已监控 {monitoredInPool}/{displayPoolAfterVerdict.length}</span>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => batchMonitor.mutate('on')}
+                  disabled={batchMonitor.isPending || monitoredInPool >= displayPoolAfterVerdict.length}
+                  className="h-5 rounded bg-accent/15 px-1.5 text-[10px] font-medium leading-none text-accent transition-colors hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  全部开启
+                </button>
+                <button
+                  onClick={() => batchMonitor.mutate('off')}
+                  disabled={batchMonitor.isPending || monitoredInPool === 0}
+                  className="h-5 rounded px-1.5 text-[10px] font-medium leading-none text-muted transition-colors hover:bg-elevated hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  全部关闭
+                </button>
+              </div>
+            </div>
+          )}
           <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-2">
           {strategies.isLoading && <div className="px-1 py-2 text-xs text-muted">加载中…</div>}
-          {!strategies.isLoading && displayPool.length === 0 && (
+          {!strategies.isLoading && displayPoolAfterVerdict.length === 0 && (
             <div className="px-2 py-6 text-center text-xs text-muted">
               {pool.length === 0
                 ? '策略池为空，点击右上角「策略池」按钮添加'
-                : '当前周期筛选下无策略'}
+                : verdictFilter === 'trusted' && displayPoolAfterVerdict.length === 0
+                  ? '池内没有清单认可的策略（粗筛通过或已验证表在列）'
+                  : '当前筛选下无策略'}
             </div>
           )}
-          {displayPool.map(id => {
+          {displayPoolAfterVerdict.map(id => {
               const s = strategyMap.get(id)
               if (!s) return null
               const isMinute = s.timeframes?.includes('1m') ?? false
@@ -956,11 +1260,14 @@ export function Screener() {
                   awaitRun={hitCounts[id] == null && isMinute && !selfRunning && !minuteRunning}
                   cardSize={cardSize}
                   onRun={() => handleRun(s)}
-                  disabled={run.isPending && activeStrategy === s.id}
+                  disabled={(run.isPending && activeStrategy === s.id) || s.status === 'retired'}
                   onSettings={() => setSettingsStrategyId(s.id)}
                   monitored={strategyMonitorMap.has(`${assetType}:${s.id}`)}
                   onToggleMonitor={() => toggleStrategyMonitor(s.id, s.name)}
                   timeframeBadge={isMinute ? '分钟' : undefined}
+                  status={s.status}
+                  statusLabel={s.status_label}
+                  verdict={verdictMap[s.id]}
                 />
               )
             })}
@@ -970,12 +1277,19 @@ export function Screener() {
 
         {/* 右栏: 结果 (独立滚动) */}
         <main className="min-w-0 min-h-0 lg:h-full lg:overflow-y-auto">
-        <section className="space-y-3">
+        <section className="space-y-2">
           {run.isError && (
             <div className="text-sm text-danger bg-danger/10 border border-danger/30 rounded-btn px-3 py-2">
               {String((run.error as any).message)}
             </div>
           )}
+
+          <CoverageWarningBanner
+            warnings={coverageWarnings}
+            signature={`${asOf}:${showAll ? 'all' : (activeStrategy ?? '')}`}
+          />
+
+          <HitsDailyBar data={hitsDailyQ.data} loading={hitsDailyQ.isLoading} />
 
           {(showAll ? allRows.length > 0 : !!result) && (
             <motion.div
@@ -983,29 +1297,41 @@ export function Screener() {
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-              className="space-y-3"
+              className="space-y-2"
             >
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-medium text-foreground flex items-center gap-2">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs font-medium text-foreground">
                   {!showAll && activeStrategy && (
-                    <span className="text-secondary">{strategyIdToName[activeStrategy] ?? ''}</span>
+                    <span
+                      className="max-w-[220px] truncate text-secondary"
+                      title={strategyIdToName[activeStrategy] ?? ''}
+                    >
+                      {strategyIdToName[activeStrategy] ?? ''}
+                    </span>
                   )}
-                  <TrendingUp className="h-4 w-4 text-accent" />
-                  {showAll ? '全部' : ''}命中 <span className="text-accent num">{displayRows.length}</span> 只
-                  {filterActive(filter) && displayRows.length !== (showAll ? allRows.length : result!.total) && (
-                    <span className="text-muted text-xs">/ {showAll ? allRows.length : result!.total}</span>
+                  <TrendingUp className="h-3.5 w-3.5 shrink-0 text-accent" />
+                  <span className="whitespace-nowrap">
+                    {showAll ? '全部' : ''}命中 <span className="text-accent num">{displayRows.length}</span> 只
+                  </span>
+                  {(filterActive(filter) || (showAll && minHits > 1)) && displayRows.length !== (showAll ? resonanceRows.length : result!.total) && (
+                    <span className="text-muted text-xs">/ {showAll ? resonanceRows.length : result!.total}</span>
+                  )}
+                  {showAll && minHits > 1 && (
+                    <span className="inline-flex items-center h-4 px-1.5 rounded-full bg-accent/15 text-accent text-[10px] font-bold leading-none">
+                      共振 ≥{minHits} 策略
+                    </span>
                   )}
                   <span className="text-[11px] text-muted font-normal">
-                    · {displayPool.length} 策略
-                    {!showAll && displayPool.length > 0 && (
-                      <> · 共 {displayPool.reduce((sum, id) => sum + (hitCounts[id] ?? 0), 0)} 只</>
+                    · {displayPoolAfterVerdict.length} 策略
+                    {!showAll && displayPoolAfterVerdict.length > 0 && (
+                      <> · 共 {displayPoolAfterVerdict.reduce((sum, id) => sum + (hitCounts[id] ?? 0), 0)} 只</>
                     )}
                   </span>
                   {runAll.isPending && (
                     <span className="text-[11px] text-muted animate-pulse">扫描中…</span>
                   )}
                 </h2>
-                <div className="flex items-center gap-3">
+                <div className="flex shrink-0 items-center gap-3">
                   {(showAll ? allRows.length > 0 : !!result?.rows.length) && (
                     <div className="inline-flex items-stretch h-7 rounded-btn border border-border bg-surface overflow-hidden">
                       <button
@@ -1200,6 +1526,10 @@ export function Screener() {
             const tf = strategyMap.get(settingsStrategyId)?.timeframes?.includes('1m') ? '1m' as const : '1d' as const
             run.mutate({ id: settingsStrategyId, date: tf === '1m' ? '' : asOf, timeframe: tf })
           }
+        }}
+        onStatusChanged={() => {
+          // 状态迁移改的是策略文件 META.status → 刷新列表让卡片徽标/已激活计数跟上
+          qc.invalidateQueries({ queryKey: ['screener-strategies'] })
         }}
         onAiModify={async () => {
           if (!settingsStrategyId) return

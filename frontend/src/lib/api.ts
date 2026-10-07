@@ -386,6 +386,9 @@ export interface IndexQuote {
 }
 
 // ===== Screener =====
+/** 策略生命周期状态 (后端 app/strategy/lifecycle.py 四态) */
+export type StrategyStatus = 'draft' | 'active' | 'watch' | 'retired'
+
 export interface ScreenerStrategy {
   id: string
   name: string
@@ -393,6 +396,35 @@ export interface ScreenerStrategy {
   source?: string
   /** 支持的周期, 如 ['1d'] / ['1m'] (分钟策略) */
   timeframes?: string[]
+  /** 生命周期状态(后端归一化后下发; 未声明 META.status 者为 draft) */
+  status?: StrategyStatus
+  /** 状态中文说明, 直接用作 tooltip */
+  status_label?: string
+  /** 是否参与自动选股池 (仅 active 为 true) */
+  selectable?: boolean
+}
+
+/** GET /api/strategies/{id}/lifecycle 返回体(只读, 无回测开销) */
+export interface StrategyLifecycleInfo {
+  strategy_id: string
+  status: StrategyStatus
+  status_label: string
+  research_only: boolean
+  source: string
+  selectable: boolean
+  visible: boolean
+}
+
+/** POST /api/strategies/{id}/status 返回体 */
+export interface StrategyStatusChangeResult {
+  ok: boolean
+  strategy_id: string
+  status: StrategyStatus
+  status_label: string
+  previous_status?: StrategyStatus
+  changed: boolean
+  /** 是否为自动降级(仅 active→watch); 人工操作恒为 false */
+  automatic?: boolean
 }
 
 export interface StrategyLoadError {
@@ -406,6 +438,27 @@ export interface ScreenerResult {
   rows: any[]
   total: number
   elapsed_ms: number
+  /**
+   * 数据充足性提示 (#303)。enriched 覆盖低于暖机窗口时由后端下发,
+   * 用于解释「为什么 0 命中」—— 缺省(数据充足)时后端不下发该键。
+   */
+  warnings?: string[]
+}
+
+/** /api/screener/cached 中单条策略的结果 (含 run_all / 单跑写入的数据不足提示) */
+export interface ScreenerCachedStrategyResult {
+  total: number
+  as_of: string
+  rows: any[]
+  warnings?: string[]
+}
+
+export interface ScreenerCachedPayload {
+  as_of: string | null
+  results: Record<string, ScreenerCachedStrategyResult>
+  today_ever_matched: Record<string, string[]> | null
+  today_ever_rows: Record<string, Record<string, any>> | null
+  updated_at: number | null
 }
 
 export interface ScreenerResultSummary {
@@ -420,6 +473,34 @@ export interface ScreenerCachedSummary {
   results: Record<string, ScreenerResultSummary>
   today_ever_counts: Record<string, number>
   updated_at: number | null
+}
+
+/** 命中日报一行: 某策略当日命中数 + 相对上一归档日的增减 */
+export interface ScreenerHitsDailyRow {
+  strategy_id: string
+  name: string
+  matched: number
+  prev_matched: number
+  added: string[]
+  dropped: string[]
+}
+
+/** 命中日报: 首日无前一日基准时 baseline=true, added/dropped 为空数组 */
+export interface ScreenerHitsDaily {
+  date: string | null
+  baseline: boolean
+  reason?: string
+  prev_date: string | null
+  strategies: ScreenerHitsDailyRow[]
+  universe: {
+    added: number
+    dropped: number
+    held: number
+    prev: number
+    current: number
+    added_symbols?: string[]
+    dropped_symbols?: string[]
+  }
 }
 
 /** run_all 渐进式返回: 快策略已算完, 慢策略后台继续算 */
@@ -781,6 +862,11 @@ export interface StrategyDetail {
   tags: string[]
   source: 'builtin' | 'custom' | 'ai' | 'composite'
   research_only?: boolean
+  /** 生命周期状态(绩效可信度维度)。与 research_only(可见性)职责独立。 */
+  status?: StrategyStatus
+  status_label?: string
+  /** 是否参与自动选股 (仅 status === 'active') */
+  selectable?: boolean
   execution_backend: 'polars_expr' | 'matrix_native' | 'python_history_legacy' | 'composite' | 'minute_filter'
   asset_types: string[]
   timeframes: string[]
@@ -1156,6 +1242,142 @@ export interface PaperAutoRule {
   cooldown_days: number
   enabled: boolean
   created_at: string
+}
+
+/** 按来源归因一行 — 哪个策略带来的持仓与已实现盈亏 (manual / auto:{rule_id}) */
+/** 系统自检 — 后端把服务/数据/策略/缓存/监控健康度聚合成一次请求 */
+/** 策略导出包条目 — 源码是权威数据, 有了它才能完整还原策略 */
+export interface StrategyBundleEntry {
+  id: string
+  name: string
+  description: string
+  source: string
+  status: string
+  research_only: boolean
+  file_path: string | null
+  meta: Record<string, unknown>
+  overrides: Record<string, unknown>
+  code: string | null
+}
+
+export interface StrategyBundle {
+  format: string
+  format_version: number
+  exported_at: string
+  app_version: string
+  count: number
+  code_missing: string[]
+  strategies: StrategyBundleEntry[]
+}
+
+/** 策略自述验证结论（来自 data/strategies/custom/README-策略清单.md） */
+export interface StrategyVerdictItem {
+  /** 三类互斥: screened 通过粗筛 / failed 回测失败 / untagged 未标注结论 */
+  verdict: 'screened' | 'failed' | 'untagged'
+  /** 叠加标记: 清单「已验证可用」表单列的重点关注名单。不改写 verdict。 */
+  verified: boolean
+  /** 证据原文（取自已验证表），可能为空 */
+  evidence: string
+  /** 未登记的措辞原文，供人工核对；正常为空 */
+  note: string
+}
+
+export interface StrategyVerdictsReport {
+  source: string
+  verdict_labels: Record<string, string>
+  by_verdict: Record<string, number>
+  meta: {
+    available: boolean
+    manifest_count: number
+    declared_counts: Record<string, number>
+    declared_total: number
+    parsed_by_verdict: Record<string, number>
+    verified_count: number
+    /** 清单自报统计 vs 实测解析的差异（key 为 verdict） */
+    mismatches: Record<string, { declared: number; parsed: number }>
+    consistent: boolean
+    unknown_wording: number
+  }
+  orphan_ids: string[]
+  orphan_total: number
+  unlabeled_total: number
+  items: Record<string, StrategyVerdictItem>
+}
+
+/** enriched 重建计划 (后端按 daily/enriched 分区差异与除权因子变化探测得出) */
+export interface EnrichedRebuildPlan {
+  /** full=全量重写 / forward=只补末尾新日期 / local=只重算受影响个股 / noop=无需重算 */
+  mode: 'full' | 'forward' | 'local' | 'noop'
+  /** 人可读依据, 直接展示给用户 */
+  reason: string
+  /** 相对全量的定性描述, 如「只算 1/1454 天」 */
+  savings: string
+  run_kwargs: { new_dates_only: boolean; symbols: string[] | null }
+  daily_days: number
+  enriched_days: number
+  missing_dates: string[]
+  missing_total: number
+  orphan_dates: string[]
+  orphan_total: number
+  earliest_missing: string | null
+  affected_symbols: number
+  adj_dates: number
+}
+
+export interface DiagnosticsReport {
+  healthy: boolean
+  failures: string[]
+  server: { ok: boolean; app_version: string; python: string; uptime_sec: number; checked_at: string; error?: string }
+  data: {
+    latest_date: string | null
+    lag_days: number | null
+    datasets: Array<{ name: string; rows: number | null; symbols: number | null; latest_date: string | null; trading_days: number | null }>
+    problems: string[]
+    error?: string
+  }
+  strategies: {
+    total: number
+    by_status: Record<string, number>
+    by_source: Record<string, number>
+    status_labels?: Record<string, string>
+    selectable: number
+    research_only: number
+    load_errors: string[]
+    error?: string
+  }
+  cache: {
+    exists: boolean
+    as_of?: string | null
+    lag_days?: number | null
+    age_minutes?: number | null
+    strategies?: number
+    ever_matched_symbols?: number
+    file_mb?: number
+    note?: string
+    error?: string
+  }
+  monitor: { rules: number; enabled: number; strategy_rules: number; by_type: Record<string, number>; error?: string }
+  auto_follow: { accounts: number; rule_files: number; error?: string }
+}
+
+export interface PaperAttributionRow {
+  source: string
+  kind: 'manual' | 'strategy' | 'orphan'
+  strategy_id: string | null
+  rule_id: string | null
+  label: string
+  realized_pnl: number
+  buy_count: number
+  sell_count: number
+  buy_qty: number
+  sell_qty: number
+  buy_amount: number
+  sell_amount: number
+  held_qty: number
+  held_cost: number
+  held_symbols: number
+  first_trade_at: string | null
+  last_trade_at: string | null
 }
 
 export interface PaperFill {
@@ -2702,10 +2924,19 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ start_date: startDate }),
     }),
-  rebuildEnriched: () =>
-    request<{ status: string; job_id: string }>('/api/kline/rebuild_enriched', {
-      method: 'POST',
-    }),
+  /** enriched 重建计划: 描述将采用哪种模式与依据, 不执行 */
+  enrichedRebuildPlan: (mode: 'auto' | 'full' | 'plan' = 'plan') =>
+    request<{ status: string; plan: EnrichedRebuildPlan }>(
+      `/api/kline/rebuild_enriched?mode=${mode}`,
+      { method: 'POST' },
+    ),
+
+  /** enriched 重算: auto 按实际差异选最省的方式, full 强制全量重写 */
+  rebuildEnriched: (mode: 'auto' | 'full' = 'auto') =>
+    request<{ status: string; job_id: string }>(
+      `/api/kline/rebuild_enriched?mode=${mode}`,
+      { method: 'POST' },
+    ),
 
   watchlistList: () => request<{ symbols: WatchlistEntry[] }>('/api/watchlist'),
   watchlistAdd: (symbol: string, note = '', groupId?: string | null) =>
@@ -2838,6 +3069,16 @@ export const api = {
     ),
   screenerCachedSummary: () =>
     request<ScreenerCachedSummary>('/api/screener/cached-summary'),
+  screenerHitsDaily: (date?: string) =>
+    request<ScreenerHitsDaily>(`/api/screener/hits-daily${date ? `?date=${date}` : ''}`),
+
+  diagnostics: () => request<DiagnosticsReport>('/api/diagnostics'),
+
+  strategyVerdicts: () => request<StrategyVerdictsReport>('/api/strategy-verdicts'),
+
+  /** 策略导出包: 不传 id = 全部(灾备), 传 id = 单个(分享/迁移) */
+  strategyBundle: (id?: string) =>
+    request<StrategyBundle>(id ? `/api/strategy-bundle/${id}` : '/api/strategy-bundle/export-all'),
   screenerCachedResult: (strategyId: string, extColumns?: string) =>
     request<ScreenerCachedResult>(
       extColumns
@@ -2845,7 +3086,7 @@ export const api = {
         : `/api/screener/cached-result/${encodeURIComponent(strategyId)}`,
     ),
   screenerCached: (extColumns?: string) =>
-    request<{ as_of: string | null; results: Record<string, { total: number; as_of: string; rows: any[] }>; today_ever_matched: Record<string, string[]> | null; today_ever_rows: Record<string, Record<string, any>> | null; updated_at: number | null }>(
+    request<ScreenerCachedPayload>(
       extColumns
         ? `/api/screener/cached?ext_columns=${encodeURIComponent(extColumns)}`
         : '/api/screener/cached',
@@ -3737,6 +3978,21 @@ export const api = {
   strategyDelete: (strategyId: string) =>
     request<{ ok: boolean }>(`/api/strategies/${strategyId}`, { method: 'DELETE' }),
 
+  /**
+   * 迁移策略生命周期状态 (draft/active/watch/retired)。
+   * 后端会改写策略文件 META.status 并 reload 引擎, 非法迁移返回 409。
+   * reason 会写入后端日志, 便于事后审计。
+   */
+  strategySetStatus: (strategyId: string, status: StrategyStatus, reason = '') =>
+    request<StrategyStatusChangeResult>(`/api/strategies/${encodeURIComponent(strategyId)}/status`, {
+      method: 'POST',
+      body: JSON.stringify({ status, reason }),
+    }),
+
+  /** 查询单个策略的生命周期状态 (只读视图, 不含回测开销) */
+  strategyLifecycle: (strategyId: string) =>
+    request<StrategyLifecycleInfo>(`/api/strategies/${encodeURIComponent(strategyId)}/lifecycle`),
+
   strategyReload: () =>
     request<{ ok: boolean; count: number }>('/api/strategies/reload', { method: 'POST' }),
 
@@ -3848,6 +4104,9 @@ export const api = {
 
   paperCompare: () =>
     request<{ accounts: PaperCompareRow[] }>('/api/paper/compare'),
+
+  paperAttribution: (account?: string) =>
+    request<{ sources: PaperAttributionRow[]; total_realized: number }>(accUrl('/api/paper/attribution', account)),
 
   paperFreeze: (frozen: boolean, account?: string) =>
     request<{ account: PaperAccount }>(accUrl('/api/paper/freeze?frozen=' + frozen, account), { method: 'POST' }),
