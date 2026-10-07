@@ -22,6 +22,16 @@ from app.backtest.minute_trigger import MINUTE_EXIT_TRIGGER_SIGNALS
 from app.strategy import config as strategy_config
 from app.strategy.ai_generator import AIStrategyGenerator, find_meta_assignment
 from app.strategy.engine import StrategyDef, StrategyEngine
+from app.strategy.lifecycle import (
+    STATUSES,
+    TRANSITIONS,
+    can_transition,
+    describe_status,
+    is_selectable,
+    is_transition_automatic,
+    is_visible,
+    normalize_status,
+)
 from app.strategy.monitor import StrategyMonitorService
 from app.strategy.prompt_builder import build_step1, build_step2
 from app.strategy.scoring import (
@@ -30,6 +40,12 @@ from app.strategy.scoring import (
     effective_scoring_directions,
 )
 from app.services.ndjson_heartbeat import with_heartbeat
+from app.services import walkforward_store
+from app.services.strategy_lifecycle import (
+    judge,
+    sharpe_baseline,
+    sweep_strategy_lifecycle,
+)
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 logger = logging.getLogger(__name__)
@@ -183,6 +199,9 @@ def _strategy_detail(
     name = overrides.get("name", s.meta.get("name", "")) if overrides else s.meta.get("name", "")
     description = overrides.get("description", s.meta.get("description", "")) if overrides else s.meta.get("description", "")
 
+    # 生命周期状态: META 未声明时归一为 draft(未声明≠已激活)。
+    lifecycle_status = normalize_status(s.meta.get("status"))
+
     return {
         "id": s.meta["id"],
         "name": name or s.meta.get("name", ""),
@@ -190,6 +209,14 @@ def _strategy_detail(
         "tags": s.meta.get("tags", []),
         "source": s.source,
         "research_only": s.meta.get("research_only", False),
+        # 生命周期状态(绩效可信度维度)。与 research_only 职责不同:
+        # research_only 管「是否对外可见」(人工 publish 驱动),
+        # status 管「是否参与自动选股」(绩效判定驱动)。
+        "status": lifecycle_status,
+        "status_label": describe_status(lifecycle_status),
+        # 前端据此决定是否显示「未激活/观察中」徽标, 以及是否把它放进
+        # 自动选股池的可选列表。
+        "selectable": is_selectable(lifecycle_status),
         "execution_backend": s.execution_backend,
         "asset_types": s.meta.get("asset_types", ["stock"]),
         "timeframes": s.meta.get("timeframes", ["1d"]),
@@ -1159,6 +1186,14 @@ async def ai_save(req: AISaveRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+class StrategyStatusRequest(BaseModel):
+    """策略生命周期状态迁移请求。"""
+
+    status: str
+    #: 迁移理由, 会写入日志。自动降级时应带上判定依据摘要, 便于事后审计。
+    reason: str = ""
+
+
 @router.post("/{strategy_id}/publish")
 def publish_ai_strategy(strategy_id: str, request: Request):
     """把 research_only 的 AI 草稿策略翻转为公开(research_only=False)。
@@ -1196,6 +1231,256 @@ def publish_ai_strategy(strategy_id: str, request: Request):
 
     _invalidate_strategy_runtime(request)
     return {"ok": True, "strategy_id": sid}
+
+
+def _write_meta_status(code: str, status: str) -> str:
+    """把 status 写进 META 文本。找不到 META 抛 ValueError。
+
+    复用 `_set_meta_string_field`(它做「存在则替换, 不存在则插入」的纯文本
+    改写, 不执行代码), 与 `_set_meta_bool_field` 完全同构。
+
+    两个易错点(都踩过):
+    1. `find_meta_assignment` 返回 `(ast.Name, ast.Dict)` **二元组**
+       (`ai_generator.find_meta_assignment:87`)。
+    2. 返回的是 **AST 节点不是文本**, `_set_meta_string_field` 里直接对
+       `pattern.subn` 做正则替换 —— 必须先用 `lineno/end_lineno` 从源码行
+       切出 META 的**文本块**, 再回填。否则报 "expected string or
+       bytes-like object, got 'Dict'"。
+    """
+    found = find_meta_assignment(code)
+    if found is None:
+        raise ValueError("找不到 META 字典")
+    meta_node = found[1]
+    lines = code.splitlines(keepends=True)
+    start = meta_node.lineno - 1
+    end = meta_node.end_lineno or meta_node.lineno
+    block = "".join(lines[start:end])
+
+    next_block = _set_meta_string_field(block, "status", status)
+    lines[start:end] = next_block.splitlines(keepends=True)
+    return "".join(lines)
+
+
+def _load_latest_walkforward(data_dir: Path, strategy_id: str) -> dict | None:
+    """读取该策略最近一次缓存的 walkforward 结果(供判定预演)。
+
+    缓存由 walkforward SSE 端点在跑完后写入(walkforward_store), 这里的
+    读取是**只读**的 —— 判定预演绝不能顺手改写策略状态。
+    """
+    return walkforward_store.load_walkforward_result(data_dir, strategy_id)
+
+
+@router.post("/{strategy_id}/status")
+def set_strategy_status(strategy_id: str, payload: StrategyStatusRequest, request: Request):
+    """迁移策略生命周期状态 (draft/active/watch/retired)。
+
+    与 publish 的区别: publish 翻转的是 `research_only`(可见性), 本端点
+    改的是 `status`(绩效可信度), 二者职责独立 —— 已 publish 但绩效衰退的
+    策略是 research_only=False + status="watch", 对外可见但不进自动选股池。
+
+    四段式安全写入(与 publish 同构): 读旧码 → 改写 → reload 并断言生效 →
+    失败回滚并二次 reload。策略文件是 `.py`, 改坏 META 会让该策略整体加载
+    失败, 所以回滚不是可选项。
+
+    迁移合法性查app.strategy.lifecycle.TRANSITIONS; 自动降级
+    (active→watch) 也走本端点, 但会标记 automatic=True 便于审计区分。
+    """
+    sid = _validate_strategy_id(strategy_id)
+    engine = _get_engine(request)
+    try:
+        s = engine.get(sid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=f"策略 {sid} 不存在") from e
+
+    target = normalize_status(payload.status)
+    if payload.status.strip().lower() not in STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"非法 status {payload.status!r}, 合法值 {sorted(STATUSES)}",
+        )
+
+    current = normalize_status(s.meta.get("status"))
+    if target == current:
+        return {"ok": True, "strategy_id": sid, "status": current, "changed": False}
+
+    if not can_transition(current, target):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"不允许的状态迁移 {current} → {target};"
+                f" 当前状态可迁移到 {sorted(TRANSITIONS.get(current, ()))}"
+            ),
+        )
+
+    path = s.file_path
+    if path is None:
+        raise HTTPException(status_code=400, detail="策略源文件路径无效, 无法迁移状态")
+
+    previous_code = path.read_text(encoding="utf-8")
+    try:
+        path.write_text(_write_meta_status(previous_code, target), encoding="utf-8")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    try:
+        engine.reload()
+        loaded = engine.get(sid)
+        if normalize_status(loaded.meta.get("status")) != target:
+            raise ValueError(
+                f"写入后状态仍为 {normalize_status(loaded.meta.get('status'))}, 期望 {target}"
+            )
+    except Exception as e:
+        _restore_strategy_file(path, previous_code)
+        engine.reload()
+        raise HTTPException(status_code=500, detail=f"状态迁移失败: {e}") from e
+
+    automatic = is_transition_automatic(current, target)
+    logger.info(
+        "策略 %s 生命周期迁移 %s → %s (automatic=%s): %s",
+        sid, current, target, automatic, payload.reason or "-",
+    )
+    _invalidate_strategy_runtime(request)
+    return {
+        "ok": True,
+        "strategy_id": sid,
+        "status": target,
+        "status_label": describe_status(target),
+        "previous_status": current,
+        "changed": True,
+        "automatic": automatic,
+    }
+
+
+@router.get("/{strategy_id}/lifecycle")
+def get_strategy_lifecycle(strategy_id: str, request: Request):
+    """查询单个策略的生命周期状态与判定依据。
+
+    与 status 端点分开: 前者是「当前存量状态」的只读视图, 不含回测开销;
+    绩效判定需要 walkforward 结果, 走 POST /api/strategies/{id}/lifecycle/check。
+    """
+    sid = _validate_strategy_id(strategy_id)
+    engine = _get_engine(request)
+    try:
+        s = engine.get(sid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=f"策略 {sid} 不存在") from e
+
+    current = normalize_status(s.meta.get("status"))
+    return {
+        "strategy_id": sid,
+        "status": current,
+        "status_label": describe_status(current),
+        "research_only": s.meta.get("research_only", False),
+        "source": s.source,
+        "selectable": is_selectable(current),
+        "visible": is_visible(current),
+    }
+
+
+@router.post("/{strategy_id}/lifecycle/check")
+def check_strategy_lifecycle(strategy_id: str, request: Request):
+    """对单个策略跑一次绩效判定, 返回是否建议降级 (不落盘)。
+
+    **只读预演**: 不修改策略文件。真正的降级由后台巡检任务
+    (jobs/daily_pipeline 调度) 调用内部服务执行, 避免用户手动点一下就
+    永久改掉策略状态。手动触发的价值是「先看看会怎么判」。
+    """
+    sid = _validate_strategy_id(strategy_id)
+    engine = _get_engine(request)
+    try:
+        s = engine.get(sid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=f"策略 {sid} 不存在") from e
+
+    current = normalize_status(s.meta.get("status"))
+    wf_result = _load_latest_walkforward(_data_dir(request), sid)
+    verdict = judge(
+        strategy_id=sid,
+        walkforward_result=wf_result,
+        current_status=current,
+    )
+    payload = verdict.as_dict()
+    payload["has_walkforward"] = wf_result is not None
+    return payload
+
+
+class LifecycleSweepRequest(BaseModel):
+    """批量巡检请求。"""
+
+    #: True = 只出报告(不改任何策略状态); False = 执行降级落盘。
+    #: 默认 True —— 首次上线应先看报告核对阈值, 确认无误再开自动降级。
+    dry_run: bool = True
+
+
+def _sharpe_baseline(data_dir: Path) -> tuple[int | None, float | None]:
+    """统计同批策略的夏普分布, 作为 deflated Sharpe 的 EM 基准。
+
+    委托给 `app.services.strategy_lifecycle.sharpe_baseline` —— EM 基准的
+    取数口径必须全局一致, 若 API 与调度各自实现一份, 会出现"手工巡检和
+    定时巡检结论不同"这种极难排查的不一致。
+    """
+    return sharpe_baseline(data_dir)
+
+
+@router.post("/lifecycle/sweep")
+def sweep_lifecycle(payload: LifecycleSweepRequest, request: Request):
+    """批量巡检所有 active 策略的绩效状态。
+
+    dry_run=True(默认)只返回降级建议清单, 不改任何策略;
+    dry_run=False 时把 active→watch 的降级真正写入策略文件, 走与
+    /status 端点相同的四段式安全写入(改写 → reload 断言 → 失败回滚)。
+
+    之所以默认 dry_run: 自动降级会改变策略是否进自动选股池, 首次上线
+    应先人工核对阈值是否合理(尤其 degradation 是按 objective 分别定阈的),
+    确认无误再开启自动落盘。
+    """
+    engine = _get_engine(request)
+    data_dir = _data_dir(request)
+    n_trials, sharpe_variance = _sharpe_baseline(data_dir)
+
+    report = sweep_strategy_lifecycle(
+        data_dir,
+        engine,
+        n_trials=n_trials,
+        sharpe_variance=sharpe_variance,
+    )
+
+    # 统一响应结构: 无论是否落盘, applied_* / failed 字段都存在且为列表。
+    # 否则前端/调用方要在 dry_run 分支与落盘分支之间判断字段是否存在 ——
+    # 曾因此让"无降级建议"的响应缺 applied_count 而 KeyError。
+    report.setdefault("applied_detail", [])
+    report.setdefault("failed", [])
+    report.setdefault("applied_count", 0)
+    report["dry_run"] = payload.dry_run
+
+    if payload.dry_run or not report.get("degraded"):
+        return report
+
+    # 实际落盘: 逐个降级, 单个失败不影响其余
+    applied: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for record in report["degraded"]:
+        sid = record["strategy_id"]
+        try:
+            result = set_strategy_status(
+                sid,
+                StrategyStatusRequest(
+                    status="watch",
+                    reason=f"自动绩效降级: {record.get('reason', '')}"[:500],
+                ),
+                request,
+            )
+            applied.append({"strategy_id": sid, "result": result})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("自动降级落盘失败 %s: %s", sid, exc)
+            failed.append({"strategy_id": sid, "error": str(exc)})
+
+    report["applied"] = True
+    report["dry_run"] = False
+    report["applied_count"] = len(applied)
+    report["applied_detail"] = applied
+    report["failed"] = failed
+    return report
 
 
 @router.delete("/{strategy_id}")

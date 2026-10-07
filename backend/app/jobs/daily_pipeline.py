@@ -910,6 +910,107 @@ def _holiday_skip(job_label: str) -> bool:
     return False
 
 
+def _strategy_lifecycle_task(app_state) -> dict | None:
+    """策略生命周期绩效巡检 (调度入口)。
+
+    判定逻辑在 `app.services.strategy_lifecycle.sweep_strategy_lifecycle`
+    (纯判定, 不依赖 web 框架); 本函数只负责调度编排:
+      1. 节假日门控 + 依赖就绪检查 (fail-closed)
+      2. 每日幂等 claim —— 同一天只跑一次, 重启不重复消耗
+      3. 调用判定; **只有显式开启自动降级时才落盘**, 默认只记报告
+
+    自动降级会改变策略是否进自动选股池, 故默认 dry_run: 首上线先看报告,
+    人工核对 degradation 阈值(按 objective 分别定, 量纲差异大)再开落盘。
+    """
+    from app.services import strategy_lifecycle as lifecycle_svc
+    from app.services import walkforward_store
+
+    if _holiday_skip("strategy_lifecycle"):
+        return None
+
+    state = app_state
+    engine = getattr(state, "strategy_engine", None) if state else None
+    repo = getattr(state, "repo", None) if state else None
+    if engine is None or repo is None:
+        logger.warning("strategy_lifecycle 跳过: 引擎或 repo 未初始化")
+        return None
+
+    config = _prefs.get_strategy_lifecycle_schedule()
+    if not config["enabled"]:
+        return None
+
+    data_dir = repo.store.data_dir
+    # 每日幂等claim: 同一天重复触发(含重启后补跑)只执行一次。
+    # 巡检是"读缓存 + 判定 + 可选降级", 重复跑除浪费外还会让降级日志变噪声。
+    from app.services.mining_schedule import beijing_date
+
+    claim_dir = data_dir / "strategy_lifecycle"
+    claim_dir.mkdir(parents=True, exist_ok=True)
+    claim_file = claim_dir / f"_claim_{beijing_date().isoformat()}.json"
+    if claim_file.exists():
+        logger.info("strategy_lifecycle 跳过: 今日已巡检(%s)", claim_file.name)
+        return None
+    claim_file.write_text('{"claimed": true}', encoding="utf-8")
+
+    n_trials, sharpe_variance = lifecycle_svc.sharpe_baseline(data_dir)
+    report = lifecycle_svc.sweep_strategy_lifecycle(
+        data_dir,
+        engine,
+        n_trials=n_trials,
+        sharpe_variance=sharpe_variance,
+    )
+
+    degraded = report.get("degraded") or []
+    logger.info(
+        "strategy_lifecycle 巡检完成: examined=%s degraded=%s healthy=%s skipped=%s",
+        report.get("examined"), len(degraded),
+        len(report.get("healthy") or []), len(report.get("skipped") or []),
+    )
+    for record in degraded:
+        logger.warning(
+            "策略 %s 绩效衰退建议降级 active → watch: %s",
+            record.get("strategy_id"), record.get("reason"),
+        )
+
+    # 默认只报告不落盘; 需用户在偏好里显式开启 auto_degrade。
+    # 落盘路径复用 api 的四段式安全写入(改写 → reload 断言 → 失败回滚)。
+    if not config.get("auto_degrade") or not degraded:
+        return report
+
+    # set_strategy_status 只需要 request.app.state, 用 SimpleNamespace 造一个
+    # 最小 Request 替身即可 —— 避免为了落盘去构造完整 FastAPI Request。
+    from types import SimpleNamespace
+
+    from app.api.strategy import StrategyStatusRequest, set_strategy_status
+
+    fake_request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    applied, failed = [], []
+    for record in degraded:
+        sid = record.get("strategy_id")
+        if not sid:
+            continue
+        try:
+            set_strategy_status(
+                sid,
+                StrategyStatusRequest(
+                    status="watch",
+                    reason=f"自动绩效降级: {record.get('reason', '')}"[:500],
+                ),
+                fake_request,
+            )
+            applied.append(sid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("strategy_lifecycle 自动降级失败 %s: %s", sid, exc)
+            failed.append({"strategy_id": sid, "error": str(exc)})
+
+    report["applied"] = True
+    report["applied_detail"] = applied
+    report["failed"] = failed
+    logger.info("strategy_lifecycle 自动降级: 成功 %s 个, 失败 %s 个", len(applied), len(failed))
+    return report
+
+
 def _scheduled_job(fn, job_label: str) -> bool:
     """调度入口: 先过节假日门控, 再走 JobStore 跟踪。返回是否真正执行成功。"""
     if _holiday_skip(job_label):
@@ -1331,6 +1432,26 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         _register_review_job(scheduler, repo, review_sched["hour"], review_sched["minute"])
         logger.info("scheduled_review enabled @%02d:%02d mon-fri",
                     review_sched["hour"], review_sched["minute"])
+
+    # 策略生命周期绩效巡检: 用 walkforward 退化度 + deflated Sharpe 把衰退策略
+    # 自动降级为 watch。**默认关闭**(preferences 开关), 首启只跑报告便于人工核对阈值。
+    lifecycle_sched = _prefs.get_strategy_lifecycle_schedule()
+    if lifecycle_sched["enabled"]:
+        def _strategy_lifecycle_sweep():
+            _strategy_lifecycle_task(_get_app_state())
+        scheduler.add_job(
+            _strategy_lifecycle_sweep,
+            trigger=CronTrigger(day_of_week="mon-fri",
+                                hour=lifecycle_sched["hour"],
+                                minute=lifecycle_sched["minute"],
+                                timezone="Asia/Shanghai"),
+            id="strategy_lifecycle",
+            misfire_grace_time=3600,
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info("strategy_lifecycle enabled @%02d:%02d mon-fri",
+                    lifecycle_sched["hour"], lifecycle_sched["minute"])
 
     scheduler.start()
     logger.info("scheduler started; instruments@%02d:%02d, pipeline@%02d:%02d, depth@%02d:%02d mon-fri",

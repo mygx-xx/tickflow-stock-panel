@@ -658,6 +658,50 @@ def set_mining_schedule(enabled: bool, weekday: int, profile: str) -> dict:
     return result
 
 
+def get_strategy_lifecycle_schedule() -> dict:
+    """策略生命周期巡检调度配置。默认关闭。
+
+    默认 16:30: 在盘后管道(默认 15:35)与定时复盘(默认 15:40)之后,
+    此时当日行情口径已定版, 巡检读到的缓存最完整。
+
+    `auto_degrade` 是**第二道闸**: 它控制巡检结果是否真正落盘。
+    - enabled=False: 连job 都不注册(完全关闭)。
+    - enabled=True + auto_degrade=False: 每天跑一遍但**只记报告**,
+      人工核对阈值后再决定是否开启自动降级(推荐的首启姿势)。
+    - auto_degrade=True: 衰退策略自动 active → watch。
+
+    两级开关的必要性: 自动降级会把策略移出自动选股池, 阈值又是按 objective
+    分别定的(absolutely量纲差异大), 首上线必须先看报告确认阈值合理。
+    """
+    d = load().get("strategy_lifecycle_schedule", {})
+    if not isinstance(d, dict):
+        d = {}
+    enabled = d.get("enabled", False)
+    auto_degrade = d.get("auto_degrade", False)
+    return {
+        "enabled": bool(enabled) if isinstance(enabled, bool) else False,
+        "auto_degrade": bool(auto_degrade) if isinstance(auto_degrade, bool) else False,
+        "hour": d.get("hour", 16) if isinstance(d.get("hour", 16), int) else 16,
+        "minute": d.get("minute", 30) if isinstance(d.get("minute", 30), int) else 30,
+    }
+
+
+def set_strategy_lifecycle_schedule(
+    enabled: bool, hour: int, minute: int, auto_degrade: bool = False
+) -> dict:
+    """保存策略生命周期巡检调度。auto_degrade 默认 False(只报告不落盘)。"""
+    h = max(0, min(23, hour if isinstance(hour, int) else 16))
+    m = max(0, min(59, minute if isinstance(minute, int) else 30))
+    result = {
+        "enabled": bool(enabled),
+        "auto_degrade": bool(auto_degrade),
+        "hour": h,
+        "minute": m,
+    }
+    save({"strategy_lifecycle_schedule": result})
+    return result
+
+
 def get_review_push_channels() -> list[str]:
     """复盘推送渠道(多选) — 选定的外部工具列表, 复盘归档后逐个推送。
 
