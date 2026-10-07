@@ -35,7 +35,21 @@ jobs:
         run: uv sync --extra dev --frozen
 
       - name: 后端全量测试
-        run: uv run pytest tests -q
+        run: uv run pytest tests -q -rf
+
+      # 把失败详情推到 GitHub 的 Checks 面板: 否则 Actions 页只有一行
+      # "process exited with code 1", 还得重新下载 200MB 日志才能定位。
+      # 这正是本 workflow 连续失败 10 次却难以定位的原因 —— 可见的日志
+      # 才是可排查的前提。
+      - name: 上报失败详情
+        if: failure()
+        run: |
+          {
+            echo "### pytest 失败摘要"
+            echo '```'
+            uv run pytest tests -q -rf --tb=short 2>&1 | tail -120
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   frontend:
     runs-on: ubuntu-latest
