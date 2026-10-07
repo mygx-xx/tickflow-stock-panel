@@ -123,3 +123,6 @@ research_pdfs/
 
 # ===== 策略研究笔记 (个人分析文档, 不入库) =====
 scripts/strategy-tools/
+
+# ===== dev-daemon 运行时状态 (PID 文件 / 重启限流记录, 本机专属) =====
+logs/dev/state/
