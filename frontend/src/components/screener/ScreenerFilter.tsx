@@ -18,9 +18,28 @@ export interface ScreenerFilter {
   volRatioMin: string    // 量比最小
   rsiMin: string
   rsiMax: string
+  turnoverMin: string    // 换手率最小(%)
+  turnoverMax: string    // 换手率最大(%)
+  amplitudeMin: string   // 振幅最小(%)
+  amplitudeMax: string   // 振幅最大(%)
+  volumeMin: string      // 成交量最小(万手)
+  volumeMax: string      // 成交量最大(万手)
+  limitUpMin: string     // 连板数最小值(≥), 0/空=不筛选
+  highGapMin: string     // 距 60 日最高价的幅度下限(%): 0=仅创 60 日新高, -5=距高点 5% 以内
+  signals: string[]      // 技术信号(与): 行内 signal_* 字段须全部为 true
   boards: string[]       // 板块筛选: 空数组=不筛选, 否则只保留选中的板块
   excludeST: boolean     // 是否排除 ST/*ST/退市股
 }
+
+/** 可选的技术信号开关 — key 直接对应结果行里的布尔字段(后端 enriched 输出)。 */
+export const SIGNAL_OPTIONS: { key: string; label: string; title: string }[] = [
+  { key: 'signal_limit_up', label: '涨停', title: '当日涨停' },
+  { key: 'signal_volume_surge', label: '放量', title: '成交量显著放大' },
+  { key: 'signal_macd_golden', label: 'MACD金叉', title: 'MACD DIF 上穿 DEA' },
+  { key: 'signal_ma_golden_5_20', label: '均线金叉', title: 'MA5 上穿 MA20' },
+  { key: 'signal_n_day_high', label: '阶段新高', title: '创 N 日新高' },
+  { key: 'signal_boll_breakout_upper', label: '破布林上轨', title: '收盘突破布林上轨' },
+]
 
 export const defaultFilter: ScreenerFilter = {
   priceMin: '', priceMax: '',
@@ -31,16 +50,22 @@ export const defaultFilter: ScreenerFilter = {
   floatCapMin: '', floatCapMax: '',
   volRatioMin: '',
   rsiMin: '', rsiMax: '',
+  turnoverMin: '', turnoverMax: '',
+  amplitudeMin: '', amplitudeMax: '',
+  volumeMin: '', volumeMax: '',
+  limitUpMin: '',
+  highGapMin: '',
+  signals: [],
   boards: [],
   excludeST: false,
 }
 
+/**
+ * 生效判定 / 计数统一走 countActiveFilters —— 旧实现用 Object.entries 遍历,
+ * `signals: []` 这类数组字段会因 `[] !== ''` 恒真, 必须避免。
+ */
 export function filterActive(f: ScreenerFilter): boolean {
-  if (f.boards.length > 0) return true
-  if (f.excludeST) return true
-  return Object.entries(f).some(([k, v]) =>
-    k !== 'boards' && k !== 'excludeST' && v !== '' && v !== false,
-  )
+  return countActiveFilters(f) > 0
 }
 
 export function countActiveFilters(f: ScreenerFilter): number {
@@ -53,6 +78,12 @@ export function countActiveFilters(f: ScreenerFilter): number {
   if (f.floatCapMin || f.floatCapMax) n++
   if (f.volRatioMin) n++
   if (f.rsiMin || f.rsiMax) n++
+  if (f.turnoverMin || f.turnoverMax) n++
+  if (f.amplitudeMin || f.amplitudeMax) n++
+  if (f.volumeMin || f.volumeMax) n++
+  if (f.limitUpMin) n++
+  if (f.highGapMin) n++
+  if (f.signals.length > 0) n++
   if (f.boards.length > 0) n++
   if (f.excludeST) n++
   return n
@@ -100,6 +131,34 @@ export function applyFilter(rows: any[], f: ScreenerFilter): any[] {
     const rsi = r.rsi_14 ?? 0
     if (v(f.rsiMin) != null && rsi < v(f.rsiMin)!) return false
     if (v(f.rsiMax) != null && rsi > v(f.rsiMax)!) return false
+    // 换手率(%) — enriched 存储列已是百分比
+    const turnover = r.turnover_rate ?? 0
+    if (v(f.turnoverMin) != null && turnover < v(f.turnoverMin)!) return false
+    if (v(f.turnoverMax) != null && turnover > v(f.turnoverMax)!) return false
+    // 振幅(%) — 存储为小数, 与涨跌幅同口径
+    const amp = (r.amplitude ?? 0) * 100
+    if (v(f.amplitudeMin) != null && amp < v(f.amplitudeMin)!) return false
+    if (v(f.amplitudeMax) != null && amp > v(f.amplitudeMax)!) return false
+    // 成交量(万手) — 存储单位为手
+    const vol = (r.volume ?? 0) / 1e4
+    if (v(f.volumeMin) != null && vol < v(f.volumeMin)!) return false
+    if (v(f.volumeMax) != null && vol > v(f.volumeMax)!) return false
+    // 连板数(≥)
+    if (v(f.limitUpMin) != null && (r.consecutive_limit_ups ?? 0) < v(f.limitUpMin)!) return false
+    // 距 60 日高点(%): 取幅度下限。0 表示仅保留创 60 日新高的个股; -5 表示
+    // 距高点 5% 以内。无 60 日高点数据(次新/停牌)无法判定 → 视为不满足。
+    if (v(f.highGapMin) != null) {
+      const high60 = Number(r.high_60d ?? 0)
+      if (!(high60 > 0)) return false
+      const gap = (close / high60 - 1) * 100
+      if (gap < v(f.highGapMin)!) return false
+    }
+    // 技术信号(与): 行内 signal_* 布尔字段须全部为 true
+    if (f.signals.length > 0) {
+      for (const key of f.signals) {
+        if (!r[key]) return false
+      }
+    }
     return true
   })
 }
@@ -121,22 +180,37 @@ export function FilterPanel({ value, onChange, onClose, onReset }: {
     onChange({ ...value, boards: next })
   }
 
-  // 数值字段只引用 string 类型的 key (排除 boards/excludeST), 避免类型混乱
+  // 数值字段只引用 string 类型的 key (排除 signals/boards/excludeST), 避免类型混乱
   type NumKey = keyof Pick<ScreenerFilter,
     'priceMin' | 'priceMax' | 'changePctMin' | 'changePctMax' |
     'momentum5dMin' | 'momentum5dMax' | 'amountMin' |
     'marketCapMin' | 'marketCapMax' | 'floatCapMin' | 'floatCapMax' |
-    'volRatioMin' | 'rsiMin' | 'rsiMax'>
-  const fields: { label: string; min: NumKey; max: NumKey; unit: string; step?: string }[] = [
+    'volRatioMin' | 'rsiMin' | 'rsiMax' |
+    'turnoverMin' | 'turnoverMax' | 'amplitudeMin' | 'amplitudeMax' |
+    'volumeMin' | 'volumeMax' | 'limitUpMin' | 'highGapMin'>
+  // single: 'min' | 'max' 表示单向字段(只渲染一个输入框), 决定占位文案
+  const fields: { label: string; min: NumKey; max: NumKey; unit: string; step?: string; single?: 'min' | 'max'; title?: string }[] = [
     { label: '现价',      min: 'priceMin',      max: 'priceMax',      unit: '元', step: '0.1' },
     { label: '涨跌幅',    min: 'changePctMin',   max: 'changePctMax',  unit: '%' },
     { label: '5日涨幅',   min: 'momentum5dMin',  max: 'momentum5dMax', unit: '%' },
-    { label: '成交额',    min: 'amountMin',      max: 'amountMin',     unit: '亿', step: '0.5' },
+    { label: '成交额',    min: 'amountMin',      max: 'amountMin',     unit: '亿', step: '0.5', single: 'min' },
     { label: '总市值',    min: 'marketCapMin',   max: 'marketCapMax',  unit: '亿', step: '10' },
     { label: '流通市值',  min: 'floatCapMin',    max: 'floatCapMax',   unit: '亿', step: '10' },
-    { label: '量比',      min: 'volRatioMin',    max: 'volRatioMin',   unit: '', step: '0.1' },
+    { label: '量比',      min: 'volRatioMin',    max: 'volRatioMin',   unit: '', step: '0.1', single: 'min' },
     { label: 'RSI14',     min: 'rsiMin',         max: 'rsiMax',        unit: '', step: '1' },
+    { label: '换手率',    min: 'turnoverMin',    max: 'turnoverMax',   unit: '%', step: '0.5' },
+    { label: '振幅',      min: 'amplitudeMin',   max: 'amplitudeMax',  unit: '%', step: '0.5' },
+    { label: '成交量',    min: 'volumeMin',      max: 'volumeMax',     unit: '万手', step: '1' },
+    { label: '连板',      min: 'limitUpMin',     max: 'limitUpMin',    unit: '板', step: '1', single: 'min', title: '连板数下限(≥)' },
+    { label: '距60日高',  min: 'highGapMin',     max: 'highGapMin',    unit: '%', step: '0.5', single: 'min', title: '距 60 日最高价的幅度下限; 填 0 只看创 60 日新高, 填 -5 看距高点 5% 以内' },
   ]
+
+  const toggleSignal = (key: string) => {
+    const next = value.signals.includes(key)
+      ? value.signals.filter(k => k !== key)
+      : [...value.signals, key]
+    onChange({ ...value, signals: next })
+  }
 
   return (
     <div className="rounded-card border border-accent/30 bg-accent/[0.03] p-4 space-y-3">
@@ -208,12 +282,13 @@ export function FilterPanel({ value, onChange, onClose, onReset }: {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2.5">
         {fields.map((f) => {
           const isRange = f.min !== f.max
+          const singleMax = !isRange && f.single === 'max'
           return (
-            <div key={f.label} className="flex items-center gap-1.5">
+            <div key={f.label} className="flex items-center gap-1.5" title={f.title}>
               <span className="text-[11px] text-secondary shrink-0 w-14 text-right">{f.label}</span>
               <input
                 type="number"
-                placeholder="最小"
+                placeholder={singleMax ? '最大' : '最小'}
                 value={value[f.min]}
                 onChange={(e) => set(f.min, e.target.value)}
                 step={f.step}
@@ -237,7 +312,31 @@ export function FilterPanel({ value, onChange, onClose, onReset }: {
           )
         })}
       </div>
-      <div className="text-[10px] text-muted/70 pl-1">输入即生效 · 点击市场/ST 按钮切换</div>
+
+      {/* 技术信号 (与): 全部为 true 才保留 */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-[11px] text-secondary shrink-0 w-14 text-right">技术信号</span>
+        {SIGNAL_OPTIONS.map(sig => {
+          const active = value.signals.includes(sig.key)
+          return (
+            <button
+              key={sig.key}
+              onClick={() => toggleSignal(sig.key)}
+              title={sig.title}
+              className={`px-2 py-0.5 rounded text-[11px] transition-colors cursor-pointer ${
+                active
+                  ? 'bg-accent/15 text-accent'
+                  : 'bg-elevated text-secondary hover:text-foreground hover:bg-elevated/80'
+              }`}
+            >
+              {sig.label}
+            </button>
+          )
+        })}
+      </div>
+      <div className="text-[10px] text-muted/70 pl-1">
+        输入即生效 · 点击市场/ST/信号按钮切换 · 信号之间为「与」关系
+      </div>
     </div>
   )
 }
