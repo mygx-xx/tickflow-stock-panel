@@ -10,7 +10,7 @@ import logging
 import math
 import re
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1648,3 +1648,92 @@ def reload_strategies(request: Request):
         raise HTTPException(status_code=400, detail=str(e)) from e
     _invalidate_strategy_runtime(request)
     return {"ok": True, "count": len(engine.list_strategies())}
+
+
+# ── 策略导出(备份/迁移) ────────────────────────────────────────────────
+# 为什么需要: data/strategies 被 .gitignore 排除(data/**), 152 个自定义策略
+# 只存在于本机磁盘, 没有版本控制也没有备份 —— 误删或磁盘故障即全部丢失。
+#
+# 导出内容 = 源码(权威, 含 META 与计算逻辑) + 元信息 + 用户参数覆盖, 可完整还原。
+#
+# 独立 prefix 是必须的: 本文件已有 `@router.get("/{strategy_id}")`, 若把导出
+# 放在同一 router 下, `/export-all` 会被当成 strategy_id="export-all" 而 404。
+
+bundle_router = APIRouter(prefix="/api/strategy-bundle", tags=["strategy"])
+
+
+def _bundle_entry(data_dir: Path, engine: StrategyEngine, s: StrategyDef) -> dict:
+    """单个策略的导出条目。源码读不到时降级为 code_missing, 不让整包失败。"""
+    from app.strategy.lifecycle import normalize_status
+
+    code = None
+    rel = None
+    if s.file_path:
+        try:
+            rel = str(s.file_path.relative_to(data_dir))
+        except ValueError:
+            rel = str(s.file_path)
+        try:
+            code = s.file_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("策略导出读源码失败 %s: %s", s.meta.get("id"), e)
+    return {
+        "id": s.meta["id"],
+        "name": s.meta.get("name", ""),
+        "description": s.meta.get("description", ""),
+        "source": s.source,
+        "status": normalize_status(s.meta.get("status")),
+        "research_only": bool(s.meta.get("research_only")),
+        "file_path": rel,
+        "meta": s.meta,
+        "overrides": strategy_config.load_override(data_dir, s.meta["id"]) or {},
+        "code": code,
+    }
+
+
+def _bundle_payload(data_dir: Path, engine: StrategyEngine, strategies: list[StrategyDef]) -> dict:
+    from app import __version__
+
+    entries = [_bundle_entry(data_dir, engine, s) for s in strategies]
+    missing = [e["id"] for e in entries if e["code"] is None]
+    return {
+        "format": "tickflow-strategy-bundle",
+        "format_version": 1,
+        "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "app_version": __version__,
+        "count": len(entries),
+        "code_missing": missing,
+        "strategies": entries,
+    }
+
+
+@bundle_router.get("/export-all")
+def export_all_strategies(request: Request):
+    """导出全部策略为一个 JSON 包 (灾备)。查询参数 source/status 可过滤。"""
+    engine = _get_engine(request)
+    data_dir = _data_dir(request)
+    include_research = request.query_params.get("include_research") == "1"
+    source_filter = request.query_params.get("source")
+    status_filter = request.query_params.get("status")
+
+    from app.strategy.lifecycle import normalize_status
+
+    picked = []
+    for s in engine.strategy_definitions():
+        meta = s.meta
+        if meta.get("research_only") and not include_research:
+            continue
+        if source_filter and s.source != source_filter:
+            continue
+        if status_filter and normalize_status(meta.get("status")) != status_filter:
+            continue
+        picked.append(s)
+    return _bundle_payload(data_dir, engine, picked)
+
+
+@bundle_router.get("/{strategy_id}")
+def export_one_strategy(strategy_id: str, request: Request):
+    """导出单个策略 (含源码), 用于分享/迁移到另一套部署。"""
+    engine = _get_engine(request)
+    s = _get_public_strategy(engine, strategy_id)
+    return _bundle_payload(_data_dir(request), engine, [s])
