@@ -66,8 +66,15 @@ SHARED_DATA_DIRS=(
   # regime/phase 的**唯一数据源**(part.parquet, 含 state/score/phase 全序列)。
   # 必须联接共享: 独立成空目录时, 新 worktree 的 regime/phase 全空,
   # 市场环境页与「阶段接入挖掘/回测」这类开发都无从下手(2026-10-07 踩到)。
-  # 写盘风险可控: 只有执行 /api/regime/recompute 时才会 upsert,
-  # 正常开发只读。介意的话用 -b 之外的手段: 手动删掉联接再单独跑一次重算。
+  #
+  # 写盘入口已逐一核实(2026-10-07), 共两个, 都是「全量 upsert」语义:
+  #   1) api/regime.py:161upsert_regime_history   ← recompute 接口
+  #   2) api/regime.py:170 upsert_mainline_history ← recompute 同函数内 concept/industry 双写
+  # regime_builder.py:549 的实现是「读旧 → 按 date anti-join → concat → 写回同一文件」,
+  # 所以联接状态下重算会**改写主树 parquet**, 且新列会以 null 自动补齐
+  # (schema 会随代码演进而静默迁移, 主树可能突然多出几列)。
+  # → 结论: 联接期间严禁在任何树点「重算市场环境」。只读取证无风险。
+  # 需要重算时: 先删本树联接(变独立实体目录)再算, 或接受主树被同步更新。
   regime_history
   mainline_history
 )
