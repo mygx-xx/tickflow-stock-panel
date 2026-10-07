@@ -36,10 +36,10 @@ logger = logging.getLogger(__name__)
 # 尾盘定版线: quote_ts 达到当日 15:00 即视为收盘后写入 (含 close_final 定版)
 CLOSE_CUTOFF = dt_time(15, 0)
 
-# 扫描窗口: 最近 N 个自然日内、今天之前的交易日
+# 扫描窗口: 最近 N 个**交易日**内、今天之前的交易日 (按交易日回溯, 长假不缩水)
 SCAN_WINDOW_DAYS = 7
 
-# 自动修复窗口: 最早坏日距今超过 N 个自然日 → 只报告不自动修 (更大缺口由用户手动 repair)
+# 自动修复窗口: 最早坏日距今超过 N 个**交易日** → 只报告不自动修 (更大缺口由用户手动 repair)
 AUTO_REPAIR_MAX_LAG_DAYS = 5
 
 # 参与检测的日K族表 (实时 flush 会写这三族的 daily/enriched)
@@ -168,20 +168,27 @@ def _partition_is_snapshot(day: date, part_dir: Path, quote_ts_max_ms: int | Non
 
 
 def _candidate_days(today: date, lookback_days: int) -> list[date]:
-    """最近 lookback_days 自然日内、严格早于今天的交易日。
+    """最近 lookback_days 个**交易日** (严格早于 today)。
 
-    fuyao 交易日历可用时按真实日历过滤 (休市日不进候选, 消除节假日误报 —
+    fuyao 交易日历可用时按真实日历回溯 (休市日不进候选, 消除节假日误报 —
     2026 中秋 09-25 休市日曾被当缺失日, realtime_gate 409 死锁);
     从未取到日历时回退工作日近似 (历史行为)。
+
+    为什么按交易日回溯而不是「N 个自然日」(2026-10-08 长假后修复):
+      自然日窗口在长假后**装不下 N 个交易日** —— 国庆 09-30 休市至 10-07,
+      取 7 个自然日内只有 10-08 一个交易日, 于是真实存在的 09-30 坏分区
+      永远扫不到: 自检显示"数据完整"、realtime_gate 不拦、管道也不会自愈,
+      而用户看到的是"停了 8 天没人管"。改为在日历上往前数 N 个交易日, 窗口
+      长度不再随假期长度缩水。
     """
     calendar = trading_day.trading_calendar()
+    if calendar is not None:
+        earlier = sorted(d for d in calendar if d < today)
+        return earlier[-lookback_days:] if lookback_days > 0 else []
     days: list[date] = []
     for offset in range(1, lookback_days + 1):
         d = today - timedelta(days=offset)
-        if calendar is not None:
-            if d in calendar:
-                days.append(d)
-        elif d.weekday() < 5:
+        if d.weekday() < 5:
             days.append(d)
     return sorted(days)
 
@@ -249,10 +256,30 @@ def earliest_issue_day(
 
 
 def within_auto_repair_window(day: date | None, *, today: date | None = None) -> bool:
-    """最早坏日是否落在自动修复窗口内 (≤ AUTO_REPAIR_MAX_LAG_DAYS 自然日)。"""
+    """最早坏日是否落在自动修复窗口内 (≤ AUTO_REPAIR_MAX_LAG_DAYS 个交易日)。
+
+    同样按**交易日**而非自然日计 (2026-10-08 长假后修复): 自然日阈值在长假后
+    会把真实缺口误判成"超窗", 于是 boot 自检与管道都静默放弃修复 —— 用户视角
+    就是"数据停了 8 天, 系统却说一切正常"。交易日阈值下 5 个交易日 = 覆盖
+    一个长假, 语义也与「落后 5 个交易日就该补」一致。
+    """
     if day is None:
         return False
     today = today or datetime.now(CN_TZ).date()
+    if day >= today:
+        return True
+    calendar = trading_day.trading_calendar()
+    if calendar is not None:
+        # 坏日之后、今天之前的交易日数 = "滞后几个交易日"(今天本身不算滞后)。
+        #
+        # n == 0 时不能按自然日兜底: 那正是长假分支 —— 09-30 → 10-08 中间
+        # 一个交易日都没有(国庆休市), 自然日跨度 8 > 5 会把真实缺口判成
+        # "超窗", 长假后的坏数据被静默放弃。中间没交易日恰恰说明"只隔了
+        # 一个长假", 数据不算陈旧, 应判在窗内。
+        n = sum(1 for d in calendar if day < d < today)
+        if n == 0:
+            return True
+        return n <= AUTO_REPAIR_MAX_LAG_DAYS
     return (today - day).days <= AUTO_REPAIR_MAX_LAG_DAYS
 
 
@@ -389,17 +416,22 @@ def launch_integrity_repair(app_state, start_date: date, reason: str) -> tuple[s
     return job_id, True
 
 
-def boot_integrity_check(app_state) -> None:
+def boot_integrity_check(app_state, *, today: date | None = None) -> None:
     """启动自检 (后台线程调用): 发现窗口内的坏数据自动创建修复任务。
 
     分钟K缺口无需单独处理 — 修复管道 Step 2.5 在 minute_sync_enabled 时
     以 start=max(datetime) 增量补洞, 天然覆盖停机缺口。
+
+    `today` 是给测试用的注入口: 本函数原先直接读系统日期, 导致"锚定某交易日"
+    的测试必须在窗口内才成立 —— 一旦跨长假(实测 09-30 的坏日 vs 10-08 的今天
+    相差 8 天 > AUTO_REPAIR_MAX_LAG_DAYS=5), 测试就静默跳过修复并失败, 而
+    生产逻辑其实是对的。现在把日期显式传下去, 默认仍取真实今天。
     """
     repo = getattr(app_state, "repo", None)
     if repo is None:
         return
     try:
-        issues = scan_recent_integrity(repo.store.data_dir)
+        issues = scan_recent_integrity(repo.store.data_dir, today=today)
     except Exception as e:  # noqa: BLE001
         logger.warning("boot integrity scan failed: %s", e)
         return
@@ -408,7 +440,7 @@ def boot_integrity_check(app_state) -> None:
         return
     earliest = earliest_issue_day(issues)
     logger.warning("boot integrity check: %s (共 %d 个坏分区)", describe_issues(issues), len(issues))
-    if not within_auto_repair_window(earliest):
+    if not within_auto_repair_window(earliest, today=today):
         logger.warning(
             "integrity: 最早坏日 %s 超出自动修复窗口(%d 天), 请在数据页手动执行数据修正",
             earliest, AUTO_REPAIR_MAX_LAG_DAYS,

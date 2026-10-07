@@ -19,7 +19,9 @@ build/
 # pytest 用例自建的临时目录(未显式指定 --basetemp 时落在 cwd 下)
 backend/tmp_*/
 tmp_*/
-# vite 构建缓存(随机名, 在 frontend/ 下)
+# vite 构建缓存(随机名, 在 frontend/ 下)。既可能是目录也可能是单文件
+# (pnpm install 生成的 0 字节锁), 故 `_*` 与 `_*` 两种都覆盖。
+frontend/_tmp_*
 frontend/_tmp_*/
 
 # ===== uv =====

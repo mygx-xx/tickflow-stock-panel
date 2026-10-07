@@ -305,9 +305,48 @@ def test_etf_family_independent(tmp_path):
 
 
 def test_auto_repair_window():
-    assert within_auto_repair_window(TODAY - timedelta(days=AUTO_REPAIR_MAX_LAG_DAYS), today=TODAY) is True
-    assert within_auto_repair_window(TODAY - timedelta(days=AUTO_REPAIR_MAX_LAG_DAYS + 1), today=TODAY) is False
-    assert within_auto_repair_window(None, today=TODAY) is False
+    """窗口按**交易日**计 (不是自然日), 边界为「滞后 ≤ N 判在窗内」。
+
+    与旧自然日口径的差异在长假后才显现: 09-30 与 10-08 之间没有交易日,
+    自然日跨度 8 天会判超窗, 交易日口径判在窗内。
+    """
+    cal = trading_day.trading_calendar()
+    today = _latest_trading_day_today()
+    earlier = [d for d in sorted(cal) if d < today]
+
+    # 边界: 「今天之前第 k 个交易日」的滞后恰为 k-1 (今天本身不算滞后)。
+    # 滞后 N 判在窗内, 滞后 N+1 判超窗 —— 与旧自然日口径的 <= 语义一致。
+    assert within_auto_repair_window(earlier[-(AUTO_REPAIR_MAX_LAG_DAYS + 1)], today=today) is True
+    assert within_auto_repair_window(earlier[-(AUTO_REPAIR_MAX_LAG_DAYS + 2)], today=today) is False
+    # 今天自身不算缺口
+    assert within_auto_repair_window(today, today=today) is True
+    assert within_auto_repair_window(None, today=today) is False
+
+
+def test_auto_repair_window_长假后仍能覆盖_自然日口径会失效():
+    """国庆 09-30 休市至 10-07, 09-30 距 10-08 有 8 个自然日且中间零交易日。
+
+    旧实现按自然日判 → 8 > 5 判为超窗, 真实存在的缺口被静默放弃修复
+    (用户视角: 数据停了 8 天, 系统却说正常)。这里直接锚定"区间内无交易日"
+    这个长假特征: 若把判定改回自然日或把 n==0 判成超窗, 本例必失败。
+    """
+    cal = trading_day.trading_calendar()
+    today = _latest_trading_day_today()
+    last_before = [d for d in sorted(cal) if d < today][-1]
+
+    # 前提: 该坏日与今天之间没有任何交易日(长假), 否则本例不成立
+    between = [d for d in cal if last_before < d < today]
+    assert not between, f"本用例要求长假区间(无中间交易日), 实际有 {between}"
+
+    # 自然日跨度已超阈值 —— 旧口径会因此判超窗
+    assert (today - last_before).days > AUTO_REPAIR_MAX_LAG_DAYS, (
+        "本用例要求自然日跨度已超阈值, 否则测不到自然日口径的缺陷"
+    )
+    # 但交易日口径必须判在窗内(数据只落后一个长假, 不算陈旧)
+    assert within_auto_repair_window(last_before, today=today) is True, (
+        f"长假后 {(today - last_before).days} 个自然日的缺口被判为超窗 —— "
+        "窗口必须按交易日计, 且区间无交易日时不得判超窗"
+    )
 
 
 # ── enriched 分区删除 ───────────────────────────────────────────────
@@ -567,21 +606,13 @@ def test_boot_check_launches_repair_within_window(tmp_path, monkeypatch):
     _write_daily_partition(data_dir, "kline_daily", probe, _ts_ms(probe, time(11, 58)))
     _write_daily_partition(data_dir, "kline_daily", latest_day, _ts_ms(latest_day, time(10, 0)))
 
-    real_scan = data_integrity.scan_recent_integrity
-    monkeypatch.setattr(
-        data_integrity, "scan_recent_integrity",
-        lambda d, **kw: real_scan(d, today=latest_day, **kw),
-    )
-    real_window = data_integrity.within_auto_repair_window
-    monkeypatch.setattr(
-        data_integrity, "within_auto_repair_window",
-        lambda day, **kw: real_window(day, today=latest_day, **kw),
-    )
-
+    # scan_recent_integrity / within_auto_repair_window 都接受 today 关键字,
+    # 直接用真实实现即可(boot_integrity_check 会把 today 透传下去), 不再需要
+    # 包一层 lambda —— 那反而会和被测函数传的 today 撞成 "multiple values"。
     state = SimpleNamespace(
         repo=SimpleNamespace(store=SimpleNamespace(data_dir=data_dir)),
     )
-    data_integrity.boot_integrity_check(state)
+    data_integrity.boot_integrity_check(state, today=latest_day)
     assert launched == [probe]
 
 

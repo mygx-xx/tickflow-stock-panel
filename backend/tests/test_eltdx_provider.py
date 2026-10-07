@@ -8,10 +8,11 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY
 
 import polars as pl
@@ -503,10 +504,18 @@ def test_test_dataset_reports_error_for_undeclared() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_availability_ok_when_eltdx_installed(monkeypatch) -> None:
-    """inproc 模式: 依赖可 import 即可用。"""
+def test_availability_true_when_eltdx_importable(monkeypatch) -> None:
+    """inproc 模式: 依赖可 import 即可用。
+
+    eltdx 是**可选依赖**(未在 pyproject/lock 中声明), 所以这里不能假设它已安装 ——
+    否则 CI 上(只装 dev extra)必然失败。改为用 import 注入构造"已安装"态,
+    断言契约本身, 而不是断言某个环境事实。
+    """
     monkeypatch.setenv("ELTDX_TRANSPORT", "inproc")
+    monkeypatch.setitem(sys.modules, "eltdx", ModuleType("eltdx"))
+
     ok, reason = availability()
+
     assert ok is True
     assert "eltdx" in reason
 
