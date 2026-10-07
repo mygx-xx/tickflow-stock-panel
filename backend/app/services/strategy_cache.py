@@ -126,13 +126,23 @@ def write_cache(
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
+    - 旁路: 把当日曾命中集合按日期归档, 供命中日报做跨日差分 (失败不影响主流程)
     """
     path = _cache_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
     with _file_lock:
-        _write_cache_locked(path, data_dir, as_of, results)
+        payload = _write_cache_locked(path, data_dir, as_of, results)
+
+    # 归档在锁外做: 它写的是另一个文件, 不该拖长主缓存的锁持有时间
+    if payload is not None:
+        try:
+            from app.services import hits_archive
+
+            hits_archive.archive(data_dir, as_of, payload.get("today_ever_matched") or {})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("命中归档旁路失败 (不影响缓存写入): %s", e)
 
 
 def _write_cache_locked(
@@ -140,8 +150,11 @@ def _write_cache_locked(
     data_dir: Path,
     as_of: str,
     results: dict[str, Any],
-) -> None:
-    """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。"""
+) -> dict | None:
+    """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。
+
+    返回落盘 payload (供调用方做旁路归档), 写盘失败返回 None。
+    """
     # 读取旧缓存 (已持锁, 走不重入的 _read_cache_unlocked)
     old = _read_cache_unlocked(data_dir)
     old_as_of = old.get("as_of") if old else None
@@ -195,5 +208,7 @@ def _write_cache_locked(
         total_rows = sum(len(r.get("rows", [])) for r in merged_results.values())
         total_ever = sum(len(v) for v in today_ever_matched.values())
         logger.info("策略缓存已写入: %s, %d 策略, %d 命中, %d 曾命中", as_of, len(merged_results), total_rows, total_ever)
+        return payload
     except Exception as e:  # noqa: BLE001
         logger.warning("写入策略缓存失败: %s", e)
+        return None

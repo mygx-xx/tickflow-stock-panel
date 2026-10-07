@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.db_safe import is_valid_ext_ident, quote_ident
-from app.services import strategy_cache, strategy_run_queue
+from app.services import hits_archive, strategy_cache, strategy_run_queue
 from app.services.screener import ScreenerService
 from app.strategy import config as strategy_config
 
@@ -409,6 +409,31 @@ def get_cached(
     return _cache_payload_with_ext(cached, ext_values)
 
 
+@router.get("/hits-daily")
+def hits_daily(
+    request: Request,
+    date: Optional[str] = Query(None, description="YYYY-MM-DD; 缺省用缓存的 as_of"),
+):
+    """命中日报 — 当日各策略命中数 + 相对上一归档日的新增/剔除。
+
+    归档由 strategy_cache.write_cache 旁路写入 (data/user_data/strategy_hits/{date}.json),
+    首个归档日没有基准, 返回 baseline=True, 此时 added/dropped 为空数组。
+    """
+    data_dir = request.app.state.repo.store.data_dir
+    as_of = date
+    if not as_of:
+        cached = strategy_cache.read_cache(data_dir)
+        as_of = (cached or {}).get("as_of")
+    if not as_of:
+        return {"date": None, "baseline": True, "reason": "no_cache", "strategies": []}
+
+    engine = getattr(request.app.state, "strategy_engine", None)
+    names: dict[str, str] = {}
+    if engine is not None:
+        names = {m["id"]: m.get("name") or m["id"] for m in engine.list_strategies(include_research=True)}
+    return hits_archive.daily_report(data_dir, as_of, names)
+
+
 @router.get("/cached-summary")
 def get_cached_summary(request: Request):
     """返回策略卡片所需的轻量摘要，不序列化股票明细。"""
@@ -471,6 +496,11 @@ def get_cached_result(
         "total": int(raw_result.get("total") or 0),
         "elapsed_ms": 0.0,
     }
+    # 数据充足性提示 (#303): run_all / 单跑写入缓存, 而本端点重建 result 对象时
+    # 会把未列出的键丢掉 —— 必须显式透传, 否则策略页首屏(走缓存)在薄库时只会
+    # 显示「今日无命中」而没有任何解释, 用户得自己跑去数据页排查。
+    if raw_result.get("warnings"):
+        result["warnings"] = raw_result["warnings"]
 
     ever_rows = None
     if cached.get("as_of") == result["as_of"]:
