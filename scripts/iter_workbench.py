@@ -291,6 +291,43 @@ def cmd_run(args: argparse.Namespace) -> None:
     tag = args.r or "adhoc"
     out_json = d / "evidence" / f"{tag}.json"
 
+    # ---- 运行配置锁定 -------------------------------------------------
+    # 协议 §3 的证据包之所以能跨轮比较, 前提是「运行配置一致」。实测踩过:
+    # 把迭代区间从 2 年改成 1 年后, 夏普 -0.44 -> 0.21, 但这是区间不同造成的,
+    # 不是策略变好 —— 极易被误读成「改动有效」。
+    # 所以把配置写进 run_config.json, 逐轮比对, 不一致直接报错。
+    cfg = {
+        "profile": args.profile,
+        "max_positions": args.max_positions,
+        "holding_days": args.holding_days,
+        "regime_states": args.regime_states or [],
+        "require_oos": bool(args.require_oos),
+        "iteration_start": start,
+        "iteration_end": end,
+    }
+    cfg_path = d / "run_config.json"
+    if cfg_path.is_file():
+        try:
+            prev = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            prev = {}
+        if prev and not args.full:
+            diffs = [
+                f"  {k}: 上一轮 {prev.get(k)!r} -> 本轮 {v!r}"
+                for k, v in cfg.items()
+                if k in prev and prev.get(k) != v
+            ]
+            if diffs:
+                raise SystemExit(
+                    "[error] 运行配置与上一轮不一致, 指标将不可比:\n"
+                    + "\n".join(diffs)
+                    + "\n\n若确实要改(如收窄区间做快速试探), 确认代价后用 --reconfig 覆盖基准。"
+                )
+    if args.reconfig or not cfg_path.is_file():
+        cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        if args.reconfig:
+            print("[warn] 已用 --reconfig 覆盖运行配置基准")
+
     cmd = [
         sys.executable, str(tool),
         "--ids", args.strategy_id,
@@ -493,6 +530,8 @@ def main() -> None:
     p.add_argument("--regime-states", nargs="*", default=None)
     p.add_argument("--require-oos", action="store_true")
     p.add_argument("--no-stage-all", action="store_true", help="不追加 --stage-all")
+    p.add_argument("--reconfig", action="store_true",
+                   help="确认要改运行配置(区间/档位/仓位)时覆盖基准, 使上一轮不可比")
     p.add_argument("--full", action="store_true",
                    help="终审模式: 跑留出集(只能用一次, 会明确警告)")
     p.set_defaults(func=cmd_run)
