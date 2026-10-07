@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.services import walkforward_store
 from app.services.backtest import (
     BacktestConfig,
     BacktestService,
@@ -1223,6 +1224,13 @@ async def walkforward_stream(
                                 task,
                                 lambda d: job.progress.append(d),
                                 job.cancel_event,
+                            )
+                            # 落盘裁剪后的结果: 供策略生命周期判定读取
+                            # (walkforward 结果原本只走 SSE 返回, 后台巡检
+                            #  无从取得绩效数据 —— 见 services/walkforward_store.py)。
+                            # 失败只告警, 不影响本次回测结果的返回。
+                            walkforward_store.save_walkforward_result(
+                                settings.data_dir, wf_cfg.strategy_id, result
                             )
                         _finish_job(job, result=result)
                     except HeavyJobCancelledError:
