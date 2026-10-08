@@ -14,6 +14,11 @@ def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         cwd=root,
         capture_output=True,
         text=True,
+        # git 输出含中文路径/内容且非 UTF-8 时, 默认 text=True 会用本地编码(gbk)
+        # 解码并抛 UnicodeDecodeError -> result.stdout 变 None -> 脚本崩溃。
+        # 显式 utf-8 + replace 保证跨平台可跑。
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if check and result.returncode != 0:
