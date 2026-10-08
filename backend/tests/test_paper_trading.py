@@ -371,6 +371,29 @@ def test_pending_buy_occupies_cash_at_fill(tmp_path, monkeypatch):
     assert cash >= 0
 
 
+def test_同刻下单仍按先到先排序(tmp_path, monkeypatch):
+    """先到先得必须可判定: created_at 撞车时撮合顺序会退化到 id 的随机后缀。
+
+    撮合的 FIFO 完全按 created_at 排 (paper._order_sort_key); 两张抢同一笔现金的
+    买单若时间戳相同, 谁先成交就变成掷骰子 —— 上面那条占用用例曾因此偶发红
+    (Windows 时钟粒度约 1 ms, 连续下单会拿到同一时刻)。这里把时钟钉死,
+    不依赖操作系统碰运气。
+    """
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    monkeypatch.setattr(paper, "cn_now", lambda: datetime(2026, 9, 24, 14, 30, tzinfo=CN_TZ))
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0), (day, 10.0, 10.0)])
+    _cap_account(tmp_path, 10_000.0)  # 只够一张 500 股 x 10 元 + 费用
+    a, _ = paper.create_order(tmp_path, SYM, "buy", qty=500, order_type="close", ref_price=10.0)
+    b, _ = paper.create_order(tmp_path, SYM, "buy", qty=500, order_type="close", ref_price=10.0)
+    # 时钟钉死 → 两张单 created_at 完全相同, 先后只能由 id 里的单调序号判出来
+    assert a["created_at"] == b["created_at"]
+    assert paper._order_sort_key(a) < paper._order_sort_key(b)
+    paper.settle_day(tmp_path, day.isoformat())
+    assert paper.get_order(tmp_path, a["id"])["status"] == "filled"
+    assert paper.get_order(tmp_path, b["id"])["status"] == "expired"
+
+
 def test_position_symbol_cap(tmp_path, monkeypatch):
     """持仓标的数上限: 第 51 只新开仓买入被拒 (加仓已有持仓不受限)。"""
     day = date(2026, 9, 24)
@@ -740,7 +763,14 @@ def test_multi_account_isolation(tmp_path, monkeypatch):
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
     _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    # 账户遍历按创建时间 (list_account_ids): Windows 时钟粒度约 1 ms, 真实时钟下
+    # 连续两次 create_account 会撞在同一微秒, 顺序退化到 id 字典序 → 下面那条
+    # ["default", "acc_a"] 断言约 3% 概率翻转 (fb210b1 实测 2/60)。显式推进时钟,
+    # 让「按创建时间」这条契约可判定。
+    clock = [datetime.combine(day, time(9, 0), tzinfo=CN_TZ)]
+    monkeypatch.setattr(paper, "cn_now", lambda: clock[0])
     paper.create_account(tmp_path, 1_000_000, account_id="default", name="主账户")
+    clock[0] += timedelta(seconds=1)
     paper.create_account(tmp_path, 500_000, account_id="acc_a", name="策略A")
 
     # 同一标的分别在两个账户各买一笔

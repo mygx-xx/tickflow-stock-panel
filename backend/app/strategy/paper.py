@@ -34,6 +34,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
@@ -56,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 # 单进程内全部写操作互斥 (API 下单 / 行情钩子撮合 / 盘后结算共用一把锁)
 PAPER_LOCK = threading.RLock()
+
+# 订单 id 的单调序号: 同一时钟刻度内下的单也保持「先到先排」(见 _new_id)
+_ID_SEQ = itertools.count()
+_ID_LOCK = threading.Lock()
 
 # 费用默认值 — 与回测 engine.py 一致
 DEFAULT_COMMISSION_PCT = 0.00025   # 双边佣金 万2.5
@@ -151,11 +156,22 @@ def _now_iso() -> str:
 
 
 def _new_id(prefix: str) -> str:
-    return f"{prefix}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    """秒戳 + 进程内单调序号 + 随机后缀。
+
+    序号必须进 id: 撮合的「先到先得」按 (created_at, id) 排, 而 Windows 时钟粒度
+    约 1 ms, 同一批连续下单会拿到完全相同的 created_at, 只剩随机后缀决定谁先成交
+    —— 相当于掷骰子。定宽 10 位保证字符串序等于序号序 (随机后缀再兜并发)。
+    """
+    with _ID_LOCK:
+        seq = next(_ID_SEQ)
+    return (
+        f"{prefix}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        f"_{seq:010d}_{uuid.uuid4().hex[:6]}"
+    )
 
 
 def _order_sort_key(order: dict) -> tuple:
-    """撮合顺序: created_at 先到先得; 同刻则按 id (内含毫秒戳+随机后缀, 稳定)。"""
+    """撮合顺序: created_at 先到先得, 同刻靠 id 里的单调序号 (见 _new_id)。"""
     return (order.get("created_at", ""), order.get("id", ""))
 
 
@@ -221,7 +237,11 @@ def save_account(data_dir: Path, acc: dict, account_id: str = DEFAULT_ACCOUNT_ID
 
 
 def list_account_ids(data_dir: Path) -> list[str]:
-    """全部账户 id (按创建时间; 供钩子/结算遍历)。"""
+    """全部账户 id (按创建时间; 供钩子/结算遍历)。
+
+    同一时刻创建的账户按 id 字典序 —— 时钟粒度内分不出先后, 而账户间账务完全隔离,
+    遍历顺序只决定展示/结算的先后, 不影响金额。
+    """
     base = accounts_base(data_dir)
     if not base.exists():
         return []
