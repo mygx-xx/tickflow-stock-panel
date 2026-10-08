@@ -14,6 +14,7 @@ monkeypatch 替换; 自定义源侧用内存 fake provider 走真实边界包装
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 
 import polars as pl
@@ -50,6 +51,9 @@ class _FakeRepo:
         from pathlib import Path
         self._inst = pl.DataFrame({"symbol": symbols})
         self.store = type("S", (), {"data_dir": Path(".")})()
+        # 落盘走 repo 的全局写锁 (KlineRepository 必有), 只被传给
+        # _write_minute_partition, 不参与本文件的断言。
+        self._write_lock = threading.Lock()
 
     def get_instruments(self) -> pl.DataFrame:
         return self._inst
@@ -144,7 +148,7 @@ def test_run_round_writes_partition_and_updates_status(tmp_path, monkeypatch):
         calls["symbols"] = list(symbols)
         return (minute_df, 1)
 
-    def fake_write(df, minute_dir):
+    def fake_write(df, minute_dir, **kw):
         calls["dir"] = minute_dir
         calls["rows"] = df.height
         return df.height
@@ -201,7 +205,7 @@ def _patch_round(monkeypatch, *, lag, inc_df, burst_df):
     )
     monkeypatch.setattr(
         "app.services.kline_sync._write_minute_partition",
-        lambda df, minute_dir: df.height,
+        lambda df, minute_dir, **kw: df.height,
     )
     return calls
 
@@ -309,7 +313,7 @@ def _patch_write(monkeypatch) -> dict:
     calls = {"rows": None}
     monkeypatch.setattr(
         "app.services.kline_sync._write_minute_partition",
-        lambda df, minute_dir: calls.update(rows=df.height) or df.height,
+        lambda df, minute_dir, **kw: calls.update(rows=df.height) or df.height,
     )
     return calls
 

@@ -35,6 +35,7 @@ import polars as pl
 
 from app.data_providers.base import AUCTION_COLUMNS, AUCTION_SCHEMA
 from app.market_time import cn_now, cn_today
+from app.services.fs_utils import atomic_write_parquet
 from app.tickflow.capabilities import Cap
 from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
 
@@ -293,10 +294,8 @@ class AuctionService:
             except Exception as e:  # noqa: BLE001
                 logger.warning("auction 旧分区读取失败(按无历史覆盖): %s", e)
         df = df.select(AUCTION_COLUMNS).sort(["symbol", "segment", "datetime"])
-        # 原子写: 临时文件 + os.replace, 读侧不会看到半写文件
-        tmp = out.with_name(out.name + ".tmp")
-        df.write_parquet(tmp)
-        os.replace(tmp, out)
+        # 原子写: 独占暂存 + 替换重试 (读侧 polars 句柄会挡住 Windows 上的替换)
+        atomic_write_parquet(df, out)
         logger.info("auction 落盘: %d 行 → %s", df.height, out)
         return True
 

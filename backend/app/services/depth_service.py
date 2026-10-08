@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import threading
 import time
 from datetime import date, time as dt_time
 
 from app.market_time import cn_now, cn_today
+from app.services.fs_utils import atomic_write_parquet
 from pathlib import Path
 
 import polars as pl
@@ -397,10 +397,8 @@ class DepthService:
         ds = today.isoformat()
         out = self._repo.store.data_dir / "depth5" / f"date={ds}" / "part.parquet"
         out.parent.mkdir(parents=True, exist_ok=True)
-        # 原子写: 先写临时文件再 os.replace, 避免读侧 (get_sealed_map) 读到半写 parquet
-        tmp = out.with_name(out.name + ".tmp")
-        df.write_parquet(tmp)
-        os.replace(tmp, out)
+        # 原子写: 独占暂存 + 替换重试, 避免读侧 (get_sealed_map) 读到半写 parquet
+        atomic_write_parquet(df, out)
         self._persisted_date = today
         logger.info("depth sealed 落盘: %d 行 → %s", df.height, out)
 

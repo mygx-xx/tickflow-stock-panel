@@ -12,10 +12,8 @@
 """
 from __future__ import annotations
 
-import io
 import json
 import logging
-import os
 import sys
 import threading
 import time
@@ -37,6 +35,11 @@ from app.enriched_generation import (
 from app.market_time import cn_today
 from app.parquet import scan_enriched_parquet
 from app.polars_guard import guarded_collect
+from app.services.fs_utils import (
+    atomic_write_parquet,
+    parquet_fingerprint,
+    read_parquet_snapshot,
+)
 from app.services.minute_adjust import apply_minute_adjustment, minute_basis_is_raw
 
 logger = logging.getLogger(__name__)
@@ -2248,16 +2251,12 @@ class KlineRepository:
 
     @staticmethod
     def _atomic_write_parquet(df: pl.DataFrame, out: Path) -> None:
-        """先写临时文件再原子替换, 避免进程中断留下损坏的 parquet。
+        """原子替换落盘 (实现收在 fs_utils.atomic_write_parquet, 与 kline_sync 共用一份)。
 
-        直接 write_parquet(out) 在进程被 kill (dev.sh 清端口用 kill -9)
-        或断电时会留下半截文件, 之后 scan_parquet glob 整条链路报错。
-        临时文件后缀 .tmp 不匹配 *.parquet glob, 不会被扫描误读。
-        Windows 下目标正被并发读取时由 replace_with_retry 短退避穿过。
+        暂存名带随机后缀: 两个写入者同时落同一分区时, 固定 `<name>.tmp` 会互相覆盖
+        对方的半截文件 (实测数字见 fs_utils._staging_path)。
         """
-        tmp = out.with_name(out.name + ".tmp")
-        df.write_parquet(tmp)
-        replace_with_retry(tmp, out)
+        atomic_write_parquet(df, out)
 
     def _write_daily_partition(self, df: pl.DataFrame, table: str) -> None:
         """按 date 分区写入 parquet，每个日期一个文件，支持 merge-upsert。"""
@@ -2282,36 +2281,13 @@ class KlineRepository:
 
     @staticmethod
     def _partition_fingerprint(path: Path) -> tuple[int, int] | None:
-        """分区文件的修改指纹 (mtime_ns, size); 不存在返回 None。"""
-        try:
-            st = path.stat()
-        except FileNotFoundError:
-            return None
-        return (st.st_mtime_ns, st.st_size)
+        """版本指纹 (见 fs_utils.parquet_fingerprint)。"""
+        return parquet_fingerprint(path)
 
     @staticmethod
     def _read_partition_base(out: Path) -> tuple[pl.DataFrame, tuple[int, int] | None]:
-        """基底数据帧 + *同一版* 的修改指纹, 二者在同一次 open 内取。
-
-        分成「按路径读内容」+「再 stat 取指纹」两步会开出并发窗口:
-        - 期间另一路写入者完成替换后, 指纹描述新版而合并用的还是旧版, 锁内比对
-          照样通过 → 对方刚落盘的行被静默覆盖 (丢行)。
-        - polars 按活路径读要分多次取 (footer → 列块), 替换落在中间就混读两版的
-          元数据与页, 直接抛 `ComputeError: parquet: File out of specification:
-          The page header reported the wrong page size`, 还会 panic 掉 polars
-          线程池的工作线程 (Windows 实测: 6142 次读 11 次命中)。
-
-        一次 open + fstat + 全量 read 把该版文件钉成不可变快照, polars 之后只解析
-        内存缓冲, 不存在第三种状态; 句柄只在顺序读期间持有, 不比现状多阻塞替换。
-        日分区实测 124~219 KB, 复制一份内存可忽略。
-        """
-        try:
-            with out.open("rb") as fh:
-                st = os.fstat(fh.fileno())
-                raw = fh.read()
-        except FileNotFoundError:
-            return pl.DataFrame(), None
-        return pl.read_parquet(io.BytesIO(raw)), (st.st_mtime_ns, st.st_size)
+        """基底 + 同源指纹 (见 fs_utils.read_parquet_snapshot, 为什么必须同源写在那里)。"""
+        return read_parquet_snapshot(out)
 
     def _optimistic_upsert_partition(
         self,

@@ -362,7 +362,7 @@ def _endpoint_mocks(monkeypatch, local_df: pl.DataFrame, sync_ret: pl.DataFrame 
     monkeypatch.setattr(kline_api.kline_sync, "sync_minute_batch", fake_sync)
     writes: list[pl.DataFrame] = []
     monkeypatch.setattr(kline_api.kline_sync, "_write_minute_partition",
-                        lambda df, d: writes.append(df))
+                        lambda df, d, **kw: writes.append(df))
 
     mock_repo = MagicMock()
     mock_repo.get_etf_symbol_set.return_value = set()
@@ -564,7 +564,13 @@ def test_sync_and_persist_minute_custom_persists(monkeypatch, tmp_path):
     get_client_spy.assert_not_called()
 
 
-def test_sync_and_persist_minute_holds_repository_write_lock(monkeypatch, tmp_path):
+def test_sync_and_persist_minute_passes_repository_write_lock(monkeypatch, tmp_path):
+    """落盘拿到 repo._write_lock, 且调用方不整段持锁。
+
+    旧契约是「外层 with repo._write_lock 包住整段读-改-写」; 新契约把读旧/合并挪到
+    锁外 (锁内只做版本校验 + 原子替换), 所以调用方必须在**空闲**锁外调用并交出锁对象
+    —— 若仍在外层持锁, threading.Lock 不可重入会自死锁。
+    """
     expected_df = _mock_minute_df()
     mock_provider = MagicMock()
     mock_provider.get_minute.return_value = expected_df
@@ -577,12 +583,16 @@ def test_sync_and_persist_minute_holds_repository_write_lock(monkeypatch, tmp_pa
     monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)
 
     write_lock = Lock()
+    seen: dict[str, object] = {}
 
-    def assert_locked(df, minute_dir):
-        assert not write_lock.acquire(blocking=False)
+    def spy(df, minute_dir, *, write_lock=None):
+        seen["write_lock"] = write_lock
+        seen["free_at_call"] = write_lock.acquire(blocking=False)
+        if seen["free_at_call"]:
+            write_lock.release()
         return df.height
 
-    monkeypatch.setattr(kline_sync, "_write_minute_partition", assert_locked)
+    monkeypatch.setattr(kline_sync, "_write_minute_partition", spy)
 
     mock_repo = MagicMock()
     mock_repo.store.data_dir = tmp_path
@@ -594,6 +604,8 @@ def test_sync_and_persist_minute_holds_repository_write_lock(monkeypatch, tmp_pa
     )
 
     assert written == expected_df.height
+    assert seen["write_lock"] is write_lock, "落盘未复用仓库写锁 → 并发写同一分区互相覆盖"
+    assert seen["free_at_call"], "调用方整段持锁 → 锁内跑重活, 且新实现会自死锁"
 
 
 # ---------- 测试 13: get_provider 异常时 fall through TickFlow (Issue 2) ----------

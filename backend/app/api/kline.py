@@ -863,14 +863,16 @@ def get_minute_batch(request: Request, body: dict):
         if df_live.is_empty():
             return
         try:
-            # 读-改-写必须持仓库写锁 (与全量分钟服务/盘后同步同一纪律, Windows 临时文件占用)。
+            # 落盘复用仓库写锁 (与全量分钟服务/盘后同步同一纪律): 锁只兜原子替换,
+            # 读旧与合并跑在锁外, 版本失配则重读重算 (见 kline_sync._write_minute_partition)。
             # 仅在拿到真实目录时落盘: data_dir 异常 (非 Path) 时跳过, 只返回本轮数据。
             # 落盘必须是原始口径 (raw_basis=True 时 sync 已按 adjust='none' 取回);
             # 对外响应再统一复权投影。
             minute_dir = minute_dirs[asset]
             if isinstance(minute_dir, Path):
-                with repo._write_lock:
-                    kline_sync._write_minute_partition(df_live, minute_dir)
+                kline_sync._write_minute_partition(
+                    df_live, minute_dir, write_lock=repo._write_lock
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning("minute-batch 补拉落盘失败 (降级为仅返回): %s", e)
         if raw_basis:
