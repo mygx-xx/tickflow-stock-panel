@@ -12,8 +12,10 @@
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -2283,6 +2285,30 @@ class KlineRepository:
             return None
         return (st.st_mtime_ns, st.st_size)
 
+    @staticmethod
+    def _read_partition_base(out: Path) -> tuple[pl.DataFrame, tuple[int, int] | None]:
+        """基底数据帧 + *同一版* 的修改指纹, 二者在同一次 open 内取。
+
+        分成「按路径读内容」+「再 stat 取指纹」两步会开出并发窗口:
+        - 期间另一路写入者完成替换后, 指纹描述新版而合并用的还是旧版, 锁内比对
+          照样通过 → 对方刚落盘的行被静默覆盖 (丢行)。
+        - polars 按活路径读要分多次取 (footer → 列块), 替换落在中间就混读两版的
+          元数据与页, 直接抛 `ComputeError: parquet: File out of specification:
+          The page header reported the wrong page size`, 还会 panic 掉 polars
+          线程池的工作线程 (Windows 实测: 6142 次读 11 次命中)。
+
+        一次 open + fstat + 全量 read 把该版文件钉成不可变快照, polars 之后只解析
+        内存缓冲, 不存在第三种状态; 句柄只在顺序读期间持有, 不比现状多阻塞替换。
+        日分区实测 124~219 KB, 复制一份内存可忽略。
+        """
+        try:
+            with out.open("rb") as fh:
+                st = os.fstat(fh.fileno())
+                raw = fh.read()
+        except FileNotFoundError:
+            return pl.DataFrame(), None
+        return pl.read_parquet(io.BytesIO(raw)), (st.st_mtime_ns, st.st_size)
+
     def _optimistic_upsert_partition(
         self,
         out: Path,
@@ -2298,6 +2324,8 @@ class KlineRepository:
         _write_lock 内悬死, 全局写锁被永久持有, 所有写路径排队冻结。乐观模式
         把读/算移出锁外; 锁内用指纹确认基底未被其他写入者改动, 失配则重试,
         重试耗尽退回锁内直读直写 (正确性优先, 牺牲隔离性)。
+
+        校验能成立的前提是指纹与基底同源, 由 _read_partition_base 保证。
         """
         def _merge(existing: pl.DataFrame) -> pl.DataFrame:
             if existing.is_empty():
@@ -2307,8 +2335,7 @@ class KlineRepository:
             ).sort(["symbol", "date"])
 
         for _ in range(retries):
-            existing = pl.read_parquet(out) if out.exists() else pl.DataFrame()
-            base_fp = self._partition_fingerprint(out)
+            existing, base_fp = self._read_partition_base(out)
             merged = _merge(existing)
             with self._write_lock:
                 if self._partition_fingerprint(out) != base_fp:
@@ -2317,7 +2344,7 @@ class KlineRepository:
             return
         # 乐观重试耗尽 (罕见: 高频并发写同一分区): 退回锁内全量模式保证正确性
         with self._write_lock:
-            existing = pl.read_parquet(out) if out.exists() else pl.DataFrame()
+            existing, _fp = self._read_partition_base(out)
             self._write_partition_locked(out, _merge(existing), existing, publication)
 
     def _write_partition_locked(
@@ -2485,8 +2512,9 @@ class KlineRepository:
             else None
         )
         # 覆写语义: 读旧内容只为跳过无变化的写, 读在锁外 (误判最多造成一次
-        # 冗余覆写, 不影响正确性); 锁内只做替换 + commit。
-        existing = pl.read_parquet(out) if out.exists() else pl.DataFrame()
+        # 冗余覆写, 不影响正确性); 锁内只做替换 + commit。快照读只为了让锁外的
+        # 这次读不会在并发替换中混读两版 (见 _read_partition_base)。
+        existing, _fp = self._read_partition_base(out)
         with self._write_lock:
             self._write_partition_locked(out, df_storage, existing, publication)
 
