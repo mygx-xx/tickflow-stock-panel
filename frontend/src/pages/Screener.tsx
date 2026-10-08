@@ -244,6 +244,7 @@ export function Screener() {
   const strategies = useQuery({
     queryKey: [...QK.screenerStrategies('all'), 'all'],
     queryFn: () => api.screenerStrategies(undefined, 'all'),
+    staleTime: 60_000,  // 策略池清单慢变 (与 Paper 同款), 减少切页重拉
   })
 
   // 激活策略自身的执行周期 (决定走缓存还是分钟实时跑)。
@@ -792,6 +793,7 @@ export function Screener() {
   const watchlist = useQuery({
     queryKey: QK.watchlist,
     queryFn: api.watchlistList,
+    staleTime: 30_000,
   })
   const watchlistSet = useMemo(() => {
     const symbols = watchlist.data?.symbols ?? []
@@ -1230,7 +1232,22 @@ export function Screener() {
           )}
           <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-2">
           {strategies.isLoading && <div className="px-1 py-2 text-xs text-muted">加载中…</div>}
-          {!strategies.isLoading && displayPoolAfterVerdict.length === 0 && (
+          {/* 官方 v0.3.5: 策略列表加载失败时给出可重试的错误态,
+              不让「加载失败」被误读成「策略池为空」。 */}
+          {!strategies.isLoading && strategies.isError && (
+            <div className="flex flex-col items-center gap-2 rounded-btn border border-dashed border-danger/40 px-2 py-4 text-center">
+              <span className="text-xs text-secondary">策略列表加载失败，请重试；策略池配置本身不受影响。</span>
+              <button
+                type="button"
+                onClick={() => strategies.refetch()}
+                disabled={strategies.isFetching}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-[10px] text-accent transition-colors hover:bg-elevated disabled:opacity-50"
+              >
+                重试
+              </button>
+            </div>
+          )}
+          {!strategies.isLoading && !strategies.isError && displayPoolAfterVerdict.length === 0 && (
             <div className="px-2 py-6 text-center text-xs text-muted">
               {pool.length === 0
                 ? '策略池为空，点击右上角「策略池」按钮添加'

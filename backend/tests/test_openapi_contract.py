@@ -47,6 +47,7 @@ EXPECTED_OPEN_ENDPOINTS: set[str] = {
     "GET /api/paper/account",
     "POST /api/paper/account",
     "GET /api/paper/accounts",
+    "POST /api/paper/arena/batch_create",
     "GET /api/paper/attribution",
     "POST /api/paper/auto_rules",
     "DELETE /api/paper/auto_rules/{rule_id}",
