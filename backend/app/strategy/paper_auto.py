@@ -19,6 +19,7 @@ import logging
 import uuid
 from datetime import date as _date
 from datetime import datetime
+from datetime import timedelta as _timedelta
 from pathlib import Path
 
 from app.market_time import cn_now
@@ -127,8 +128,22 @@ def _matches(rule: dict, ev: dict) -> bool:
     return ev.get("rule_id") == rule["match_id"]
 
 
+def _elapsed_trading_days(created: _date, today: _date) -> int:
+    """created 之后到 today (含) 的交易日数; 日历不可用时退回日历天数。
+
+    冷却期声明按交易日, 不能按日历天: 春节/国庆连休会把「3 个交易日」撑成 8~10
+    个日历天, 按日历天计冷却在休市期间就空转到期, 节后第一个交易日立刻又能触发
+    一轮 —— 跟单频率因此比规则设定的更高。
+    """
+    from app.services import trading_day
+    if trading_day.trading_calendar() is None:
+        return max(0, (today - created).days)
+    days = trading_day.trading_days(created + _timedelta(days=1), today)
+    return max(0, len(days or ()))
+
+
 def _in_cooldown(data_dir: Path, rule: dict, symbol: str, cooldown_days: int, account_id: str) -> bool:
-    """同规则同 symbol 最近一次自动下单是否仍在冷却期 (按日历日, 含当日)。"""
+    """同规则同 symbol 最近一次自动下单是否仍在冷却期 (按交易日, 含当日)。"""
     if cooldown_days <= 0:
         return False
     prefix = f"auto:{rule['id']}"
@@ -140,7 +155,7 @@ def _in_cooldown(data_dir: Path, rule: dict, symbol: str, cooldown_days: int, ac
             created = _date.fromisoformat(order["created_at"][:10])
         except (KeyError, ValueError):
             continue
-        if (today - created).days < cooldown_days:
+        if _elapsed_trading_days(created, today) < cooldown_days:
             return True
     return False
 
@@ -194,6 +209,9 @@ def on_rule_events(data_dir: Path, events: list[dict], account_id: str = paper.D
                     order_type=rule["order_type"],
                     ref_price=float(price),
                     source=f"auto:{rule['id']}",
+                    # 资产类型跟着事件走 (监控规则自带 asset_type); 旧事件缺字段时
+                    # 由 create_order 按代码前缀兜底。
+                    asset_type=ev.get("asset_type"),
                 )
                 if err:
                     logger.info("paper auto %s: %s 下单被拒: %s", rule["name"], symbol, err)

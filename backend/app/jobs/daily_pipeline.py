@@ -735,7 +735,10 @@ def run_now(
         # 逐账户结算 (账户间订单/台账隔离), 汇总合并供日志与结果展示
         totals = {"filled": 0, "expired": 0, "corp_actions": 0, "nav": None, "accounts": []}
         for acc_id in paper_trading.list_account_ids(repo.store.data_dir):
-            s = paper_trading.settle_day(repo.store.data_dir, today.isoformat(), account_id=acc_id)
+            s = paper_trading.settle_day(
+                repo.store.data_dir, today.isoformat(),
+                account_id=acc_id, name_map=repo.get_name_map(),
+            )
             totals["filled"] += s.get("filled", 0)
             totals["expired"] += s.get("expired", 0)
             totals["corp_actions"] += s.get("corp_actions", 0)

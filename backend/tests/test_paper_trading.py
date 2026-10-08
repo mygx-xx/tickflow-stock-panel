@@ -66,17 +66,64 @@ def test_slippage_direction_adverse():
     assert paper.apply_slippage(10.0, "buy", 5) == pytest.approx(10.005)
 
 
-def test_limit_prices_by_board():
-    assert paper.limit_pct("600519.SH", "stock") == 0.10
-    assert paper.limit_pct("000001.SZ", "stock") == 0.10
-    assert paper.limit_pct("300750.SZ", "stock") == 0.20
-    assert paper.limit_pct("688981.SH", "stock") == 0.20
-    assert paper.limit_pct("832000.BJ", "stock") == 0.30
-    assert paper.limit_pct("510300.SH", "etf") == 0.10
-    up, down = paper.limit_prices(10.0, "600519.SH", "stock")
-    assert (up, down) == (11.0, 9.0)
-    up3, down3 = paper.limit_prices(1.0, "510300.SH", "etf")
-    assert (up3, down3) == (1.1, 0.9)  # 3 位小数 round 不改变该值
+def test_涨跌停口径不再由paper自维护():
+    """paper 不再平行实现第二套涨跌停 —— 幅度与价格都来自 app.price_limits。
+
+    旧实现有两处偏差 (口径用例见 tests/test_price_limits.py):
+      - 基金统一 10%, 创业板/科创板 ETF 实际 20%;
+      - ST 股完全识别不了, 且用 Python round() (银行家舍入) 而非交易所四舍五入。
+    """
+    assert not hasattr(paper, "limit_pct")
+    assert not hasattr(paper, "limit_prices")
+
+
+def test_风险警示板现行幅度与主板一致(tmp_path, monkeypatch):
+    """2026-07-06 起主板 ST 涨跌幅与主板同为 10% (规则已变更), paper 按当日日期取幅度。
+
+    名称只用来判「是不是风险警示票」与基金的板块归属; 5% 是历史口径, 由
+    tests/test_price_limits.py 按日期锚定, 模拟盘不再单独维护一套。
+    """
+    day = date(2026, 10, 8)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+    # 10.50 在 10% 板内 → 成交
+    paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.5}, name_map={SYM: "ST某某"})) == 1
+    # 11.00 触及涨停 → 买不进 (与是否 ST 无关)
+    order, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    assert paper.evaluate_intraday(tmp_path, {SYM: 11.0}, name_map={SYM: "ST某某"}) == []
+    assert paper.get_order(tmp_path, order["id"])["status"] == "expired"
+
+
+def test_创业板etf按两成涨跌幅成交(tmp_path, monkeypatch):
+    """基金 20% 幅度只有 price_limits + 名称能判出来; 旧实现统一 10% 会误拒。"""
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    acc = _cap_account(tmp_path)
+    etf = "159915.SZ"
+    repo = KlineRepository(DataStore(tmp_path))
+
+    def _bar(d: date, price: float) -> pl.DataFrame:
+        return pl.DataFrame({
+            "symbol": [etf], "date": [d],
+            "open": [price], "high": [price], "low": [price], "close": [price],
+            "volume": [1e6], "amount": [price * 1e6],
+        })
+
+    repo.append_etf_daily(pl.concat([_bar(day - timedelta(days=1), 2.0), _bar(day, 2.3)]))
+    order, err = paper.create_order(
+        tmp_path, etf, "buy", qty=1000, order_type="close",
+        asset_type="etf", ref_price=2.0,
+    )
+    assert err is None
+    # 收盘 2.30 = 昨收 +15%: 创业板 ETF 板 20% 内应成交; 按旧的统一 10% 会判成涨停拒单
+    summary = paper.settle_day(tmp_path, day.isoformat(), name_map={etf: "创业板ETF易方达"})
+    assert summary["filled"] == 1
+    filled = paper.get_order(tmp_path, order["id"])
+    # 成交价 = 收盘价的不利滑点价, 且被夹在板内 (涨停 2.40)
+    assert filled["fill_price"] == pytest.approx(paper.apply_slippage(2.3, "buy", acc["slippage_bps"]))
+    assert filled["fill_price"] < 2.40
 
 
 def test_qty_from_amount_floors_to_lot():
@@ -182,7 +229,7 @@ def test_limit_up_buy_rejected(tmp_path, monkeypatch):
     _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
     _cap_account(tmp_path)
     order, _ = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
-    # 主板涨停 11.0; 快照 11 + 滑点 ≥ 涨停 → 拒单
+    # 主板涨停 11.0; 快照 raw 价触板即拒 (滑点不参与判板, 见 test_滑点不改变涨跌停可达性)
     assert paper.evaluate_intraday(tmp_path, {SYM: 11.0}) == []
     got = paper.get_order(tmp_path, order["id"])
     assert got["status"] == "expired"
@@ -201,10 +248,56 @@ def test_limit_down_sell_rejected(tmp_path, monkeypatch):
     paper._materialize(tmp_path)
     sell, err = paper.create_order(tmp_path, SYM, "sell", qty=100)
     assert err is None
-    # 跌停 9.0; 快照 9 减滑点后不高于跌停价 -> 拒单
+    # 跌停 9.0; 快照 raw 价触板 → 拒单
     assert paper.evaluate_intraday(tmp_path, {SYM: 9.0}) == []
     got = paper.get_order(tmp_path, sell["id"])
     assert got["status"] == "expired" and "跌停" in got["reason"]
+
+
+def test_滑点不改变涨跌停可达性(tmp_path, monkeypatch):
+    """可达性按 raw 价判, 滑点只决定成交价。
+
+    旧实现拿「滑点后价」判板: 大滑点账户在板内侧的正常报价会被误判成封板拒单。
+    新口径下 raw 10.99 < 涨停 11.00 → 可成交, 成交价仍夹在板内。
+    """
+    day = date(2026, 9, 24)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    paper.create_account(tmp_path, 100_000.0, slippage_bps=200.0)   # 2% 滑点
+    order, err = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.99)
+    assert err is None
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.99})) == 1
+    got = paper.get_order(tmp_path, order["id"])
+    assert got["status"] == "filled"
+    # 10.99 +200bps = 11.2098, 越过当日涨停 → 夹到 11.00 成交
+    assert got["fill_price"] == pytest.approx(11.0)
+
+
+def test_零股只能一次性清仓(tmp_path, monkeypatch):
+    """除权折算会掉出非整百余额 (100 股 ×1.5 = 150)。
+
+    交易所口径: 不足一手的余额只能一次性全额申报 —— 旧实现一律要求整百, 余额
+    永远卖不掉 (持仓卡死)。
+    """
+    day = date(2026, 9, 24)
+    ex_day = day + timedelta(days=1)
+    monkeypatch.setattr(paper, "cn_today", lambda: day)
+    _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
+    _cap_account(tmp_path)
+    _, err = paper.create_order(tmp_path, SYM, "buy", qty=100, ref_price=10.0)
+    assert err is None
+    assert len(paper.evaluate_intraday(tmp_path, {SYM: 10.0})) == 1
+
+    # 次日除权 1.5 → 可卖 150 (盘前入账, 与 settle_day 同序)
+    monkeypatch.setattr(paper, "cn_today", lambda: ex_day)
+    _write_factor(tmp_path, ex_day, 1.5)
+    assert paper._apply_corp_actions(tmp_path, ex_day.isoformat()) == 1
+    paper._materialize(tmp_path)
+
+    _, err = paper.create_order(tmp_path, SYM, "sell", qty=120)
+    assert err is not None and "零股只能一次性全部卖出" in err
+    _, err = paper.create_order(tmp_path, SYM, "sell", qty=150)
+    assert err is None
 
 
 def test_settle_next_open_close_and_postpone_expire(tmp_path):
@@ -391,6 +484,35 @@ def test_round_trips_fifo_stats(tmp_path):
     assert st["rounds"] == 2 and st["win_rate"] == 100.0
 
 
+def test_stats_持平回合不进亏损分母(tmp_path):
+    """盈亏恰为 0 的回合既不算胜也不算负 —— 旧口径把它计进亏损, 亏损均值被摊薄。
+
+    构造 +100 / -50 / 0 三个回合: 真实平均亏损 50 → 盈亏比 2.0; 把 0 也算亏损
+    会得到平均 25、盈亏比 4.0 (虚高)。
+    """
+    day = date(2026, 9, 1)
+    _cap_account(tmp_path)
+    rows = [
+        {"seq": 1, "side": "buy", "qty": 100, "price": 10.0},
+        {"seq": 2, "side": "sell", "qty": 100, "price": 11.0},   # +100
+        {"seq": 3, "side": "buy", "qty": 100, "price": 12.0},
+        {"seq": 4, "side": "sell", "qty": 100, "price": 11.5},   # -50
+        {"seq": 5, "side": "buy", "qty": 100, "price": 13.0},
+        {"seq": 6, "side": "sell", "qty": 100, "price": 13.0},   # 0
+    ]
+    for r in rows:
+        paper._append_fill(tmp_path, {
+            "ts": "", "date": day.isoformat(), "order_id": f"o{r['seq']}", "symbol": SYM,
+            "asset_type": "stock", "fee": 0.0, "kind": "fill", **r,
+        })
+
+    st = paper.stats(tmp_path)
+    assert st["rounds"] == 3
+    assert st["win_rate"] == pytest.approx(33.33)            # 分母含持平, 分子只算盈利
+    assert st["profit_loss_ratio"] == pytest.approx(2.0)
+    assert st["realized_pnl"] == pytest.approx(50.0)
+
+
 # ── 自动跟单 (V2) ───────────────────────────────────────
 def _auto_rule(**overrides) -> dict:
     base = {
@@ -427,8 +549,11 @@ def test_auto_rule_crud_and_validation(tmp_path):
 
 def test_auto_trigger_matches_strategy_event(tmp_path, monkeypatch):
     from app.strategy import paper_auto
+    from app.services import trading_day
     day = date(2026, 9, 24)
     monkeypatch.setattr(paper, "cn_today", lambda: day)
+    # 本用例锚定「交易日历不可用 → 退回日历天」这条降级支路
+    monkeypatch.setattr(trading_day, "trading_calendar", lambda: None)
     _write_daily(tmp_path, [(day - timedelta(days=1), 10.0, 10.0)])
     _cap_account(tmp_path)
     paper_auto.create_auto_rule(tmp_path, _auto_rule())
@@ -443,17 +568,71 @@ def test_auto_trigger_matches_strategy_event(tmp_path, monkeypatch):
 
     # 冷却期内同 symbol 不再触发
     assert paper_auto.on_rule_events(tmp_path, [ev]) == []
-    # 冷却外 (6 天后) 恢复触发
-    paper_auto._now_iso = lambda: ""  # no-op 防误用提示
-    rule_id = orders[0]["source"].split(":", 1)[1]
-    paper_auto.delete_auto_rule(tmp_path, rule_id) if False else None
-    # 直接改订单 created_at 模拟 6 天前
-    orders_loaded = paper.load_orders(tmp_path)
-    for o in orders_loaded:
+    # 冷却外 (6 个天前下的单) 恢复触发
+    for o in paper.load_orders(tmp_path):
         o["created_at"] = "2026-09-18T10:00:00+08:00"
         paper.save_order(tmp_path, o)
     orders2 = paper_auto.on_rule_events(tmp_path, [ev])
     assert len(orders2) == 1
+
+
+def test_跟单冷却数交易日(tmp_path, monkeypatch):
+    """cooldown_days 声明的是交易日: 连休期间日历天在走, 冷却不该跟着空转到期。
+
+    旧口径 (today - created).days 让「3 个交易日冷却」在国庆前后被 8 个日历天空掉,
+    节后第一个交易日立刻又能跟一轮 —— 频率比规则设定的高。
+    """
+    from app.strategy import paper_auto
+    from app.services import trading_day
+    day = date(2026, 10, 8)
+    created = day - timedelta(days=5)
+    monkeypatch.setattr(paper_auto, "cn_now",
+                        lambda: datetime.combine(day, time(10, 0), tzinfo=CN_TZ))
+    monkeypatch.setattr(trading_day, "trading_calendar", lambda: object())
+    elapsed = {"days": 2}            # 5 个日历天里只开了 2 个交易日
+    monkeypatch.setattr(trading_day, "trading_days",
+                        lambda start, end: [start] * elapsed["days"])
+
+    rule = {"id": "arule_cool"}
+    order = {
+        "id": "order_cool", "symbol": SYM, "asset_type": "stock", "side": "buy",
+        "qty": 500, "order_type": "next_open", "status": "filled", "ref_price": 10.0,
+        "postponed": 0, "source": f"auto:{rule['id']}",
+        "created_at": f"{created.isoformat()}T09:35:00+08:00",
+        "filled_at": None, "fill_price": None, "fees": None, "reason": None,
+    }
+    paper.save_order(tmp_path, order)
+
+    assert paper_auto._in_cooldown(tmp_path, rule, SYM, 3, paper.DEFAULT_ACCOUNT_ID)
+    elapsed["days"] = 3              # 交易日补足 3 天 → 放行
+    assert not paper_auto._in_cooldown(tmp_path, rule, SYM, 3, paper.DEFAULT_ACCOUNT_ID)
+    # 冷却 0 = 不启用, 不看日历
+    assert not paper_auto._in_cooldown(tmp_path, rule, SYM, 0, paper.DEFAULT_ACCOUNT_ID)
+
+
+def test_跟单按事件的资产类型下单(tmp_path, monkeypatch):
+    """ETF 跟单要带 asset_type=etf 下单, 不能靠代码前缀猜 —— 涨跌停幅度与最小价位不同。
+
+    monitor 把规则的 asset_type 放进事件 (见 MonitorRuleEngine), 这里锚定它一路传到
+    create_order; 事件缺字段时才由 create_order 兜底。
+    """
+    from app.strategy import paper_auto
+    seen: list[dict] = []
+
+    def _spy(data_dir, symbol, side, **kwargs):
+        seen.append({"symbol": symbol, "side": side, **kwargs})
+        return None, "测试拦截: 不下真单"
+
+    monkeypatch.setattr(paper, "create_order", _spy)
+    _cap_account(tmp_path)
+    paper_auto.create_auto_rule(tmp_path, _auto_rule())
+    ev = {"source": "strategy", "strategy_id": "strat_1", "symbol": "159915.SZ",
+          "price": 2.0, "asset_type": "etf"}
+
+    paper_auto.on_rule_events(tmp_path, [ev])
+
+    assert len(seen) == 1
+    assert seen[0]["symbol"] == "159915.SZ" and seen[0]["asset_type"] == "etf"
 
 
 def test_auto_trigger_non_matching_events_ignored(tmp_path):

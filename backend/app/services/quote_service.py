@@ -1417,10 +1417,20 @@ class QuoteService:
                         enriched_today["raw_close"].to_list(),
                         strict=False,
                     ))
+                    # 名称快照: 模拟盘涨跌停幅度要用 (ST / 创业板科创板 ETF 与主板不同)
+                    name_map = (
+                        dict(zip(
+                            enriched_today["symbol"].to_list(),
+                            enriched_today["name"].to_list(),
+                            strict=False,
+                        ))
+                        if "name" in enriched_today.columns else None
+                    )
                     paper_events: list[dict] = []
                     for acc_id in paper_trading.list_account_ids(data_dir):
                         paper_events.extend(
-                            paper_trading.evaluate_intraday(data_dir, snapshot, account_id=acc_id))
+                            paper_trading.evaluate_intraday(
+                                data_dir, snapshot, account_id=acc_id, name_map=name_map))
                         if rule_events:
                             created = paper_auto.on_rule_events(data_dir, rule_events, account_id=acc_id)
                             paper_events.extend(paper_auto.auto_order_events(created, account_id=acc_id))

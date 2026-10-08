@@ -34,11 +34,12 @@ def _write_fills(tmp_path: Path, fills: list[dict]) -> None:
 
 
 def _fill(side: str, qty: int, price: float, source: str, *, fee: float = 0.0,
-          symbol: str = "600519.SH", kind: str = "fill", **extra) -> dict:
+          symbol: str = "600519.SH", kind: str = "fill", day: str = "2026-09-30",
+          **extra) -> dict:
     return {
         "seq": 1,
-        "ts": f"2026-09-30T09:30:0{extra.get('n', 0)}.000000+08:00",
-        "date": "2026-09-30",
+        "ts": f"{day}T09:30:0{extra.get('n', 0)}.000000+08:00",
+        "date": day,
         "order_id": f"order_{extra.get('n', 0)}",
         "symbol": symbol,
         "asset_type": "stock",
@@ -134,10 +135,15 @@ def test_部分卖出按FIFO消耗最早批次(tmp_path: Path):
 
 
 def test_除权按比例调整各来源持仓(tmp_path: Path):
+    """除权只折算**事件日之前**的批次: 除权在盘前生效, 当日新买的份额不参与送转。
+
+    旧实现按顺序乘因子, 事件日当天的成交也被折算 → 份额与 NAV 虚增。
+    """
     _write_fills(tmp_path, [
-        _fill("buy", 100, 10.0, RULE_A, n=1),
-        _fill("buy", 200, 10.0, RULE_B, n=2),
-        _fill("buy", 0, 0.0, "manual", kind="corp_action", n=3, factor=0.5),
+        _fill("buy", 100, 10.0, RULE_A, n=1, day="2026-09-29"),
+        _fill("buy", 200, 10.0, RULE_B, n=2, day="2026-09-29"),
+        _fill("buy", 100, 5.0, "manual", n=3),
+        _fill("buy", 0, 0.0, "manual", kind="corp_action", n=4, factor=0.5),
     ])
 
     r = paper.replay_attribution(tmp_path)
@@ -145,6 +151,7 @@ def test_除权按比例调整各来源持仓(tmp_path: Path):
     assert _row(r, RULE_A)["held_qty"] == pytest.approx(50.0)
     assert _row(r, RULE_A)["held_cost"] == pytest.approx(1000.0)   # 股数减半, 总成本不变
     assert _row(r, RULE_B)["held_qty"] == pytest.approx(100.0)
+    assert _row(r, "manual")["held_qty"] == pytest.approx(100.0)   # 当日批次不折算
 
 
 def test_旧台账无source字段_按manual兜底(tmp_path: Path):

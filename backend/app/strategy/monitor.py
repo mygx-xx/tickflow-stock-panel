@@ -1149,6 +1149,9 @@ class MonitorRuleEngine:
                 "change_pct": pct,
                 "signals": hit_sigs,
                 "severity": severity,
+                # 资产类型来自规则 (一条规则只评估一个品种域)。下游模拟盘跟单要按
+                # 它下单/判涨跌停, 不能再按代码前缀猜。
+                "asset_type": rule.get("asset_type", "stock"),
                 # 触发条件快照 (signal/price/market 类型): 用于触发记录展示
                 # 「命中了什么条件」。strategy 类型靠策略选股池 diff, 不写条件。
                 "conditions": list(rule.get("conditions", [])) if rtype != "strategy" else [],

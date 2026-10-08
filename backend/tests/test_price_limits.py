@@ -10,6 +10,10 @@ from app.api import kline
 from app.backtest.matrix import load_market_data_matrix_from_parquet
 from app.indicators import pipeline
 from app.price_limits import (
+    asset_limit_pct,
+    asset_limit_prices,
+    etf_limit_pct,
+    limit_price,
     numpy_limit_price,
     numpy_price_limit_matrix,
     polars_is_risk_warning_name,
@@ -37,6 +41,69 @@ def test_scalar_price_limit_rules(symbol, trade_date, is_st, expected):
         trade_date,
         is_risk_warning=is_st,
     ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "asset_type", "name", "expected"),
+    [
+        # 股票: 风险警示板在 2026-07-06 前 5%, 之后与主板同为 10% (见日期边界用例)
+        ("600001.SH", "stock", "ST康得", 0.05),
+        ("600001.SH", "stock", "贵州茅台", 0.10),
+        ("300750.SZ", "stock", "宁德时代", 0.20),
+        ("832000.BJ", "stock", "北交所股", 0.30),
+        # 场内基金: 科创板基金按号段, 创业板基金按名称, 其余 10%
+        ("510300.SH", "etf", "沪深300ETF", 0.10),
+        ("588000.SH", "etf", "科创50ETF华夏", 0.20),
+        ("159915.SZ", "etf", "创业板ETF易方达", 0.20),
+        ("159919.SZ", "etf", "沪深300ETF", 0.10),
+        ("159915.SZ", "etf", None, 0.10),   # 无名称时退到 10% (只会多拒单, 不会虚构成交)
+    ],
+)
+def test_asset_limit_pct_by_asset_type(symbol, asset_type, name, expected):
+    assert asset_limit_pct(symbol, asset_type, date(2026, 7, 3), name=name) == pytest.approx(expected)
+
+
+def test_asset_limit_pct_st_date_boundary():
+    """主板 ST 在风险警示板规则变更日前后幅度不同 (与股票口径一致)。"""
+    assert asset_limit_pct("600001.SH", "stock", date(2026, 7, 3), name="ST康得") == 0.05
+    assert asset_limit_pct("600001.SH", "stock", date(2026, 7, 6), name="ST康得") == 0.10
+
+
+def test_etf_limit_pct_matches_asset_level():
+    assert etf_limit_pct("588080.SH") == 0.20
+    assert etf_limit_pct("159915.SZ", "创业板ETF") == 0.20
+    assert etf_limit_pct("510500.SH", "中证500ETF") == 0.10
+
+
+def test_asset_limit_prices_uses_min_price_tick_by_asset():
+    """股票 2 位小数最小价位, 场内基金 3 位。"""
+    assert asset_limit_prices("600519.SH", "stock", 20.05, date(2026, 8, 5)) == (22.06, 18.05)
+    assert asset_limit_prices("510300.SH", "etf", 4.001, date(2026, 8, 5), name="沪深300ETF") == (4.401, 3.601)
+
+
+def test_limit_price_is_half_up_not_bankers_rounding():
+    """交易所四舍五入: 0.95 +10% = 1.045 → 1.05; Python round() 给 1.04。"""
+    assert limit_price(0.95, 0.10, up=True) == 1.05
+    assert limit_price(0.95, 0.10, up=False) == 0.86
+    assert round(0.95 * 1.1, 2) == 1.04          # 银行家舍入 (错误口径), 锚定差异
+
+
+@pytest.mark.parametrize("pct", [0.05, 0.10, 0.20, 0.30])
+def test_scalar_limit_price_matches_polars_implementation(pct):
+    """标量版与向量化版 (indicators/backtest 用的那份) 必须逐价同口径。
+
+    容差 1e-9 只吸收 polars 向量除法的 1 ULP 噪声 (35/100 给
+    0.35000000000000003, 实测最大分歧 7.1e-17); 舍入规则分歧至少差一个
+    最小价位 0.01, 所以这个判据仍能卡住口径。
+    """
+    previous = [round(0.01 * i, 2) for i in range(1, 3000)]
+    frame = pl.DataFrame({"previous": previous, "limit": [pct] * len(previous)})
+    for up in (True, False):
+        expected = frame.select(
+            polars_limit_price(pl.col("previous"), pl.col("limit"), up=up)
+        ).to_series().to_list()
+        got = [limit_price(p, pct, up=up) for p in previous]
+        assert got == pytest.approx(expected[: len(got)], abs=1e-9)
 
 
 def test_polars_and_numpy_price_limit_rules_match():

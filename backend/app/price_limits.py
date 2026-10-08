@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta
 
@@ -14,6 +15,13 @@ MAIN_BOARD_LIMIT = 0.10
 LEGACY_MAIN_BOARD_ST_LIMIT = 0.05
 GROWTH_BOARD_LIMIT = 0.20
 BEIJING_BOARD_LIMIT = 0.30
+# 跟踪创业板/科创板指数的 ETF 与成分股同幅 (20%); 其余场内基金 10%。
+ETF_GROWTH_LIMIT = 0.20
+# 上交所科创板基金号段 (588/589) —— 号段即可判定, 不依赖名称。
+ETF_STAR_CODE_PREFIXES = ("588", "589")
+# 深市创业板基金与主板基金同用 15x/158/159 号段, 无法按号段区分; 场内基金维表
+# (instruments_etf) 只有 symbol/name/code, 不带 limit_up 权威值, 故退而用名称标记。
+ETF_GROWTH_NAME_MARKERS = ("创业板", "科创")
 
 
 def is_risk_warning_name(name: str | None) -> bool:
@@ -42,6 +50,63 @@ def price_limit_pct(
     ):
         return LEGACY_MAIN_BOARD_ST_LIMIT
     return base
+
+
+def etf_limit_pct(symbol: str, name: str | None = None) -> float:
+    """场内基金涨跌幅幅度。
+
+    科创板基金按号段 (588/589) 判定; 创业板基金与主板基金共用 15x 号段, 只能靠
+    名称标记识别。判不出来时返回 10% —— 偏差方向是「把没封板的票当成封板」,
+    即只可能拒绝一笔本可成交的单, 不会虚构成交。
+    """
+    code = str(symbol).split(".")[0]
+    if code.startswith(ETF_STAR_CODE_PREFIXES):
+        return ETF_GROWTH_LIMIT
+    text = str(name or "")
+    if any(m in text for m in ETF_GROWTH_NAME_MARKERS):
+        return ETF_GROWTH_LIMIT
+    return MAIN_BOARD_LIMIT
+
+
+def asset_limit_pct(
+    symbol: str,
+    asset_type: str,
+    trade_date: date,
+    *,
+    name: str | None = None,
+) -> float:
+    """按资产类型取当日涨跌幅幅度 (股票含风险警示板口径, 基金按板块号段/名称)。"""
+    if asset_type == "etf":
+        return etf_limit_pct(symbol, name)
+    return price_limit_pct(symbol, trade_date, is_risk_warning=is_risk_warning_name(name))
+
+
+def limit_price(previous: float, limit_pct: float, *, up: bool, digits: int = 2) -> float:
+    """标量版交易所涨跌停价, 整数最小价位算术 + half-up (与 polars/numpy 实现同口径)。
+
+    digits 为价格最小价位数: 股票 2 分, 场内基金 3 厘。
+    """
+    scale = 10 ** digits
+    numerator = round((1 + (1 if up else -1) * limit_pct) * 100)
+    units = math.floor(previous * scale + 0.5)
+    return (units * numerator + 50) // 100 / scale
+
+
+def asset_limit_prices(
+    symbol: str,
+    asset_type: str,
+    previous_close: float,
+    trade_date: date,
+    *,
+    name: str | None = None,
+) -> tuple[float, float]:
+    """(涨停价, 跌停价)。场内基金用 3 位小数最小价位, 股票 2 位。"""
+    pct = asset_limit_pct(symbol, asset_type, trade_date, name=name)
+    digits = 3 if asset_type == "etf" else 2
+    return (
+        limit_price(previous_close, pct, up=True, digits=digits),
+        limit_price(previous_close, pct, up=False, digits=digits),
+    )
 
 
 # ================================================================
