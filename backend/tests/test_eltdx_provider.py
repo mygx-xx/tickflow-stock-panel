@@ -2472,6 +2472,38 @@ def _codes_transport_with_timeout(handler, *, timeout: float):
     return t, counter
 
 
+# ── 卡死模拟的占位工具 ────────────────────────────────────────────────
+# 为什么不用 time.sleep(30) 直接占位(2026-10-08 CI 修复):
+#   这些用例的意图是"持有者卡死时, 等待者必须在 timeout 内有界返回"。
+#   硬 sleep 的占位线程是 daemon 线程, 只有**整个 pytest 进程结束**才被杀,
+#   于是它会在后续所有用例期间持续存活; 单跑该文件 17s / 跑全量更久。
+#   断言又是硬上限(elapsed < 2.0 甚至 < 0.15) —— 在 GitHub runner 的
+#   2 核环境上, 多个 sleep(30) 线程 + 严格时间断言叠加, 必然出现
+#   调度延迟导致的偶发失败(这正是 CI 连续 10 次红的可疑根因)。
+#
+# 改成 Event.wait: 语义等价("卡死直到本用例结束"), 但用例一结束就能立刻
+# 唤醒退出, 不给后续用例留垃圾。同样保留"远大于 timeout"的占位时长。
+_BLOCK_UNTIL_RELEASE = 60.0
+
+
+def _block_until(release: threading.Event, result: list[str], started: threading.Event | None = None):
+    """占位 handler: 阻塞直到 ``release`` 被 set, 返回 ``result``。
+
+    timeout 取 ``_BLOCK_UNTIL_RELEASE`` 而非无限 —— 若某个用例忘了 set
+    release, 也会在 60s 后自行退出, 不会把整个测试会话拖死。
+    ``started`` 用于让调用方确认"持有者确实进来了"(替代原先 sleep 前
+    的 started.set())。
+    """
+
+    def _handler(method, params):
+        if started is not None:
+            started.set()
+        release.wait(timeout=_BLOCK_UNTIL_RELEASE)
+        return list(result)
+
+    return _handler
+
+
 def test_code_table_waiter_returns_bounded_when_holder_stalls() -> None:
     """**回归防护(实测缺陷)**: 持有者卡死时, 等待者必须在 timeout 内有界返回。
 
@@ -2486,23 +2518,27 @@ def test_code_table_waiter_returns_bounded_when_holder_stalls() -> None:
     正确行为: 等待者超时返回 [](软失败), 由下一轮轮询自然重试。
     """
     started = threading.Event()
+    release = threading.Event()
 
-    def h(method, params):
-        started.set()
-        time.sleep(30)  # 远大于 timeout
-        return ["sz000001"]
-
-    t, _ = _codes_transport_with_timeout(h, timeout=0.3)
+    t, _ = _codes_transport_with_timeout(
+        _block_until(release, ["sz000001"], started), timeout=0.3
+    )
     holder = threading.Thread(target=t.all_a_shares, daemon=True)
     holder.start()
-    assert started.wait(timeout=5), "持有者未启动"
+    try:
+        assert started.wait(timeout=5), "持有者未启动"
 
-    t0 = time.perf_counter()
-    result = t.all_a_shares()  # 本线程是等待者
-    elapsed = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        result = t.all_a_shares()  # 本线程是等待者
+        elapsed = time.perf_counter() - t0
 
-    assert result == [], "等待者超时应软失败返回空"
-    assert elapsed < 2.0, f"等待者必须按 timeout 有界返回, 实际 {elapsed:.2f}s"
+        assert result == [], "等待者超时应软失败返回空"
+        assert elapsed < 2.0, f"等待者必须按 timeout 有界返回, 实际 {elapsed:.2f}s"
+    finally:
+        # 必须释放: 否则持有者线程会滞留到 pytest 进程结束, 占用 CPU 并
+        # 放大后续用例的调度延迟(2 核 runner 上尤其明显)。
+        release.set()
+        holder.join(timeout=5)
 
 
 def test_code_table_reset_releases_stalled_single_flight() -> None:
@@ -2513,26 +2549,30 @@ def test_code_table_reset_releases_stalled_single_flight() -> None:
     (实测 timeout=0.3 时每次调用耗时 0.3s), 而 reset() 正是网关重启后的自愈入口。
     """
     started = threading.Event()
+    release = threading.Event()
 
-    def h(method, params):
-        started.set()
-        time.sleep(30)
-        return ["sz000001"]
-
-    t, _ = _codes_transport_with_timeout(h, timeout=0.3)
+    t, _ = _codes_transport_with_timeout(
+        _block_until(release, ["sz000001"], started), timeout=0.3
+    )
     holder = threading.Thread(target=t.all_a_shares, daemon=True)
     holder.start()
-    assert started.wait(timeout=5), "持有者未启动"
+    try:
+        assert started.wait(timeout=5), "持有者未启动"
 
-    t.reset(reason="网关重启")
-    assert t._code_inflight is None, "reset 后单飞占位必须已清除"
+        t.reset(reason="网关重启")
+        assert t._code_inflight is None, "reset 后单飞占位必须已清除"
 
-    # 自愈后必须能立刻成功回源(而不是被旧占位拖到 timeout)
-    t._rpc = lambda method, params: ["sz000001"]  # type: ignore[method-assign]
-    t0 = time.perf_counter()
-    assert t.all_a_shares() == ["000001.SZ"]
-    elapsed = time.perf_counter() - t0
-    assert elapsed < 0.15, f"reset 后应立即回源, 实际 {elapsed:.2f}s(旧占位未清除)"
+        # 自愈后必须能立刻成功回源(而不是被旧占位拖到 timeout)
+        t._rpc = lambda method, params: ["sz000001"]  # type: ignore[method-assign]
+        t0 = time.perf_counter()
+        assert t.all_a_shares() == ["000001.SZ"]
+        elapsed = time.perf_counter() - t0
+        # 上界取 timeout(0.3) 而非 0.15: 本用例要证明的是"没有白等满
+        # timeout", 而非精确耗时; 0.15 在 2 核 runner 上会因调度抖动偶发失败。
+        assert elapsed < 0.3, f"reset 后应立即回源, 实际 {elapsed:.2f}s(旧占位未清除)"
+    finally:
+        release.set()
+        holder.join(timeout=5)
 
 
 def test_code_table_inflight_result_discarded_after_close() -> None:
