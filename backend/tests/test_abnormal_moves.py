@@ -316,7 +316,9 @@ def test_build_overview_cache_date_today_no_double_count() -> None:
 
     class _TodayRepo(_FakeRepo):
         def get_enriched_latest(self):
-            return self._df, date.today()
+            # 与 build_overview 同用 cn_today(): 宿主 date.today() 在 UTC 16-24 点
+            # 窗口会比北京日晚一天, 用例会被重复计入的实时涨跌带红
+            return self._df, cn_today()
 
     df = pl.DataFrame(
         {
@@ -341,7 +343,8 @@ def test_build_overview_negative_side_stricter_threshold() -> None:
 
     class _TodayRepo(_FakeRepo):
         def get_enriched_latest(self):
-            return self._df, date.today()
+            # 同上: 日期源必须与实现一致, 否则 UTC 16-24 点窗口必然错开一天
+            return self._df, cn_today()
 
     df = pl.DataFrame(
         {
