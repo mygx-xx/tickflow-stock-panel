@@ -2395,7 +2395,10 @@ def test_code_table_invalidated_after_ttl(monkeypatch) -> None:
     assert counter["n"] == 1
 
     # 推进到 TTL 之内: 仍命中
-    base = time.monotonic()
+    # base 必须取自 **hc.time**(被测代码用的那个时钟函数): 用本模块的
+    # time.monotonic() 只是恰好同源才成立, 一旦被测模块的 time 被替换
+    # (如本地复现 CI 的 fresh-boot 插件)两边量级就对不上, 断言随即失效。
+    base = hc.time.monotonic()
     monkeypatch.setattr(hc.time, "monotonic", lambda: base + ttl - 1)
     t.all_a_shares()
     assert counter["n"] == 1, "TTL 未到不应回源"
@@ -2483,6 +2486,33 @@ def _codes_transport_with_timeout(handler, *, timeout: float):
 
     t._rpc = _rpc  # type: ignore[method-assign]
     return t, counter
+
+
+# ── 代码表缓存"强制过期" ──────────────────────────────────────────────
+# 为什么不能写 `t._code_at = 0.0`(2026-10-08 CI 修复):
+#   过期判定是 `time.monotonic() - _code_at >= _code_ttl_s`, 而
+#   **time.monotonic() 是机器/容器的运行时长**。开发机常已开机数天
+#   (monotonic ≈ 数十万秒), 远超 TTL(默认 300s), 于是 0.0 恰好构成过期;
+#   GitHub Actions 容器可能只启动了几十~几百秒, 0.0 - 30s 之差**根本没到 TTL**,
+#   缓存被判命中、完全不回源 —— 4 个用例在 CI 上稳定报"回源 0 次 / 1 次",
+#   而本机全绿。按当前 monotonic 往回推 TTL+1 秒即与 uptime 无关。
+def _expire_code_cache(t) -> None:
+    """把代码表缓存强制置为"已过期"(任何机器 uptime 下都成立)。
+
+    基准时钟取 ``hc.time.monotonic`` —— **被测代码看的那个**。用本测试模块的
+    ``time.monotonic()`` 只是"两边恰好是同一个模块对象"才等价, 一旦被测模块的
+    time 被替换(本地复现 CI 的 fresh-boot 插件)量级就对不上, 断言随之失效。
+    """
+    from app.plugins.eltdx import http_client as hc
+
+    t._code_at = hc.time.monotonic() - t._code_ttl_s - 1.0
+
+
+def _age_out_code_data(t) -> None:
+    """把代码表**数据**年龄推到陈旧上界之外(基准时钟同 ``_expire_code_cache``)。"""
+    from app.plugins.eltdx import http_client as hc
+
+    t._code_data_at = hc.time.monotonic() - (t._code_stale_max_s + 1)
 
 
 # ── 卡死模拟的占位工具 ────────────────────────────────────────────────
@@ -2679,12 +2709,12 @@ def test_code_table_falls_back_to_stale_list_on_failure() -> None:
     assert fresh == ["000001.SZ", "600000.SH"]
 
     # ---- 持有者路径: 单线程, 回源失败 ----
-    t._code_at = 0.0  # 强制 TTL 过期
+    _expire_code_cache(t)
     state["fail"] = True
     assert t.all_a_shares() == fresh, "持有者路径应兜底当日旧清单"
 
     # ---- 等待者路径: 4 并发同时等到同世代失败 ----
-    t._code_at = 0.0
+    _expire_code_cache(t)
     counter["n"] = 0
     results: list[list[str]] = []
     lock = threading.Lock()
@@ -2738,11 +2768,11 @@ def test_code_table_stale_fallback_has_age_bound() -> None:
     assert t._stale_code_symbols_locked() is not None, "刚取回应在界内"
 
     # 把数据年龄推到上界之外(不改 _code_at, 模拟"降级刷新过缓存有效期")
-    t._code_data_at = time.monotonic() - (t._code_stale_max_s + 1)
+    _age_out_code_data(t)
     assert t._stale_code_symbols_locked() is None, "超过陈旧上界不得兜底"
 
     # 且此时回源失败应返回空(而非降级)
-    t._code_at = 0.0  # 强制 TTL 过期
+    _expire_code_cache(t)
     state["fail"] = True
     assert t.all_a_shares() == [], "超出陈旧上界后失败应返回空"
 
@@ -2765,7 +2795,7 @@ def test_code_table_stale_fallback_backs_off() -> None:
     fresh = t.all_a_shares()
     assert fresh == ["000001.SZ", "600000.SH"]
 
-    t._code_at = 0.0  # 强制 TTL 过期
+    _expire_code_cache(t)
     state["fail"] = True
     counter["n"] = 0
     for _ in range(4):
@@ -2844,7 +2874,7 @@ def test_code_table_stays_correct_after_many_refetches() -> None:
     t, counter = _codes_transport()
     for _ in range(50):
         assert t.all_a_shares() == ["000001.SZ", "600000.SH"]
-        t._code_at = 0.0  # 强制 TTL 过期, 触发真实回源
+        _expire_code_cache(t)  # 强制 TTL 过期, 触发真实回源
     assert counter["n"] == 50, f"每次 TTL 失效应各回源一次, 实际 {counter['n']}"
     assert t.all_a_shares() == ["000001.SZ", "600000.SH"]
 
