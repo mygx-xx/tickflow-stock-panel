@@ -35,29 +35,44 @@ jobs:
         run: uv sync --extra dev --frozen
 
       - name: 后端全量测试
-        run: uv run pytest tests -q -rf
+        # 同时落一份完整输出供失败上报步骤取用: 否则失败时只能靠 tail 猜,
+        # 而本仓库 180+ 条 warnings summary 会把尾部灌满 —— 真正的失败清单
+        # 反而被挤出可见范围(上一版就是这样, 见 tasks: FAILED 行拿不到)。
+        run: |
+          set -o pipefail
+          uv run pytest tests -q -rf 2>&1 | tee /tmp/pytest-full.txt
 
       # 把失败详情推到 GitHub 页面: 否则 Actions 页只有一行
       # "process exited with code 1", 还得有 admin 权限下载 200MB 日志才能定位
-      # (logs 端点对非 admin 返回 403) —— 这正是本 workflow 连续失败 10 次
+      # (logs 端点对非 admin 返回 403) —— 这正是本 workflow 连续失败多次
       # 却难以定位的原因。两条通道互补:
       #   1) ::error:: 注解 → Checks/PR 页面的 inline 注释, 任何人可见;
       #   2) $GITHUB_STEP_SUMMARY → run 页面的 Summary 区块。
+      # 关键是**精确提取**而非 tail: 失败清单 + 断言行才是定位所需,
+      # warning 行再多也只是噪音。
       - name: 上报失败详情
         if: failure()
         run: |
           set +e
-          uv run pytest tests -q -rf --tb=short > /tmp/pytest-out.txt 2>&1
-          tail -100 /tmp/pytest-out.txt > /tmp/pytest-tail.txt
+          F=/tmp/pytest-full.txt
           {
-            echo "### pytest 失败摘要"
+            echo '### 失败用例清单'
             echo '```'
-            cat /tmp/pytest-tail.txt
+            grep -E '^(FAILED|ERROR) ' "$F" | head -80
+            echo '```'
+            echo '### 断言与出错位置'
+            echo '```'
+            grep -E '^E |^_{5,}|^[^ ]+\.py:[0-9]+: in ' "$F" | head -120
+            echo '```'
+            echo '### 结尾统计'
+            echo '```'
+            tail -3 "$F"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           # 逐行打成 error 注解(GitHub 单条上限 1KB, 故按行切分并限制条数)
           echo "::group::pytest 失败输出"
-          sed -n 's/^/::error title=pytest::/p' /tmp/pytest-tail.txt | head -40
+          { grep -E '^(FAILED|ERROR) ' "$F"; grep -E '^E ' "$F"; } \
+            | head -25 | sed -n 's/^/::error title=pytest::/p'
           echo "::endgroup::"
 
   frontend:
