@@ -49,11 +49,8 @@ def _violations(root: Path) -> list[str]:
     return bad
 
 
-def test_text_mode_subprocess_must_pin_encoding():
-    """文本模式子进程必须显式指定 encoding, 否则 Windows 上按 gbk 解码。
-
-    (函数名用 ASCII: 中文测试名会触发 N802, 新增文件不留新告警。)
-    """
+def test_文本模式子进程必须显式指定编码():
+    """任何 text=True / universal_newlines=True 的 subprocess 调用都必须带 encoding=。"""
     missing: list[str] = []
     for rel in SCAN_ROOTS:
         root = REPO_ROOT / rel
