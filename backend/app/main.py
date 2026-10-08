@@ -16,6 +16,7 @@ from app.api import (
     abnormal,
     alerts,
     analysis,
+    auction,
     backtest,
     data,
     diagnostics,
@@ -176,6 +177,13 @@ async def _application_lifespan(app: FastAPI):
     depth_service.set_app_state(app.state)
     app.state.depth_service = depth_service
 
+    # 集合竞价服务(独立旁路线: 09:26/15:01 两次全市场扫描 + 按日 parquet)
+    from app.services.auction_service import AuctionService
+    auction_service = AuctionService()
+    auction_service.set_repo(repo)
+    auction_service.set_app_state(app.state)
+    app.state.auction_service = auction_service
+
     # 启动调度器(若 enriched 数据为空,首次启动可手动 POST /api/pipeline/run)
     try:
         daily_pipeline.set_app_state(app.state)  # 供 depth_finalize job 访问 depth_service
@@ -191,6 +199,12 @@ async def _application_lifespan(app: FastAPI):
         depth_service.start_polling()
     except Exception as e:  # noqa: BLE001
         logger.warning("depth_service init failed: %s", e)
+
+    # 竞价: 启动补跑(今天无分区 → 后台线程扫一次, 全市场约 15~30s 不阻塞启动)
+    try:
+        auction_service.boot_check()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("auction_service init failed: %s", e)
 
     # 盘中分钟增量刷新 (Expert 专有): 线程常驻, 开关/时段/能力门控在循环内每轮判断
     try:
@@ -522,6 +536,7 @@ app.include_router(indices.router)
 app.include_router(overview.router)
 app.include_router(paper.router)
 app.include_router(abnormal.router)
+app.include_router(auction.router)
 app.include_router(diagnostics.router)
 app.include_router(diagnostics.verdict_router)
 app.include_router(regime.router)

@@ -8,11 +8,13 @@ export interface FrontendSlotContextMap {
     collapsed: boolean
     pathname: string
   }
-  /** 个股详情对话框底部扩展区 (日K/分时图表下方) */
+  /** 个股详情对话框底部扩展区 (日K/分时/竞价图表下方) */
   'stock-preview.footer': {
     symbol: string
     name: string | null
-    view: 'daily' | 'intraday'
+    // 'auction' 是后加第三种视图: 只判 'daily' 的插槽无需改动; 若把 else 分支当作
+    // "就是分时"处理, 竞价视图下会画错 —— 依赖穷举的插槽要补 'auction' 分支。
+    view: 'daily' | 'intraday' | 'auction'
   }
   /** 自选页工具栏扩展区 (按钮行末尾) */
   'watchlist.toolbar': {

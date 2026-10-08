@@ -311,6 +311,7 @@ _DATASET_CAP_MAP: tuple[tuple[str, Cap], ...] = (
     ("adj_factor", Cap.ADJ_FACTOR),
     ("minute", Cap.KLINE_MINUTE_BATCH),
     ("depth5", Cap.DEPTH5_BATCH),
+    ("auction", Cap.AUCTION_BATCH),
     ("financial", Cap.FINANCIAL),
     ("full_minute", Cap.INTRADAY_UNIVERSE),
 )
@@ -329,6 +330,7 @@ def _augment_custom_sources(capset: CapabilitySet) -> None:
             "adj_factor": adj_provider,
             "minute": preferences.get_minute_data_provider(),
             "depth5": preferences.get_depth5_data_provider(),
+            "auction": preferences.get_auction_data_provider(),
             "financial": preferences.get_financial_provider(),
             "full_minute": preferences.get_full_minute_data_provider(),
         }

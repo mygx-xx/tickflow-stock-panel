@@ -422,3 +422,57 @@ class EltDxClient:
         if not codes:
             return None
         return self._call(self._ensure().quotes.get_depth, codes)
+
+    # ---- 集合竞价 -------------------------------------------------------
+
+    def auction_series(self, symbol: str, trade_date: date | None = None) -> Any:
+        """单标的集合竞价逐点序列(``AuctionSeries``, 取 ``.points``); 失败抛异常。
+
+        实测口径(eltdx 3.2.3): 上游形参名是 ``date``(不是返回字段名 ``trading_date``);
+        **历史只回溯约 12 个月**(实测 2025-10-09 有、2025-06-03 空), 超窗口/非交易日/
+        无该数据的标的(如沪深综指以外的部分品种、多数北交所个股)一律返回**空 points
+        且不抛异常** —— 空是正常状态, 不能当成失败。
+        """
+        code = to_eltdx_code(symbol)
+        if code is None:
+            raise ValueError(f"无法识别的 symbol: {symbol!r}")
+        return self._call(self._ensure().auctions.series, code, trade_date)
+
+    def auction_batch(
+        self,
+        symbols: list[str],
+        trade_date: date | None = None,
+        *,
+        workers: int | None = None,
+    ) -> tuple[list[tuple[str, Any]], int]:
+        """并发取多标的竞价序列 → ``([(面板symbol, AuctionSeries), ...], 失败数)``。
+
+        竞价是**逐标的**接口(无批量端点), 故用连接池 slot 数并发打点。
+        单标的异常只丢弃该标的(记 warning), 不连坐整批; 返回值携带失败数,
+        由调用方判定"全批失败"并上抛 —— 契约要求服务层按批隔离、不跨源回退。
+        """
+        pairs: list[tuple[str, str]] = []
+        for s in symbols:
+            code = to_eltdx_code(s)
+            if code is not None:
+                pairs.append((s, code))
+        if not pairs:
+            return [], 0
+        step = max(1, int(workers or self._max_workers))
+        out: list[tuple[str, Any]] = []
+        failures = 0
+        with ThreadPoolExecutor(max_workers=min(step, len(pairs))) as pool:
+            futures = {
+                pool.submit(self.auction_series, sym, trade_date): sym for sym, _ in pairs
+            }
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    series = fut.result()
+                except Exception as e:
+                    failures += 1
+                    logger.warning("eltdx auction 单标的失败 %s: %s", sym, str(e)[:80])
+                    continue
+                if series is not None:
+                    out.append((sym, series))
+        return out, failures

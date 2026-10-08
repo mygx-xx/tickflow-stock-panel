@@ -123,7 +123,7 @@ watchlist.toolbar
 各插槽 context 契约（均要求 `apiVersion: 1`，定义见 `frontend/src/extensions/types.ts` 的 `FrontendSlotContextMap`）：
 
 - `layout.navigation.extra`：`{ collapsed, pathname }`，侧边栏导航底部。
-- `stock-preview.footer`：`{ symbol, name, view }`，个股详情对话框底部（日K/分时图表下方）；`view` 为 `'daily' | 'intraday'`。适合个股附加面板：龙虎榜、资金流、外部研究链接等。
+- `stock-preview.footer`：`{ symbol, name, view }`，个股详情对话框底部（日K/分时/竞价图表下方）；`view` 为 `'daily' | 'intraday' | 'auction'`（`'auction'` 为后加值，`apiVersion` 保持 1）。只判 `'daily'` 的插槽无需改动；把 else 分支当作"就是分时"处理的插槽会在竞价视图下画错，需补 `'auction'` 分支。适合个股附加面板：龙虎榜、资金流、外部研究链接等。
 - `watchlist.toolbar`：`{ symbols, viewMode, selectedGroup, refresh }`，自选页工具栏末尾；`symbols` 为当前筛选视图中的标的，`refresh` 在扩展修改数据后调用以刷新自选增强数据。适合批量操作入口：自定义分析、导出、组合计算等。
 
 新增插槽前必须有真实用例，并同时定义 context 类型、异常隔离和测试；不能只在类型表中预留名字。

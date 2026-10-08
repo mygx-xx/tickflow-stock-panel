@@ -136,6 +136,7 @@ class DataStore:
             "ai_cache",
             "user_data",
             "depth5",
+            "auction",
         ):
             (self.data_dir / sub).mkdir(parents=True, exist_ok=True)
 
@@ -253,6 +254,9 @@ class DataStore:
             # 五档盘口 sealed 真假涨停(独立旁路存储,不进 enriched)
             f"""CREATE OR REPLACE VIEW depth5 AS
                 SELECT * FROM read_parquet('{d}/depth5/**/*.parquet', union_by_name=true)""",
+            # 集合竞价逐点(独立旁路存储; 长表, 一标的一时点一行)
+            f"""CREATE OR REPLACE VIEW auction AS
+                SELECT * FROM read_parquet('{d}/auction/**/*.parquet', union_by_name=true)""",
         ]
         for sql in statements:
             try:

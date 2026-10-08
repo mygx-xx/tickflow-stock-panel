@@ -448,6 +448,7 @@ class DataProvidersIn(BaseModel):
     minute_data_provider: str | None = None
     full_minute_data_provider: str | None = None
     depth5_data_provider: str | None = None
+    auction_data_provider: str | None = None
     realtime_data_provider: str | None = None
     financial_data_provider: str | None = None
 
@@ -544,6 +545,7 @@ def get_preferences() -> dict:
         "full_minute_data_provider": preferences.get_full_minute_data_provider(),
         "minute_history_days": _minute_history_days(),
         "depth5_data_provider": preferences.get_depth5_data_provider(),
+        "auction_data_provider": preferences.get_auction_data_provider(),
         "realtime_data_provider": preferences.get_realtime_data_provider(),
         "financial_data_provider": preferences.get_financial_provider(),
         "data_source_job_timeout_s": preferences.get_data_source_job_timeout_s(),
@@ -629,6 +631,7 @@ def get_capability_matrix() -> dict:
             "minute_data_provider": preferences.get_minute_data_provider(),
             "full_minute_data_provider": preferences.get_full_minute_data_provider(),
             "depth5_data_provider": preferences.get_depth5_data_provider(),
+            "auction_data_provider": preferences.get_auction_data_provider(),
             "adj_factor_provider": preferences.get_adj_factor_provider(),
             "financial_data_provider": preferences.get_financial_provider(),
         },
@@ -831,6 +834,7 @@ def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
         "minute_data_provider": preferences.get_minute_data_provider(),
         "full_minute_data_provider": preferences.get_full_minute_data_provider(),
         "depth5_data_provider": preferences.get_depth5_data_provider(),
+        "auction_data_provider": preferences.get_auction_data_provider(),
         "realtime_data_provider": preferences.get_realtime_data_provider(),
         "financial_data_provider": preferences.get_financial_provider(),
     }

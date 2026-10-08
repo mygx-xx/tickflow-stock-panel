@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
-import { X, RefreshCw, Clock, LineChart, Star, RadioTower, Maximize2, Minimize2, Activity } from 'lucide-react'
+import { X, RefreshCw, Clock, LineChart, Star, RadioTower, Maximize2, Minimize2, Activity, AlarmClock } from 'lucide-react'
 import { api } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { cn } from '@/lib/cn'
@@ -12,6 +12,7 @@ import { StockPanel, getDefaultRange } from '@/components/StockPanel'
 import { NavPager, NavWrapToast } from '@/components/NavPager'
 import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { StockMultiDayIntradayChart } from '@/components/StockMultiDayIntradayChart'
+import { StockAuctionPanel } from '@/components/StockAuctionPanel'
 import { DatePicker } from '@/components/DatePicker'
 import { RuleEditor } from '@/components/monitor/RuleEditor'
 import { PriceAlertDialog } from '@/components/stock-analysis/PriceAlertDialog'
@@ -51,7 +52,7 @@ const PRESETS: { label: string; months: number }[] = [
   { label: '1年', months: 12 },
 ]
 
-type PreviewView = 'daily' | 'intraday'
+type PreviewView = 'daily' | 'intraday' | 'auction'
 interface PriceAlertDraft {
   id: number
   targetPrice: number
@@ -229,9 +230,14 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
     if (!symbol) return
     if (view === 'daily') {
       qc.invalidateQueries({ queryKey: ['kline', symbol] })
-    } else {
+    } else if (view === 'intraday') {
       qc.invalidateQueries({ queryKey: ['kline-minute-range', symbol] })
       qc.invalidateQueries({ queryKey: ['kline-minute', symbol!] })
+    } else {
+      // 竞价: 按日分区 + 单股序列都可能在补扫后变化 (段本身不可变, 是显式刷新不是轮询)
+      qc.invalidateQueries({ queryKey: ['auction-series', symbol] })
+      qc.invalidateQueries({ queryKey: ['auction-board'] })
+      qc.invalidateQueries({ queryKey: QK.auctionStatus })
     }
   }
 
@@ -290,7 +296,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
 
               {/* 视图/区间控件: 原第二行并入顶行, 紧邻操作按钮 (原「自选于」标注位置) */}
               <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2.5">
-                {/* 日K / 分时 切换 */}
+                {/* 日K / 分时 / 竞价 切换 */}
                 <div role="tablist" aria-label="图表视图" className="inline-flex shrink-0 items-center rounded border border-border/60 bg-base/60 p-0.5">
                   <button
                     type="button"
@@ -315,6 +321,19 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                   >
                     <Clock className="h-3 w-3" />
                     分时
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={view === 'auction'}
+                    onClick={() => setView('auction')}
+                    className={`inline-flex h-6 items-center gap-1 rounded px-2.5 text-[11px] transition-colors ${
+                      view === 'auction' ? 'bg-accent/20 text-accent font-medium' : 'text-muted hover:text-secondary hover:bg-elevated/60'
+                    }`}
+                    title="开盘/收盘集合竞价撮合序列"
+                  >
+                    <AlarmClock className="h-3 w-3" />
+                    竞价
                   </button>
                 </div>
                 <span className="h-4 w-px shrink-0 bg-border/70" />
@@ -360,7 +379,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                       min={dateRange.start}
                     />
                   </div>
-                ) : (
+                ) : view === 'intraday' ? (
                   <div className="inline-flex items-center gap-2">
                     <div className="inline-flex shrink-0 items-center rounded border border-border/60 bg-base/60 p-0.5" aria-label="分时周期">
                       {dayOptions.map(days => (
@@ -380,7 +399,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                       ))}
                     </div>
                   </div>
-                )}
+                ) : null}
               </div>
 
               <div className="flex shrink-0 items-center gap-1">
@@ -546,7 +565,7 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                   dailyKlineFlex="flex-[1.4]"
                   addedDate={addedDate}
                 />
-              ) : (
+              ) : view === 'intraday' ? (
                 <div className="flex flex-col gap-3">
                 <StockPanel
                   symbol={symbol}
@@ -565,6 +584,9 @@ export function StockPreviewDialogContent({ symbol, name, onClose, triggerInfo, 
                   onPriceDoubleClick={openPriceAlert}
                 />
                 </div>
+              ) : (
+                // 竞价: 日期/段控件在面板内 (竞价只在固定窗口撮合, 与日K/分时的区间选择不同一套)
+                <StockAuctionPanel symbol={symbol} height={380} />
               )}
               </div>
             </div>

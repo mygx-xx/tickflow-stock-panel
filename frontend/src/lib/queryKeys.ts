@@ -147,6 +147,15 @@ export const QK = {
   sectorRotationIndexDaily:  (symbol: string) => ['sector-rotation-index-daily', symbol] as const,
   // 扩展表 schema 清单 (板块切换的资金流列选择器等)
   extSchemaAll:         ['ext-schema-all'] as const,
+
+  // 集合竞价 (auction 数据集)。竞价段在窗口结束后不可变, 由 09:26/15:01 两次扫描
+  // 落盘 → **不进 SSE_INVALIDATE_PREFIXES**: 挂到行情推送上只会按 tick 重复读同一份
+  // 静态数据。刷新点: staleTime 过期、切股/切日、手动扫描成功后显式失效。
+  auctionSeries:        (symbol: string, date: string) => ['auction-series', symbol, date] as const,
+  // symbols 必须进键: 它改变结果集 (个股竞价图用它单取昨收与末点读数)
+  auctionBoard:         (date: string, segment: string, sortBy: string, limit: number, symbols?: string) =>
+                          ['auction-board', date, segment, sortBy, limit, symbols ?? ''] as const,
+  auctionStatus:        ['auction-status'] as const,
 } as const
 
 // ===== SSE 应该 invalidate 的 key 前缀列表 =====

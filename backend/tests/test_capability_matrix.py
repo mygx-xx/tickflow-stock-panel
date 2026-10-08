@@ -19,6 +19,7 @@ DEFAULT_CURRENT = {
     "minute_data_provider": "tickflow",
     "full_minute_data_provider": "tickflow",
     "depth5_data_provider": "tickflow",
+    "auction_data_provider": "eltdx",
     "realtime_data_provider": "tickflow",
     "financial_data_provider": "tickflow",
 }
@@ -34,30 +35,47 @@ def _by_id(matrix: dict) -> dict[str, dict]:
 
 
 def test_registry_covers_all_routing_fields():
-    """注册表是能力的单一权威: 可路由能力与偏好键一一对应、无重复;
-    full_minute 为不可路由能力 (field=None, 仅 TickFlow Expert 提供)。"""
+    """注册表是能力的单一权威: 可路由能力与偏好键一一对应、无重复。
+
+    default 的规则不是"恒为 tickflow", 而是"TickFlow 能提供的能力才默认 tickflow":
+    auction 的 ``tickflow_capable=False``(SDK 无竞价接口), 默认落到唯一实装源 eltdx ——
+    若仍按 tickflow 记账, usable 会谎报可用而服务层取不到数据, 这是金融状态错误。
+    """
     routable = [c["field"] for c in CAPABILITY_REGISTRY if c["field"] is not None]
     assert sorted(routable) == sorted(DEFAULT_CURRENT)
     assert len(set(routable)) == len(routable)
     assert {c["id"] for c in CAPABILITY_REGISTRY} == {
-        "realtime", "daily", "minute", "full_minute", "depth5", "adj_factor", "financial",
+        "realtime", "daily", "minute", "full_minute", "depth5", "auction", "adj_factor",
+        "financial",
     }
     full_minute = next(c for c in CAPABILITY_REGISTRY if c["id"] == "full_minute")
     assert full_minute["field"] == "full_minute_data_provider"
     assert full_minute["tf_tier"] == "expert"
     for cap in CAPABILITY_REGISTRY:
-        assert cap["default"] == "tickflow"
         assert cap["tf_tier"] in ("none", "starter", "pro", "expert")
         assert "follow" not in cap
+        if cap.get("tickflow_capable", True):
+            assert cap["default"] == "tickflow"
+    incapable = {c["id"] for c in CAPABILITY_REGISTRY if not c.get("tickflow_capable", True)}
+    assert incapable == {"auction"}
+    auction = next(c for c in CAPABILITY_REGISTRY if c["id"] == "auction")
+    assert auction["default"] == "eltdx"
 
 
 def test_matrix_without_third_party_sources(monkeypatch):
-    """无插件无自定义源: 每个能力只剩 TickFlow 候选, 默认路由全部生效。"""
+    """无插件无自定义源: TickFlow 能提供的能力只剩 TickFlow 候选并生效;
+    auction 因无源可承载而候选为空、usable=False(fail-closed, 不谎报可用)。"""
     _fake_sources(monkeypatch, [])
     matrix = build_capability_matrix(dict(DEFAULT_CURRENT), tickflow_tier="expert")
     assert matrix["tickflow_tier"] == "expert"
-    assert len(matrix["capabilities"]) == 7
+    assert len(matrix["capabilities"]) == 8
     for cap in matrix["capabilities"]:
+        if cap["id"] == "auction":
+            assert cap["tf_available"] is False
+            assert cap["candidates"] == []
+            assert cap["usable"] is False
+            assert cap["current"] == cap["effective"] == "eltdx"
+            continue
         names = [c["name"] for c in cap["candidates"]]
         assert names == ["tickflow"]
         assert cap["candidates"][0]["kind"] == "builtin"
@@ -287,6 +305,7 @@ def test_api_endpoint_injects_all_routing_preferences(monkeypatch):
         "minute_data_provider": "min-src",
         "full_minute_data_provider": "fm-src",
         "depth5_data_provider": "d5-src",
+        "auction_data_provider": "auc-src",
         "adj_factor_provider": "adj-src",
         "financial_data_provider": "fin-src",
     }
@@ -296,6 +315,7 @@ def test_api_endpoint_injects_all_routing_preferences(monkeypatch):
         "minute_data_provider": "get_minute_data_provider",
         "full_minute_data_provider": "get_full_minute_data_provider",
         "depth5_data_provider": "get_depth5_data_provider",
+        "auction_data_provider": "get_auction_data_provider",
         "adj_factor_provider": "get_adj_factor_provider",
         "financial_data_provider": "get_financial_provider",
     }

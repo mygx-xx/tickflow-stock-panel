@@ -499,6 +499,7 @@ def test_declared_datasets_only() -> None:
         "minute",
         "full_minute",
         "depth5",
+        "auction",
         "financial",
         "adj_factor",
     }
@@ -586,6 +587,7 @@ def test_manifest_parses_and_entry_loads() -> None:
         "minute",
         "full_minute",
         "depth5",
+        "auction",
         "financial",
         "adj_factor",
     }

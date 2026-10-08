@@ -296,6 +296,15 @@ def get_depth5_data_provider() -> str:
     return provider if provider in _allowed_data_providers() else "tickflow"
 
 
+def get_auction_data_provider() -> str:
+    """集合竞价生效源。默认 **eltdx** 而非 tickflow —— TickFlow SDK 没有竞价接口,
+    该能力只能由声明 auction 数据集的插件承担。未安装 eltdx 时这里仍返回 "eltdx",
+    但能力矩阵里它不在 candidates 中 → usable=False → 前端提示去数据源配置。
+    """
+    provider = str(load().get("auction_data_provider", "eltdx") or "eltdx").lower()
+    return provider if provider in _allowed_data_providers() else "eltdx"
+
+
 def get_realtime_data_provider() -> str:
     provider = str(load().get("realtime_data_provider", "tickflow") or "tickflow").lower()
     return provider if provider in _allowed_data_providers() else "tickflow"

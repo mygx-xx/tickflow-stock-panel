@@ -782,3 +782,61 @@ class HttpTransport:
         if not codes:
             return None
         return self._rpc("quotes.get_depth", {"codes": codes})
+
+    # ---- 集合竞价 -------------------------------------------------------
+
+    def auction_series(self, symbol: str, trade_date: date | None = None) -> Any:
+        """单标的集合竞价逐点序列; 失败抛异常。
+
+        ⚠️ **网关形参名陷阱**: 网关按 kwargs 直调 ``AuctionApi.series(code, date)``,
+        形参是 ``date`` 而不是返回字段名 ``trading_date`` —— 传 ``trading_date`` 会得到
+        HTTP 400 ``unexpected keyword argument``。日期以 ISO 字符串下发, 网关原样
+        回传字符串(进程内对象是 ``date``), provider 归一化层必须两种都吃。
+
+        ``date`` 省略时网关取"当日", 但返回的 ``trading_date`` 为 None —— 为了可判定
+        归属, 调用方应始终显式传日期。空 points 是正常状态(非交易日/超约 12 个月
+        回溯窗口/该标的无竞价), 不抛异常。
+        """
+        code = to_eltdx_code(symbol)
+        if code is None:
+            raise ValueError(f"无法识别的 symbol: {symbol!r}")
+        params: dict[str, Any] = {"code": code}
+        if trade_date is not None:
+            params["date"] = (
+                trade_date.isoformat() if hasattr(trade_date, "isoformat") else str(trade_date)
+            )
+        return self._rpc("auctions.series", params)
+
+    def auction_batch(
+        self,
+        symbols: list[str],
+        trade_date: date | None = None,
+        *,
+        workers: int | None = None,
+    ) -> tuple[list[tuple[str, Any]], int]:
+        """并发取多标的竞价序列 → ``([(面板symbol, series), ...], 失败数)``。
+
+        与进程内实现同语义(逐标的接口、单标的失败不连坐整批、返回失败数供调用方
+        判定全批失败)。并发上界受连接池 size 约束, 超出只在池上排队。
+        """
+        pairs = [s for s in symbols if to_eltdx_code(s)]
+        if not pairs:
+            return [], 0
+        step = max(1, int(workers or self._max_workers))
+        out: list[tuple[str, Any]] = []
+        failures = 0
+        with ThreadPoolExecutor(max_workers=min(step, len(pairs))) as pool:
+            futures = {
+                pool.submit(self.auction_series, sym, trade_date): sym for sym in pairs
+            }
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    series = fut.result()
+                except Exception as e:
+                    failures += 1
+                    logger.warning("eltdx-http auction 单标的失败 %s: %s", sym, str(e)[:80])
+                    continue
+                if series is not None:
+                    out.append((sym, series))
+        return out, failures

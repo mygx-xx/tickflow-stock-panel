@@ -1,10 +1,12 @@
 """能力注册表与能力路由矩阵 — 数据集维度的单一权威定义。
 
 能力 (capability) = 一个标准化数据集 (CONTRIBUTING「数据源插件化要求」):
-daily / adj_factor / realtime / minute / depth5 / financial (注册表顺序即设置页卡片顺序)。注册表集中声明每个
+daily / adj_factor / realtime / minute / depth5 / auction / financial (注册表顺序即设置页卡片顺序)。注册表集中声明每个
 能力的展示元数据、路由偏好字段与 TickFlow 档位要求, 前端设置页不再各自硬编码。
 depth5 与其他数据集一样可由插件声明并独立路由; 五档不可用时连板梯队封单/
 看板封单通过 usable 给出缺数据提示。
+auction 是 **TickFlow 不具备**的能力 (tickflow_capable=False): 候选只来自声明该数据集的
+插件, 默认路由即实装源, 未装插件时 usable=False 由前端引导到数据源配置。
 
 build_capability_matrix 把注册表、插件/自定义源的能力声明 (datasets) 和当前
 路由偏好合并为一个矩阵, 供设置页一次拉全。当前偏好由 API 层注入
@@ -67,6 +69,20 @@ CAPABILITY_REGISTRY: list[dict] = [
         "field": "depth5_data_provider",
         "default": "tickflow",
         "tf_tier": "pro",
+    },
+    {
+        "id": "auction",
+        "label": "集合竞价",
+        "desc": "开盘/收盘竞价撮合序列与竞价榜",
+        "field": "auction_data_provider",
+        "default": "eltdx",
+        "tf_tier": "expert",
+        # ⚠️ TickFlow SDK **没有**竞价接口, 该能力只可能由声明 auction 数据集的插件提供。
+        # tickflow_capable=False 使 TickFlow 不进候选: 否则「路由到 tickflow」会被
+        # 判为 usable, 而服务层 getattr 取不到 get_auction_batch —— usable 谎报可用即
+        # 是错误金融状态。默认值因此不是 tickflow 而是唯一实装源 eltdx;
+        # 未安装该插件时 candidates 为空 → usable=False → 前端引导去数据源配置。
+        "tickflow_capable": False,
     },
     {
         "id": "financial",
@@ -163,7 +179,9 @@ def build_capability_matrix(current: dict[str, str], tickflow_tier: str = "none"
     for cap in CAPABILITY_REGISTRY:
         # field=None → 不可路由能力 (仅 TickFlow 提供, 无路由偏好), 生效源恒为默认
         effective = current.get(cap["field"], cap["default"]) if cap["field"] else cap["default"]
-        tf_available = tier_rank >= _TIER_RANK[cap["tf_tier"]]
+        tf_available = cap.get("tickflow_capable", True) and (
+            tier_rank >= _TIER_RANK[cap["tf_tier"]]
+        )
         candidates: list[dict] = []
         pending: list[dict] = []
         if tf_available:

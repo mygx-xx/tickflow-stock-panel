@@ -23,6 +23,7 @@ class Cap(StrEnum):
     INTRADAY_UNIVERSE      = "intraday.universe"
     DEPTH5                 = "depth5"
     DEPTH5_BATCH           = "depth5.batch"
+    AUCTION_BATCH          = "auction.batch"
     WEBSOCKET              = "websocket"
     FINANCIAL              = "financial"
     ADJ_FACTOR             = "adj_factor"

@@ -36,6 +36,7 @@ from typing import Any
 
 import polars as pl
 
+from app.data_providers.base import AUCTION_COLUMNS, AUCTION_SCHEMA
 from app.data_providers.normalizer import DAILY_COLS, normalize_daily
 from app.plugins.eltdx.client import (
     DEFAULT_CONNECTIONS_PER_SERVER,
@@ -94,7 +95,16 @@ def _record_symbol(rec: Any) -> str | None:
     return None
 
 
-_DATASETS = ("daily", "realtime", "minute", "full_minute", "depth5", "financial", "adj_factor")
+_DATASETS = (
+    "daily",
+    "realtime",
+    "minute",
+    "full_minute",
+    "depth5",
+    "auction",
+    "financial",
+    "adj_factor",
+)
 
 # 日 K 列(面板 canonical 9 列, 含 quote_ts; 由 normalizer.DAILY_COLS 单源定义)
 _DAILY_COLUMNS = DAILY_COLS
@@ -102,6 +112,7 @@ _DAILY_COLUMNS = DAILY_COLS
 _MINUTE_COLUMNS = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
 # 除权因子 canonical 3 列(契约: get_adj_factors)
 _ADJ_COLUMNS = ["symbol", "trade_date", "ex_factor"]
+# 集合竞价 canonical 8 列: 契约列在 data_providers.base.AUCTION_COLUMNS(单源)
 
 # 财务: 只实现 shares 表(见 get_financials docstring 的口径依据)。
 # eltdx 的财务有两个来源, 只有前者字段名明确:
@@ -311,6 +322,54 @@ def _depth_row(rec: Any) -> dict | None:
         "ask_volumes": [_to_float(getattr(lv, "volume", None)) for lv in asks],
         "timestamp": _hhmmss_ts(getattr(rec, "update_time_raw", None)),
     }
+
+
+# 竞价序列只有开盘(09:15→09:25)与收盘(14:57→15:00)两段, 实测不含连续竞价点,
+# 故用连续竞价开始时刻做分段界。
+_CONTINUOUS_START_S = 9 * 3600 + 30 * 60
+
+# 竞价长表 schema: 契约列在 data_providers.base.AUCTION_SCHEMA(空帧也带列, 供服务层直接 concat/落盘)
+
+
+def _auction_rows(symbol: str, trade_date: date, series: Any) -> list[dict]:
+    """``AuctionSeries`` → 面板标准竞价行(逐点长表)。
+
+    实测口径(eltdx 3.2.3, 2026-10-08 取证), 三条都是"不照做就会静默出错"的坑:
+
+    * **价格取 ``price_milli/1000``, 不用 ``price``** —— ``price`` 是 float32 还原值
+      (实测 11.569999694824219), ``price_milli``(11570)才是精确整数。
+    * **量单位为手** —— 锚点: 600519.SH 收盘竞价末点 ``matched_volume=472`` 与该日
+      15:00 分钟 K ``volume_lots=472`` 逐位相同(分钟 K 契约同为手)。
+      ``matched_volume`` 是该时点虚拟撮合下的可匹配量、**非累计**(实测竞价中可回落)。
+    * **``unmatched_direction_raw`` +1 = 买侧剩余** —— 锚点: 8 连板一字 600825.SH
+      末点未匹配 5,770,681 手且方向 +1(涨停买队排不进); 低开/抛压标的为 -1。
+
+    日期归属一律采用调用方传入的 ``trade_date``: 上游只在显式传 date 时回传
+    ``trading_date``, 且网关回传的是**字符串**(进程内是 date), 而非交易日它也会把
+    请求日原样回填(实测 2026-10-07 休市仍回 ``td=2026-10-07``) —— 回读会误导。
+    """
+    out: list[dict] = []
+    for p in getattr(series, "points", ()) or ():
+        ts = getattr(p, "time_seconds", None)
+        milli = getattr(p, "price_milli", None)
+        if ts is None or milli is None:
+            continue  # 无法定位时刻或还原精确价: 丢行, 不伪造
+        side_raw = getattr(p, "unmatched_direction_raw", None)
+        out.append({
+            "symbol": symbol,
+            "trade_date": trade_date,
+            "segment": "open" if int(ts) < _CONTINUOUS_START_S else "close",
+            "datetime": datetime.combine(trade_date, dtime()) + timedelta(seconds=int(ts)),
+            "price": int(milli) / 1000,
+            "matched_volume": _to_float(getattr(p, "matched_volume", None)),
+            "unmatched_volume": _to_float(getattr(p, "unmatched_volume", None)),
+            "unmatched_side": (
+                None
+                if side_raw is None
+                else ("buy" if int(side_raw) > 0 else "sell" if int(side_raw) < 0 else None)
+            ),
+        })
+    return out
 
 
 def _today_wallclock_ms(hour: int, minute: int, sec: int, micro: int = 0) -> int | None:
@@ -1153,6 +1212,32 @@ class EltDxProvider:
                 out[symbol] = row
         return out
 
+    # ---- 集合竞价(auction) ----------------------------------------------
+
+    def get_auction_batch(self, symbols: list[str], trade_date: date) -> pl.DataFrame:
+        """集合竞价逐点 → 标准长表(契约见 ``data_providers.base.get_auction_batch``)。
+
+        上游 ``auctions.series`` 是**逐标的**接口(无批量端点), 实测约 78ms/只,
+        连接池并发下 ~360 只/秒(经 HTTP 网关, 2026-10-08 实测), 故内部并发打点。
+
+        失败语义与 depth5 一致: 单标的异常只丢该标的(空 points 本就是正常状态,
+        非交易日/超约 12 个月回溯窗口/北交所多数个股与部分指数都没有竞价),
+        **全批都失败**才上抛, 由服务层按批隔离, provider 不跨源回退。
+        """
+        valid = [s for s in symbols if to_eltdx_code(s)]
+        if not valid:
+            logger.warning("eltdx get_auction_batch: 无有效代码(入参 %d 个)", len(symbols))
+            return pl.DataFrame(schema=AUCTION_SCHEMA)
+        pairs, failures = self._client.auction_batch(valid, trade_date)
+        if not pairs and failures >= len(valid):
+            raise RuntimeError(f"eltdx 竞价全批失败({failures}/{len(valid)} 只)")
+        rows: list[dict] = []
+        for sym, series in pairs:
+            rows.extend(_auction_rows(sym, trade_date, series))
+        if not rows:
+            return pl.DataFrame(schema=AUCTION_SCHEMA)
+        return pl.DataFrame(rows, schema=AUCTION_SCHEMA).select(AUCTION_COLUMNS)
+
     # ---- 财务 -------------------------------------------------------------
 
     def get_financials(
@@ -1345,6 +1430,16 @@ class EltDxProvider:
                 ]
                 df = pl.DataFrame(rows) if rows else pl.DataFrame()
                 return self._preview(dataset, df)
+            if dataset == "auction":
+                syms = [s for s in (symbols or [])][:2] or ["000001.SZ"]
+                df = self.get_auction_batch(syms, date.today())
+                out = self._preview(dataset, df)
+                if df.is_empty():
+                    out["note"] = (
+                        "当日无竞价点: 可能休市/尚未到竞价窗口/该标的无竞价数据"
+                        "(北交所多数个股与部分指数没有), 也可能已超约 12 个月回溯窗口"
+                    )
+                return out
             if dataset == "financial":
                 syms = [s for s in (symbols or [])][:3] or ["600519.SH"]
                 df = self.get_financials("shares", syms)

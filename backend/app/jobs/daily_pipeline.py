@@ -1132,6 +1132,21 @@ def _scheduled_depth_finalize() -> None:
         depth_svc.finalize()
 
 
+def _scheduled_auction_sweep() -> None:
+    """集合竞价全市场扫描(调度入口, 节假日跳过)。
+
+    两次触发(09:26 开盘段 / 15:01 含收盘段的全天)而非盘中轮询: 上游竞价序列是
+    **已完成段**, 段内点位不可变, 轮询只会重复拉同一批数据、白烧通达信连接。
+    服务内部不抛异常(旁路线), 失败只体现在返回的 stats 与日志。
+    """
+    if _holiday_skip("auction_sweep"):
+        return
+    state = _get_app_state()
+    svc = getattr(state, "auction_service", None) if state else None
+    if svc:
+        svc.sweep()
+
+
 def _run_tracked(fn, job_label: str) -> bool:
     """调度触发时包装 JobStore 跟踪，确保同步历史有记录。
 
@@ -1497,6 +1512,19 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
         replace_existing=True,
     )
 
+    # 集合竞价: 09:26 抓开盘段(盘前决策当天可用), 15:01 抓全天含收盘段并覆盖。
+    # 竞价段在窗口结束后不可变, 所以晚触发只是延后拿到, 不会拿到半截数据。
+    for _auc_id, _auc_hm in (("auction_sweep_open", (9, 26)), ("auction_sweep_close", (15, 1))):
+        scheduler.add_job(
+            _scheduled_auction_sweep,
+            trigger=CronTrigger(day_of_week="mon-fri",
+                                hour=_auc_hm[0], minute=_auc_hm[1],
+                                timezone="Asia/Shanghai"),
+            id=_auc_id,
+            misfire_grace_time=3600,
+            replace_existing=True,
+        )
+
     # 周期性能力重探: 付费 Key 中途过期/续费无需重启即可被发现。
     # 只热更新 app.state.capabilities(API 端点、盘后管道 _pipeline_then_refresh 均读它);
     # 档位变化记 WARNING, 让「Key 失效」在日志/前端可见, 不再静默按旧档位打 403 端点。
@@ -1558,7 +1586,8 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
                     lifecycle_sched["hour"], lifecycle_sched["minute"])
 
     scheduler.start()
-    logger.info("scheduler started; instruments@%02d:%02d, pipeline@%02d:%02d, depth@%02d:%02d mon-fri",
+    logger.info("scheduler started; instruments@%02d:%02d, pipeline@%02d:%02d, depth@%02d:%02d, "
+                "auction@09:26+15:01 mon-fri",
                 inst_sched["hour"], inst_sched["minute"], sched["hour"], sched["minute"],
                 depth_sched["hour"], depth_sched["minute"])
     return scheduler
