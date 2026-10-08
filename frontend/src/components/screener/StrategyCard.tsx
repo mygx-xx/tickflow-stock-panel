@@ -232,8 +232,9 @@ export function StrategyCard({
       ) : (
         /* mini */
         <>
+          {/* flex-1 让文字区吃掉剩余宽度: 否则两个图标跟在长度不一的命中文本后面, 逐行左右参差 */}
           <button onClick={onRun} disabled={disabled}
-            className="flex min-w-0 items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait">
+            className="flex min-w-0 flex-1 items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait">
             <span className="text-[8px] px-0.5 rounded bg-secondary/10 text-muted border border-border font-medium leading-tight shrink-0 whitespace-nowrap">{srcLabel}</span>
             <span className="text-[10px] font-medium truncate min-w-0 text-foreground">{name}</span>
             {count != null && !loading && (
