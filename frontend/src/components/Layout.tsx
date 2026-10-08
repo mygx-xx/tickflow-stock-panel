@@ -249,7 +249,7 @@ function DataSourceHealthBadge({ matrix }: { matrix: CapabilityMatrix | undefine
         onFocus={openPop}
         onBlur={closePop}
         onKeyDown={e => { if (e.key === 'Escape') setPopPos(null) }}
-        className="group relative flex items-center gap-2 overflow-hidden rounded-md py-1.5 pl-2.5 pr-2 transition-colors duration-150 hover:bg-elevated/70"
+        className="group relative flex items-center gap-2 overflow-hidden rounded-md py-1.5 pl-3 pr-3 transition-colors duration-150 hover:bg-elevated/70"
       >
         <span className="pointer-events-none absolute inset-y-1.5 left-0 w-[2px] rounded-full bg-accent/50 transition-colors group-hover:bg-accent" />
         <DatabaseZap className="h-3.5 w-3.5 shrink-0 text-muted group-hover:text-accent transition-colors" />
@@ -332,7 +332,7 @@ function AIConfigBadge({ configured, model }: { configured?: boolean; model?: st
   return (
     <NavLink
       to="/settings?tab=ai"
-      className="group relative flex items-center gap-2 overflow-hidden rounded-md py-1.5 pl-2.5 pr-2 transition-colors duration-150 hover:bg-elevated/70"
+      className="group relative flex items-center gap-2 overflow-hidden rounded-md py-1.5 pl-3 pr-3 transition-colors duration-150 hover:bg-elevated/70"
       title={`AI 配置 — ${descText}`}
     >
       <span className="pointer-events-none absolute inset-y-1.5 left-0 w-[2px] rounded-full bg-purple-400/50 transition-colors group-hover:bg-purple-400" />
@@ -695,9 +695,11 @@ export function Layout() {
           overlayPreview && 'fixed inset-y-0 left-0 z-50 w-56 shadow-2xl border-r border-border',
         )}
       >
-        <div className={cn('border-b border-border shrink-0', railMode ? 'px-2 pt-3 pb-2' : 'px-4 pt-4 pb-3')}>
+        {/* 侧栏两侧统一用 px-2 外距 + 内部 px-3 内距 = 图标左沿 20px,
+            与下方菜单项同一基线; 品牌行单独补 px-2 让 logo 仍落在 16px。 */}
+        <div className={cn('border-b border-border shrink-0', railMode ? 'px-2 pt-3 pb-2' : 'px-2 pt-4 pb-3')}>
           {/* Brand block — 收起时只显 logo 居中 */}
-          <div className={cn('flex', railMode ? 'flex-col items-center gap-2' : 'items-center gap-2')}>
+          <div className={cn('flex', railMode ? 'flex-col items-center gap-2' : 'items-center gap-2 px-2')}>
             <Logo
               size={railMode ? 24 : 26}
               className="shrink-0 drop-shadow-[0_0_8px_rgba(139,92,246,0.4)]"
@@ -1001,7 +1003,6 @@ export function Layout() {
 
         <div className={cn('border-t border-border py-3 shrink-0', railMode ? 'px-2 flex flex-col items-center gap-1' : 'px-2')}>
           <div className={railMode ? 'flex flex-col items-center gap-1' : 'flex items-center gap-1'}>
-            <ThemeToggle />
             <NavLink
               to="/settings"
               title={railMode ? '设置' : undefined}
@@ -1061,6 +1062,9 @@ export function Layout() {
                 </>
               )}
             </NavLink>
+            {/* 主题切换按钮殿后: 若放在「设置」左侧会把设置图标右推 36px,
+                导致图标左沿 (20px) 与 active 竖条 (8px) 双双与菜单项错位 */}
+            <ThemeToggle />
           </div>
         </div>
       </aside>
