@@ -141,6 +141,7 @@ def stage_all_supported(tool: Path) -> bool:
         out = subprocess.run(
             [sys.executable, str(tool), "--help"],
             capture_output=True, text=True, timeout=120,
+            encoding="utf-8", errors="replace",
         ).stdout
     except Exception:  # noqa: BLE001
         return False

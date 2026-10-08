@@ -170,6 +170,8 @@ def install_plugin(name: str) -> tuple[bool, str]:
                 cwd=str(pdir),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=300,
             )
         elif runtime == "python":
@@ -191,6 +193,7 @@ def install_plugin(name: str) -> tuple[bool, str]:
                 result = subprocess.run(
                     [uv_bin, "pip", "install", "--python", sys.executable, "-r", str(req)],
                     capture_output=True, text=True, timeout=300,
+                    encoding="utf-8", errors="replace",
                     env={**__import__("os").environ, "UV_HTTP_TIMEOUT": "300"},
                 )
                 # exit 2 通常是配置文件解析错误, 绕过配置重试
@@ -202,12 +205,14 @@ def install_plugin(name: str) -> tuple[bool, str]:
                          "--python", sys.executable,
                          "-r", str(req)],
                         capture_output=True, text=True, timeout=300,
+                        encoding="utf-8", errors="replace",
                         env={**__import__("os").environ, "UV_HTTP_TIMEOUT": "300"},
                     )
             else:
                 result = subprocess.run(
                     [sys.executable, "-m", "pip", "install", "-r", str(req)],
                     capture_output=True, text=True, timeout=300,
+                    encoding="utf-8", errors="replace",
                 )
         else:
             return False, f"runtime={runtime} 无需安装依赖"
@@ -272,7 +277,10 @@ def uninstall_plugin(name: str) -> tuple[bool, str]:
         cmd = ([uv_bin, "pip", "uninstall", "--python", sys.executable, *pkgs]
                if uv_bin else [sys.executable, "-m", "pip", "uninstall", "-y", *pkgs])
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+                encoding="utf-8", errors="replace",
+            )
             if result.returncode != 0:
                 return False, f"卸载失败: {(result.stderr or '').strip()[-300:]}"
             return True, f"已卸载 {len(pkgs)} 个包"
