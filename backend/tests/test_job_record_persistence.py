@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 from app.services.pipeline_jobs import JobStore
 
@@ -123,3 +125,46 @@ def test_terminal_write_replaces_running_snapshot(tmp_path):
     disk = _read_disk(d, jid)
     assert disk["status"] == "failed"
     assert disk["error"] == "boom"
+
+
+# ── 落盘原子性(并发读者不得看到半截 JSON) ──────────────────────────────
+
+def test_terminal_write_swaps_file_atomically(tmp_path, monkeypatch):
+    """终态落盘必须经「临时文件 + os.replace」原子换入, 不得原地 truncate。
+
+    旧实现用 ``path.write_text``: 先截断再写, 并发读者(轮询线程里的
+    ``_read_file``)会读到半截 JSON → 解析失败 → 返回 None, 与「任务不存在」
+    无法区分。CI(2 核 runner)上 ``test_api_jobs_wait_before_computing`` 即因此
+    报 ``'NoneType' object is not subscriptable`` —— 本机 22 核的轮询间隔极少
+    落进这个亚毫秒窗口, 所以长期只红在 CI。
+
+    这里的判定不靠"压概率": 直接把 ``os.replace`` 换成探针, 断言
+    (a) 终态确实经 rename 换入, (b) rename 发生的瞬间目标文件仍是**完整的**
+    旧快照(说明此前从未被 truncate), (c) 临时文件不残留且不被
+    ``glob("*.json")`` 扫到。
+    """
+    d = tmp_path / "jobs"
+    store = JobStore(store_dir=d)
+    jid, _ = store.create(timeout_s=60)
+    store.start(jid)
+    dst = d / f"{jid}.json"
+    assert json.loads(dst.read_text("utf-8"))["status"] == "running"
+
+    swaps = []
+    real_replace = os.replace
+
+    def spy_replace(src, target):
+        # rename 之前, 目标必须仍是完整的旧快照 —— 原地写的话这里早已是空壳
+        assert json.loads(Path(target).read_text("utf-8"))["status"] == "running"
+        swaps.append((Path(src), Path(target)))
+        return real_replace(src, target)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    store.succeed(jid, {"rows": 3})
+
+    assert swaps, "终态必须经 os.replace 原子换入(原地写会让读者读到半截文件)"
+    assert swaps[-1][1] == dst
+    assert json.loads(dst.read_text("utf-8"))["status"] == "succeeded"
+    # 临时文件不得残留, 也不得混进 job 列表/清理逻辑的 glob("*.json")
+    assert not list(d.glob("*.tmp.*")), "临时文件残留"
+    assert [f.name for f in d.glob("*.json")] == [f"{jid}.json"]

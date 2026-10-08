@@ -20,7 +20,12 @@ import pytest
 
 from app.plugins.eltdx import client as eltdx_client
 from app.plugins.eltdx.client import EltDxClient, to_eltdx_code, to_panel_symbol
-from app.plugins.eltdx.provider import EltDxProvider, _snapshot_ts, availability
+from app.plugins.eltdx.provider import (
+    _CN_TZ,
+    EltDxProvider,
+    _snapshot_ts,
+    availability,
+)
 
 # ---------------------------------------------------------------------------
 # 代码格式转换
@@ -264,11 +269,18 @@ def test_snapshot_ts_parsing_and_invalid(monkeypatch) -> None:
 
     真机样例: 15330366 → 15:33:03.66(当日最后一笔, 收盘后 15:33 时刻)。
     非法值(时/分/秒越界、位数不足)返回 None, 由下游退本地时间。
+
+    还原时刻**必须显式指定 _CN_TZ**: 契约是"A 股墙钟(北京时间)", 而
+    ``datetime.fromtimestamp(ts)`` 会用**运行机器**的本地时区 —— 本机
+    UTC+8 恰好等于北京时区所以通过, GitHub runner 是 UTC, 于是同一份代码
+    在 CI 上得出 07:33 而非 15:33, 长期只有 CI 红。
     """
     _assume_trading_day(monkeypatch, True)
+    assert _CN_TZ.utcoffset(None) == timedelta(hours=8), "A 股墙钟必须是北京时间"
+
     ts = _snapshot_ts(15330366)  # 15:33:03.66
     assert ts is not None
-    dt = datetime.fromtimestamp(ts / 1000)
+    dt = datetime.fromtimestamp(ts / 1000, tz=_CN_TZ)
     assert (dt.hour, dt.minute, dt.second) == (15, 33, 3)
     assert _snapshot_ts(None) is None
     assert _snapshot_ts("abc") is None
@@ -941,7 +953,8 @@ def test_hhmmss_ts_parses_both_widths(raw, expect_hm, monkeypatch) -> None:
     """时间戳解析需兼容 6 位(盘口)与 8 位(快照)两种紧凑形态。
 
     休市日该函数返回 None (日期不可归属, 见 test_snapshot_ts_withheld_on_holiday),
-    故这里固定"交易日"以免测试结果随运行日漂移。
+    故这里固定"交易日"以免测试结果随运行日漂移。还原时刻必须显式带 _CN_TZ
+    (北京时间), 不能依赖运行机器的本地时区 —— 见 test_snapshot_ts_parsing_and_invalid。
     """
     from app.plugins.eltdx.provider import _hhmmss_ts
 
@@ -950,7 +963,7 @@ def test_hhmmss_ts_parses_both_widths(raw, expect_hm, monkeypatch) -> None:
     if expect_hm is None:
         assert ts is None
     else:
-        dt = datetime.fromtimestamp(ts / 1000)
+        dt = datetime.fromtimestamp(ts / 1000, tz=_CN_TZ)
         assert (dt.hour, dt.minute, dt.second) == expect_hm
 
 

@@ -115,15 +115,35 @@ class JobStore:
     # ===== persistence =====
 
     def _write_file(self, job: dict[str, Any]) -> None:
-        """将 job 快照写入独立 JSON 文件(create/start/终态均落盘)。"""
+        """将 job 快照写入独立 JSON 文件(create/start/终态均落盘)。
+
+        **必须原子替换**(临时文件 + ``os.replace``): ``write_text`` 是先截断再写,
+        并发读者(轮询线程里的 ``_read_file``)会读到半截 JSON → 解析失败 →
+        返回 None, 与「任务不存在」无法区分 —— HTTP 侧表现为任务凭空 404。
+
+        这正是 CI(2 核 runner)上 ``test_api_jobs_wait_before_computing`` 报
+        ``'NoneType' object is not subscriptable`` 的原因: 终态落盘与
+        ``/jobs/{id}`` 轮询撞在一起; 本机 22 核轮询间隔(5ms)极少落进这个
+        亚毫秒窗口, 所以长期只红在 CI。
+
+        ``os.replace`` 在同一文件系统内原子(POSIX rename / Windows ReplaceFile),
+        读者要么看到旧快照、要么看到新快照, 不存在中间态。临时文件名刻意**不以
+        .json 结尾**, 以免被 ``glob("*.json")`` 的列表/清理逻辑扫到。
+        """
         path = self._store_dir / f"{job['id']}.json"
+        tmp = self._store_dir / f"{job['id']}.json.tmp.{os.getpid()}.{threading.get_ident()}"
         try:
-            path.write_text(
+            tmp.write_text(
                 json.dumps(job, ensure_ascii=False, indent=None),
                 encoding="utf-8",
             )
+            os.replace(tmp, path)
         except Exception:
             logger.warning("failed to write job file %s", path)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def _read_file(self, job_id: str) -> dict[str, Any] | None:
         """从磁盘读取单个 job 文件。"""
@@ -269,32 +289,41 @@ class JobStore:
 
     def succeed(self, job_id: str, result: Any) -> None:
         with self._lock:
-            j = self._active_jobs.pop(job_id, None)
+            j = self._active_jobs.get(job_id)
             if not j:
                 return
-            j["status"] = "succeeded"
-            j["finished_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-            j["progress"] = 100
-            j["result"] = result
-            j["duration_s"] = _duration_s(j)
+            # 在**副本**上构造终态快照: 内存里那份保持完整可读 —— 否则
+            # _summary() 可能取到"status 已改、finished_at 还没写"的半成品。
+            finished = {**j}
+            finished["status"] = "succeeded"
+            finished["finished_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            finished["progress"] = 100
+            finished["result"] = result
+            finished["duration_s"] = _duration_s(finished)
             if self._active_id == job_id:
                 self._active_id = None
             self._delete_oldest()
-            self._write_file(j)
+            # 落盘在移出内存**之前**: get() 不加锁, 先 pop 再写盘的话这中间
+            # 读内存为空、读盘只能拿到旧的 running 快照(状态倒退)。
+            self._write_file(finished)
+            self._active_jobs.pop(job_id, None)
 
     def fail(self, job_id: str, error: str) -> None:
         with self._lock:
-            j = self._active_jobs.pop(job_id, None)
+            j = self._active_jobs.get(job_id)
             if not j:
                 return
-            j["status"] = "failed"
-            j["finished_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-            j["error"] = error
-            j["duration_s"] = _duration_s(j)
+            finished = {**j}
+            finished["status"] = "failed"
+            finished["finished_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            finished["error"] = error
+            finished["duration_s"] = _duration_s(finished)
             if self._active_id == job_id:
                 self._active_id = None
             self._delete_oldest()
-            self._write_file(j)
+            # 同 succeed: 先落盘再移出内存, 读者永远看到单调前进的快照。
+            self._write_file(finished)
+            self._active_jobs.pop(job_id, None)
 
     # ===== progress =====
 
