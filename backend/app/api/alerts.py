@@ -56,9 +56,21 @@ def clear_alerts(request: Request):
 
 
 @router.delete("/{ts}")
-def delete_alert(ts: int, request: Request):
-    """删除单条触发记录 (按 ts 毫秒时间戳)。"""
-    deleted = alert_store.delete_one(_data_dir(request), ts)
+def delete_alert(
+    ts: int,
+    request: Request,
+    # ts 是落盘时刻, 批量写入时一批共享同一个 ts (一次策略扫描可达数百条),
+    # 只靠 ts 会删错记录 — 前端把被点记录的身份字段一并带上, 全部相等才命中。
+    symbol: str | None = None,
+    type: str | None = None,
+    rule_name: str | None = None,
+    message: str | None = None,
+):
+    """删除单条触发记录 (ts + 可选身份字段精确定位)。"""
+    deleted = alert_store.delete_one(
+        _data_dir(request), ts,
+        symbol=symbol, type=type, rule_name=rule_name, message=message,
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="记录不存在")
     return {"ok": True}

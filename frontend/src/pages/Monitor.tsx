@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react'
 import { useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -22,6 +22,8 @@ import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import { toNavItems, type NavItem } from '@/lib/listNav'
 import { DimensionMembersDialog, type DimensionKind, type DimensionMembersTarget } from '@/components/DimensionMembersDialog'
 import { usePreferences, useQuoteStatus } from '@/lib/useSharedQueries'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { VIRTUAL_LIST_THRESHOLD, useParentScroll } from '@/components/virtual-list/useParentScroll'
 
 const TYPE_LABEL: Record<string, string> = {
   signal: '信号', price: '价格/涨跌', market: '市场异动', strategy: '策略监控', sector: '板块监控',
@@ -117,6 +119,30 @@ function AlertExtTags({ ev, fields, onTagClick }: {
   )
 }
 
+/** 同屏同时做"新增闪烁"的卡片上限 — 策略一次扫描可批量命中数十只, 若整批一起闪,
+ *  左栏会出现整片明暗跳变 (实测 30 条同批时约 24% 视口像素在一帧内跳变)。
+ *  只让最新到的前 N 条闪, 保留"有新记录"的提示, 又不制造满屏闪烁。 */
+const MAX_FLASH_ITEMS = 6
+
+/**
+ * 触发记录的唯一稳定键。
+ *
+ * 后端 ts 是"落盘时刻": append_many 批量写入时整批共享同一个 ts
+ * (实测近 7 天 408 条记录只有 2 个 ts, 单批 213 条同 ts), 所以 ts 不能当主键。
+ * 这里用「ts + 来源 + 类型 + 代码 + 规则名 + 消息」做内容指纹, 同内容的重复推送
+ * 再用出现序号区分 —— 列表身份稳定, React 才会复用节点而不是每次刷新重建卡片
+ * (重建即重播入场动画 + 触发重复 key 警告 → 整列闪)。
+ */
+function buildKeyedAlerts(events: AlertEvent[]): { ev: AlertEvent; key: string }[] {
+  const seen = new Map<string, number>()
+  return events.map(ev => {
+    const base = `${ev.ts}|${ev.source}|${ev.type}|${ev.symbol ?? ''}|${ev.rule_name ?? ''}|${ev.message ?? ''}`
+    const n = seen.get(base) ?? 0
+    seen.set(base, n + 1)
+    return { ev, key: n === 0 ? base : `${base}|${n}` }
+  })
+}
+
 export function Monitor() {
   const qc = useQueryClient()
   const [editorOpen, setEditorOpen] = useState(false)
@@ -182,9 +208,9 @@ export function Monitor() {
 
   // 进入监控页: 清零未读徽标 + 记录"进入时刻", 之后新增的记录会闪烁
   // 离开监控页: 停止同步, 之后新增才计入未读
-  const enterTsRef = useRef<number>(Date.now())
+  // enterTs 用 state 固定: 它是"哪些记录算新增"的判定基准, 值变化会让闪烁集合整体重算。
+  const [enterTs] = useState(() => Date.now())
   useEffect(() => {
-    enterTsRef.current = Date.now()
     markSeen()
     return () => leaveMonitorPage()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -254,7 +280,7 @@ export function Monitor() {
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-auto p-3.5">
-              <AlertsList alertsQuery={alertsQuery} confirmClear={confirmClear} setConfirmClear={setConfirmClear} total={total} enterTs={enterTsRef.current} monitorExtFields={monitorExtFields} />
+              <AlertsList alertsQuery={alertsQuery} confirmClear={confirmClear} setConfirmClear={setConfirmClear} total={total} enterTs={enterTs} monitorExtFields={monitorExtFields} />
             </div>
           </section>
 
@@ -338,7 +364,8 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
 }) {
   const qc = useQueryClient()
   const navigate = useNavigate()
-  const [confirmTs, setConfirmTs] = useState<number | null>(null)
+  // 确认态记录的是列表项的稳定键 (不是 ts —— 同批记录共享 ts, 用 ts 会让整批一起进确认态)
+  const [confirmKey, setConfirmKey] = useState<string | null>(null)
   const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [previewEv, setPreviewEv] = useState<AlertEvent | null>(null)
   const [memberPreview, setMemberPreview] = useState<{ symbol: string; name?: string } | null>(null)
@@ -351,30 +378,100 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['alerts'] }); setConfirmClear(false); resetBadge() },
   })
   const delMut = useMutation({
-    mutationFn: (ts: number) => api.alertDelete(ts),
+    mutationFn: (ev: AlertEvent) => api.alertDelete({
+      ts: ev.ts,
+      symbol: ev.symbol || undefined,
+      type: ev.type || undefined,
+      rule_name: ev.rule_name || undefined,
+      message: ev.message || undefined,
+    }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['alerts'] }),
   })
 
   // 点击删除: 第一次进入确认态, 第二次真删, 3 秒后自动复位
-  const handleClickDelete = (ts: number) => {
-    if (confirmTs === ts) {
+  const handleClickDelete = (item: { ev: AlertEvent; key: string }) => {
+    if (confirmKey === item.key) {
       // 第二次点击 → 真删
       if (resetTimer.current) clearTimeout(resetTimer.current)
-      setConfirmTs(null)
-      delMut.mutate(ts)
+      setConfirmKey(null)
+      delMut.mutate(item.ev)
     } else {
       // 第一次点击 → 进入确认态, 3 秒后自动复位
-      setConfirmTs(ts)
+      setConfirmKey(item.key)
       if (resetTimer.current) clearTimeout(resetTimer.current)
-      resetTimer.current = setTimeout(() => setConfirmTs(null), 3000)
+      resetTimer.current = setTimeout(() => setConfirmKey(null), 3000)
     }
   }
 
-  const events = (alertsQuery.data as any)?.alerts ?? []
+  const events: AlertEvent[] = (alertsQuery.data as any)?.alerts ?? []
+  const keyedEvents = useMemo(() => buildKeyedAlerts(events), [events])
+
+  // 触发记录单页可达 500 条 → 一次挂载 2.3 万个 DOM 节点。每次 10s 轮询 / SSE 推送都要
+  // 重排整列 (实测单帧 310~393 张卡位移、主线程单次阻塞 190~260ms), 几百张带阴影和圆角的
+  // 卡片同时重绘 —— 这是"整列都在闪"的放大器: 即使只有 6 张卡在跑动画, 剩下的重排也把
+  // 一次数据更新放大成满屏抖动。超过阈值改为窗口化渲染: 只挂载视口内约 10 张卡。
+  const listRef = useRef<HTMLDivElement>(null)
+  const virtualize = keyedEvents.length > VIRTUAL_LIST_THRESHOLD
+  const { getScrollElement, scrollMargin: virtualScrollMargin } = useParentScroll(listRef, virtualize)
+  const rowVirtualizer = useVirtualizer({
+    count: virtualize ? keyedEvents.length : 0,
+    getScrollElement,
+    // 未测量行的占位高度。取值要紧贴实测行高: 锚定补偿是按"下标 × (占位高 + gap)"
+    // 推算插入位移的, 占位高偏 1px, 一次插入 150 行就偏 150px。
+    // 75 来自实测 (列表总高 41437px / 500 行 − 8px gap ≈ 74.9), 实测行由
+    // measureElement 回填, 所以只有"还没渲染到的行"吃这个估值。
+    estimateSize: () => 75,
+    // 用内容指纹作 item key: 新记录从头部插入时, react-virtual 能复用既有测量结果,
+    // 不会因下标整体位移而重测/重排全部卡片。
+    getItemKey: (index) => keyedEvents[index]?.key ?? index,
+    gap: 8,
+    overscan: 6,
+    scrollMargin: virtualScrollMargin,
+  })
+  // 虚拟化: 只遍历视口内的槽位 (vi 非空)。非虚拟化: 遍历全部 (vi 为 null)。
+  const renderSlots = virtualize
+    ? rowVirtualizer.getVirtualItems().map((vi) => ({ vi, idx: vi.index }))
+    : keyedEvents.map((_, idx) => ({ vi: null as null, idx }))
+
+  // 滚动锚定: 新记录总是从头部插入 (列表倒序), 一批 100~200 条会把正在读的内容
+  // 整体顶走一万多像素 —— 用户看到的就是"列表突然跳一下/闪一下"。
+  // 做法: 找到"原首项"现在落在第几个下标, 用它新的起始偏移作为位移量补回 scrollTop,
+  // 视口里正在看的那几张卡就保持不动 (仅在用户已滚离顶部时生效)。
+  // 不能"先找锚点项再比 start": 插入 150 条后锚点项会落到渲染窗口之外, 那时拿不到它,
+  // 锚定会静默失效; getOffsetForIndex 走的是测量缓存, 与该项是否在渲染窗口内无关。
+  const headKeyRef = useRef<string | null>(null)
+  useLayoutEffect(() => {
+    if (!virtualize) {
+      headKeyRef.current = null
+      return
+    }
+    const headKey = keyedEvents[0]?.key ?? null
+    const prevHead = headKeyRef.current
+    headKeyRef.current = headKey
+    if (!prevHead || prevHead === headKey) return
+    const idx = keyedEvents.findIndex((e) => e.key === prevHead)
+    if (idx <= 0) return
+    const el = getScrollElement()
+    if (!el || el.scrollTop <= 24) return
+    const shift = rowVirtualizer.getOffsetForIndex(idx, 'start')?.[0] ?? 0
+    if (Number.isFinite(shift) && shift > 0.5) el.scrollTop += shift
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keyedEvents, virtualize])
+
+  // 新增闪烁集合: 只取"进入页面之后新到"的最新若干条 (列表本身按时间倒序)
+  const flashKeys = useMemo(() => {
+    const out = new Set<string>()
+    for (const { ev, key } of keyedEvents) {
+      if (ev.ts <= enterTs) continue
+      if (out.size >= MAX_FLASH_ITEMS) break
+      out.add(key)
+    }
+    return out
+  }, [keyedEvents, enterTs])
 
   // 切股导航列表: 有 symbol 的触发记录 (按展示顺序)
   const alertsNavItems = useMemo(
-    () => toNavItems(events.filter((ev: AlertEvent) => ev.symbol)),
+    () => toNavItems(events.filter((ev): ev is AlertEvent & { symbol: string } => !!ev.symbol)),
     [events],
   )
   const handlePreviewEvent = useCallback((ev: AlertEvent) => {
@@ -403,21 +500,26 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
           hint="监控规则命中后,触发记录会出现在这里。可在右侧配置规则,或在标的详情页加入监控。"
         />
       ) : (
-        <div className="space-y-2">
-              {events.map((ev: any, i: number) => {
+        <div
+          ref={listRef}
+          className={virtualize ? 'relative' : 'space-y-2'}
+          style={virtualize ? { height: rowVirtualizer.getTotalSize() } : undefined}
+        >
+              {renderSlots.map(({ vi, idx }) => {
+            const { ev, key } = keyedEvents[idx]
             const sev = SEVERITY_CONFIG[ev.severity ?? 'info'] ?? SEVERITY_CONFIG.info
             const SevIcon = sev.icon
-            const isNew = ev.ts > enterTs
-            return (
+            const isNew = flashKeys.has(key)
+            const card = (
               <motion.div
-                key={`${ev.ts}-${ev.symbol ?? ''}-${ev.rule_name ?? ''}`}
-                initial={isNew ? { opacity: 0, y: -8, scale: 0.98 } : { opacity: 0, y: 4 }}
-                animate={isNew ? {
-                  opacity: [0, 1, 1, 0.85, 1],
-                  scale: [0.98, 1, 1, 1.01, 1],
-                  y: [-8, 0, 0, 0, 0],
-                } : { opacity: 1, y: 0 }}
-                transition={isNew ? { duration: 1.2, times: [0, 0.2, 0.5, 0.75, 1] } : { duration: 0.2, delay: Math.min(i * 0.02, 0.2) }}
+                key={key}
+                // 非新增记录 initial={false}: 直接以终态渲染, 不参与任何入场动画。
+                // 否则列表每次刷新(10s 轮询 / SSE 推送)重建卡片时都会重新淡入 → 整列闪。
+                initial={isNew ? { opacity: 0 } : false}
+                // 新增记录只做透明度脉冲, 不再缩放: scale 会把卡片提升为合成层并放大
+                // 重绘范围, 批量命中时几十个层一起动, 是"整屏闪"的主要来源。
+                animate={isNew ? { opacity: [0, 1, 0.82, 1] } : { opacity: 1 }}
+                transition={isNew ? { duration: 1.1, times: [0, 0.25, 0.7, 1] } : undefined}
                 className={cn(
                   'group relative flex items-start gap-3 overflow-hidden rounded-lg border bg-surface pl-3.5 pr-3 py-2.5 shadow-sm transition-all duration-200 hover:border-border hover:shadow-md hover:shadow-black/10 hover:-translate-y-px',
                   isNew ? 'border-accent/60 ring-1 ring-accent/30' : 'border-border/50',
@@ -624,10 +726,10 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
                   <span className="text-[10px] text-muted/60 font-mono">
                     {new Date(ev.ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
                   </span>
-                  {confirmTs === ev.ts ? (
+                  {confirmKey === key ? (
                     // 确认态: 红色实心按钮 (原删除图标位置), 再点确认删除
                     <button
-                      onClick={() => handleClickDelete(ev.ts)}
+                      onClick={() => handleClickDelete({ ev, key })}
                       title="再次点击确认删除"
                       className="inline-flex items-center gap-1 rounded-md bg-danger/15 px-1.5 py-0.5 text-[10px] font-medium text-danger border border-danger/30 animate-pulse cursor-pointer"
                     >
@@ -635,7 +737,7 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
                     </button>
                   ) : (
                     <button
-                      onClick={() => handleClickDelete(ev.ts)}
+                      onClick={() => handleClickDelete({ ev, key })}
                       disabled={delMut.isPending}
                       title="删除"
                       className="rounded p-1 text-muted/0 transition-colors group-hover:text-muted/40 hover:!text-danger hover:bg-danger/10 cursor-pointer"
@@ -645,6 +747,20 @@ function AlertsList({ alertsQuery, confirmClear, setConfirmClear, total, enterTs
                   )}
                 </div>
               </motion.div>
+            )
+            // 虚拟化: 包一层绝对定位槽位 (位置由虚拟器给出), 卡片本身仍是同一个 motion.div。
+            // 非虚拟化: 直接返回卡片, 保持原有 space-y-2 流式布局。
+            if (!vi) return card
+            return (
+              <div
+                key={vi.key}
+                ref={rowVirtualizer.measureElement}
+                data-index={vi.index}
+                className="absolute left-0 top-0 w-full"
+                style={{ transform: `translateY(${vi.start - virtualScrollMargin}px)` }}
+              >
+                {card}
+              </div>
             )
           })}
         </div>

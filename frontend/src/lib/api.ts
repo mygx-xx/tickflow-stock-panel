@@ -4173,8 +4173,20 @@ export const api = {
   alertsClear: () =>
     request<{ ok: boolean; cleared: number }>('/api/alerts', { method: 'DELETE' }),
 
-  alertDelete: (ts: number) =>
-    request<{ ok: boolean }>(`/api/alerts/${ts}`, { method: 'DELETE' }),
+  /**
+   * 删除单条触发记录。
+   * ts 是落盘时刻, 批量写入时一批记录共享同一个 ts, 因此必须带上被点记录的身份字段,
+   * 否则会删到同批次里的另一条。
+   */
+  alertDelete: (target: { ts: number; symbol?: string; type?: string; rule_name?: string; message?: string }) => {
+    const qs = new URLSearchParams()
+    if (target.symbol) qs.set('symbol', target.symbol)
+    if (target.type) qs.set('type', target.type)
+    if (target.rule_name) qs.set('rule_name', target.rule_name)
+    if (target.message) qs.set('message', target.message)
+    const s = qs.toString()
+    return request<{ ok: boolean }>(`/api/alerts/${target.ts}${s ? `?${s}` : ''}`, { method: 'DELETE' })
+  },
 
   /** 生成演示触发记录 (Dev 页用) */
   alertSeed: (count = 12, recent = true) =>

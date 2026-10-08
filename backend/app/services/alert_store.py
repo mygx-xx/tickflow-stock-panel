@@ -136,12 +136,35 @@ def clear(data_dir: Path) -> int:
         return count
 
 
-def delete_one(data_dir: Path, ts: int) -> bool:
-    """删除指定 ts 的单条记录,返回是否删除成功。
+def delete_one(
+    data_dir: Path,
+    ts: int,
+    *,
+    symbol: str | None = None,
+    type: str | None = None,
+    rule_name: str | None = None,
+    message: str | None = None,
+) -> bool:
+    """删除单条记录,返回是否删除成功。
 
-    JSONL 无主键, 用 ts(毫秒时间戳) 作为标识。
-    若存在多条同 ts, 只删第一条。
+    JSONL 无主键。ts(毫秒) 是「落盘时刻」, 批量写入 (append_many) 时同一批
+    记录共享同一个 ts —— 实测一次策略扫描可产出数百条同 ts 记录。因此只按 ts
+    定位会删错记录, 必须叠加其余身份字段:
+    传入的字段全部相等才命中, 未传入的字段不参与判定。
     """
+    def _matches(ev: dict) -> bool:
+        if ev.get("ts") != ts:
+            return False
+        if symbol is not None and ev.get("symbol") != symbol:
+            return False
+        if type is not None and ev.get("type") != type:
+            return False
+        if rule_name is not None and ev.get("rule_name") != rule_name:
+            return False
+        if message is not None and ev.get("message") != message:
+            return False
+        return True
+
     with _lock:
         p = _path(data_dir)
         if not p.exists():
@@ -158,7 +181,7 @@ def delete_one(data_dir: Path, ts: int) -> bool:
                         ev = json.loads(line)
                     except Exception:
                         continue
-                    if not deleted and ev.get("ts") == ts:
+                    if not deleted and _matches(ev):
                         deleted = True
                         continue
                     kept.append(ev)
