@@ -32,11 +32,12 @@ function isValidPrice(v: number | null | undefined): v is number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0
 }
 
-/** 竞价量读数(手): 一万手以内保留整数精度, 以上才折万/亿。
- *  直接用 fmtBigNum 会把 10,996 手显示成「1万手」—— 竞价撮合量级本身就小, 这样丢精度。 */
+/** 竞价量读数(手): 十万手以内保留整数精度, 以上才折万/亿。
+ *  阈值不能压在 1e4: 大盘股开盘竞价匹配量普遍就在 1万~10万手 (宁德时代 10,996 手),
+ *  那样多数行会被 fmtBigNum 折成「1万手」, 只剩一位有效数字。 */
 function lotLabel(v: number | null | undefined): string {
   if (v == null || Number.isNaN(v)) return '—'
-  return v >= 1e4 ? fmtBigNum(v) : Math.round(v).toLocaleString('en-US')
+  return v >= 1e5 ? fmtBigNum(v) : Math.round(v).toLocaleString('en-US')
 }
 
 function sideOf(p: AuctionPoint): 'buy' | 'sell' | null {
@@ -50,6 +51,19 @@ function buildOption(points: AuctionPoint[], prevClose: number | null | undefine
   const matched = points.map(p => p.matched_volume)
   const unmatched = points.map(p => (sideOf(p) ? p.unmatched_volume : null))
   const lastPrice = [...prices].reverse().find(isValidPrice)
+  // x 轴标签位: 先按分钟去重(10 分钟窗口能有 60+ 个撮合点), 再从这些分钟里抽约 6 个。
+  // 直接按点索引取模会让抽中的槽位反复落进同一分钟, 轴上就成了 14:57 14:57 14:57。
+  const minuteMarks = (() => {
+    const firstAt = new Map<string, number>()
+    labels.forEach((l, i) => {
+      const m = l.slice(0, 5)
+      if (!firstAt.has(m)) firstAt.set(m, i)
+    })
+    const idx = [...firstAt.values()]
+    if (!idx.length) return new Set<number>()
+    const step = Math.max(1, Math.round(idx.length / 6))
+    return new Set(idx.filter((_, k) => k % step === 0))
+  })()
   const lineColor = !isValidPrice(prevClose) || !isValidPrice(lastPrice)
     ? C.priceFlat
     : lastPrice > prevClose ? C.priceUp : lastPrice < prevClose ? C.priceDown : C.priceFlat
@@ -143,8 +157,8 @@ function buildOption(points: AuctionPoint[], prevClose: number | null | undefine
           color: ct.text,
           fontSize: 10,
           fontFamily: 'JetBrains Mono, monospace',
-          // 竞价窗口只有 10 分钟(开盘段)/3 分钟(收盘段), 按点数抽稀避免标签重叠
-          interval: (i: number) => i % Math.max(1, Math.round(labels.length / 6)) === 0,
+          // 竞价窗口只有 10 分钟(开盘段)/3 分钟(收盘段), 按分钟去重后再抽稀, 标签不会同刻重复
+          interval: (i: number) => minuteMarks.has(i),
           formatter: (v: string) => v.slice(0, 5),
         },
       },
