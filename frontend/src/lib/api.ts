@@ -466,6 +466,8 @@ export interface ScreenerResultSummary {
   as_of: string
   /** 渐进式 run_all 写入的计算时间戳 (Unix ms); 监控实时叠加等来源无此字段 */
   computed_at?: number | null
+  /** 本轮策略执行失败的原因 (如引用了面板未提供的数据列); 成功时无此字段 */
+  error?: string
 }
 
 export interface ScreenerCachedSummary {
@@ -513,6 +515,8 @@ export interface ScreenerRunAllSummary {
   complete?: boolean
   /** 后台执行出错时的错误信息 (部分结果仍会返回) */
   error?: string | null
+  /** 逐策略失败原因 (策略 → 一句话); 卡片据此显示「缺数据」 */
+  errors?: Record<string, string>
   /** 本次执行起点 (Unix ms, 后端时钟), 用于判断缓存结果是否属于本轮 */
   started_at?: number | null
 }

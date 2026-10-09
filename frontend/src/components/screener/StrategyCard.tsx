@@ -101,6 +101,8 @@ interface StrategyCardProps {
   computing?: boolean
   /** 等待运行 (自动计算关闭/失败时的分钟策略): 数字未出时显示「待计算」点击引导 */
   awaitRun?: boolean
+  /** 本轮执行失败的原因 (缺数据列等): 有值时数字槽改显「缺数据」, 原因放 tooltip */
+  error?: string
   /** 生命周期状态 (draft/active/watch/retired); draft 不渲染徽标 */
   status?: string
   /** 后端下发的状态说明, 用作徽标 tooltip */
@@ -110,23 +112,27 @@ interface StrategyCardProps {
 }
 
 export function StrategyCard({
-  name, description, source, active, count, expiredCount,
+  name, description, source, active, count: countValue, expiredCount,
   loading, cardSize,
-  onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing, awaitRun,
+  onRun, disabled, onSettings, monitored, onToggleMonitor, timeframeBadge, computing, awaitRun, error,
   status, statusLabel, verdict,
 }: StrategyCardProps) {
   const cs = CARD_STYLES[cardSize]
   const activeCls = active
     ? 'border-accent/50 bg-accent/10 shadow-[0_0_10px_rgba(59,130,246,0.1)]'
     : 'border-border bg-surface hover:border-accent/40 hover:bg-accent/[0.03]'
-  const countCls = count === 0
-    ? 'text-muted'
-    : 'bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent'
   const srcLabel = cardSize === 'mini' ? (SRC_MAP[source ?? ''] ?? '内') : (SRC_MAP[source ?? ''] ?? '内置')
   const badgeCls = BADGE_CLS_MAP[source ?? 'builtin'] ?? BADGE_CLS_MAP.builtin
 
+  // 跑挂的策略: 后端给的 total 是占位 0, 显示成数字会让人以为「今日无命中」。
+  // 失败态优先于数字、失效数与计算占位, 原因收进 title 悬浮查看。
+  const showError = !!error && !loading
+  const count = showError ? undefined : countValue
   // 失效数 > 0 时显示
-  const hasExpired = expiredCount != null && expiredCount > 0
+  const hasExpired = !showError && expiredCount != null && expiredCount > 0
+  const countCls = count === 0
+    ? 'text-muted'
+    : 'bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent'
 
   return (
     <motion.div
@@ -165,10 +171,13 @@ export function StrategyCard({
                 )}
               </div>
             )}
-            {count == null && !loading && computing && (
+            {showError && (
+              <span className="mt-1.5 text-[10px] text-red-400/80" title={error}>缺数据</span>
+            )}
+            {!showError && count == null && !loading && computing && (
               <span className="mt-1.5 text-sm font-mono font-bold text-muted/50 animate-pulse">···</span>
             )}
-            {count == null && !loading && !computing && awaitRun && (
+            {!showError && count == null && !loading && !computing && awaitRun && (
               <span className="mt-1.5 text-[10px] text-muted/60 transition-colors group-hover:text-accent/80" title="自动计算未开启或失败 — 点击卡片实时计算">待计算</span>
             )}
             {loading && <div className="mt-1 h-4 w-10 rounded bg-elevated animate-pulse" />}
@@ -200,10 +209,13 @@ export function StrategyCard({
               {count != null && !loading && (
                 <span className={`text-xs font-mono font-bold tabular-nums shrink-0 ${countCls}`}>{count}</span>
               )}
-              {count == null && !loading && computing && (
+              {showError && (
+                <span className="text-[10px] text-red-400/80 shrink-0" title={error}>缺数据</span>
+              )}
+              {!showError && count == null && !loading && computing && (
                 <span className="text-xs font-mono font-bold text-muted/50 animate-pulse shrink-0">···</span>
               )}
-              {count == null && !loading && !computing && awaitRun && (
+              {!showError && count == null && !loading && !computing && awaitRun && (
                 <span className="text-[10px] text-muted/60 transition-colors group-hover:text-accent/80 shrink-0" title="自动计算未开启或失败 — 点击卡片实时计算">待计算</span>
               )}
               {loading && <span className="w-5 h-3 rounded bg-elevated animate-pulse shrink-0" />}
@@ -232,22 +244,26 @@ export function StrategyCard({
       ) : (
         /* mini */
         <>
-          {/* flex-1 让文字区吃掉剩余宽度: 否则两个图标跟在长度不一的命中文本后面, 逐行左右参差 */}
+          {/* flex-1 落在策略名上: 剩余宽度由名称吃掉, 命中数右沿与图标同列对齐, 逐行可直接比大小。
+              失效数排在命中数之前, 否则它出现的那一行会把命中数往左顶, 数字列参差。 */}
           <button onClick={onRun} disabled={disabled}
             className="flex min-w-0 flex-1 items-center gap-1 cursor-pointer disabled:opacity-50 disabled:cursor-wait">
             <span className="text-[8px] px-0.5 rounded bg-secondary/10 text-muted border border-border font-medium leading-tight shrink-0 whitespace-nowrap">{srcLabel}</span>
-            <span className="text-[10px] font-medium truncate min-w-0 text-foreground">{name}</span>
+            <span className="text-[10px] font-medium truncate min-w-0 flex-1 text-left text-foreground">{name}</span>
+            {hasExpired && (
+              <span className="text-[9px] font-mono text-red-400/70 shrink-0">{'-' + expiredCount}</span>
+            )}
             {count != null && !loading && (
               <span className={`text-xs font-mono font-bold tabular-nums shrink-0 ${countCls}`}>{count}</span>
             )}
-            {count == null && !loading && computing && (
+            {showError && (
+              <span className="text-[9px] text-red-400/80 shrink-0" title={error}>缺数据</span>
+            )}
+            {!showError && count == null && !loading && computing && (
               <span className="text-xs font-mono font-bold text-muted/50 animate-pulse shrink-0">···</span>
             )}
-            {count == null && !loading && !computing && awaitRun && (
+            {!showError && count == null && !loading && !computing && awaitRun && (
               <span className="text-[9px] text-muted/60 transition-colors group-hover:text-accent/80 shrink-0" title="自动计算未开启或失败 — 点击卡片实时计算">待算</span>
-            )}
-            {hasExpired && (
-              <span className="text-[9px] font-mono text-red-400/70 shrink-0">{'-' + expiredCount}</span>
             )}
             {loading && <span className="w-4 h-2.5 rounded bg-elevated animate-pulse shrink-0" />}
           </button>

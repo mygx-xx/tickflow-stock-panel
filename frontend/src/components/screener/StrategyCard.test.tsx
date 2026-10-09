@@ -63,6 +63,34 @@ it('mini size also renders the hint', () => {
   expect(container.textContent).toContain('待算')
 })
 
+// 缺数据态: 策略本轮跑挂 (如引用了面板未提供的数据列) 时后端给的 total 只是占位 0,
+// 显示成「0」会被读成「今日无命中」。error 必须顶掉数字、失效数与计算占位, 原因收进 title。
+it('error replaces the placeholder count and puts the reason in the tooltip', () => {
+  const reason = '策略引用了面板未提供的数据列 "pb_latest"'
+  render({ count: 0, expiredCount: 3, error: reason })
+
+  expect(container.textContent).toContain('缺数据')
+  expect(container.textContent).not.toContain('0')
+  expect(container.textContent).not.toContain('-3')
+  const badge = [...container.querySelectorAll('span')].find(el => el.textContent === '缺数据')
+  expect(badge?.getAttribute('title')).toBe(reason)
+})
+
+it('error wins over computing and awaitRun placeholders in mini size', () => {
+  render({ cardSize: 'mini', count: 0, error: '缺少列', computing: true, awaitRun: true })
+
+  expect(container.textContent).toContain('缺数据')
+  expect(container.textContent).not.toContain('···')
+  expect(container.textContent).not.toContain('待算')
+})
+
+it('count renders normally when there is no error', () => {
+  render({ count: 12 })
+
+  expect(container.textContent).toContain('12')
+  expect(container.textContent).not.toContain('缺数据')
+})
+
 it('onRun fires when the card is clicked', () => {
   const onRun = vi.fn()
   render({ awaitRun: true, onRun })

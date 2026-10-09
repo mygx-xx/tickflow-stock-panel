@@ -214,6 +214,8 @@ export function Screener() {
   const [hitCounts, setHitCounts] = useState<Record<string, number>>({})
   // 各策略失效数 (今日曾命中 - 当前命中)
   const [expiredCounts, setExpiredCounts] = useState<Record<string, number>>({})
+  // 各策略本轮执行失败原因 (如引用了面板未提供的数据列): 卡片显示「缺数据」而不是数字
+  const [strategyErrors, setStrategyErrors] = useState<Record<string, string>>({})
   // 各策略显示上限 (null = 全部)
   const [strategyLimits, setStrategyLimits] = useState<Record<string, number | null>>({})
   // run_all 渐进式返回后仍在后台计算的策略 (startedAt 为后端时钟, 用于判断缓存新旧)
@@ -413,6 +415,11 @@ export function Screener() {
         counts[id] = item.total
       }
       setHitCounts(prev => ({ ...prev, ...counts }))
+      // 首返已判失败的策略立刻挂「缺数据」: 摘要轮询只在 pendingRun 期间开启,
+      // 全批都失败时没有轮询, 单靠缓存透出要等下次进页面
+      if (data.errors && Object.keys(data.errors).length) {
+        setStrategyErrors(prev => ({ ...prev, ...data.errors }))
+      }
       // 渐进式返回: 慢策略后台继续算, 开启摘要轮询逐个点亮
       setPendingRun(
         data.pending?.length
@@ -469,9 +476,11 @@ export function Screener() {
     if (!summaryQuery.data || !asOf) return
     const counts: Record<string, number> = {}
     const expired: Record<string, number> = {}
+    const errs: Record<string, string> = {}
     for (const [id, r] of Object.entries(summaryQuery.data.results)) {
       if (r.as_of !== asOf) continue
       counts[id] = r.total
+      if (r.error) errs[id] = r.error
       const everCount = summaryQuery.data.today_ever_counts[id] ?? r.total
       const expiredCount = Math.max(everCount - r.total, 0)
       if (expiredCount > 0) expired[id] = expiredCount
@@ -489,6 +498,7 @@ export function Screener() {
       return next
     })
     setExpiredCounts(expired)
+    setStrategyErrors(errs)
     // 渐进式: computed_at 晚于本轮起点的策略已算完, 从 pending 中移除;
     // 无 computed_at (监控实时叠加/旧缓存) 视为新鲜。容差吸收前后端时钟差。
     if (pendingRun) {
@@ -1272,6 +1282,7 @@ export function Screener() {
                   active={activeStrategy === s.id}
                   count={hitCounts[id]}
                   expiredCount={expiredCounts[id]}
+                  error={strategyErrors[id]}
                   loading={runAll.isPending}
                   computing={pendingRunIds.has(id) || selfRunning || minuteRunning}
                   awaitRun={hitCounts[id] == null && isMinute && !selfRunning && !minuteRunning}
