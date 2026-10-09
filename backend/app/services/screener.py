@@ -45,8 +45,18 @@ def enriched_history_days(data_dir, asset_type: str = "stock", as_of: date | Non
 
 
 # ── 进程级历史数据缓存 (避免 run_all 每次重新扫描 parquet + 计算指标) ──
-_history_cache: dict[tuple[str, date, int], tuple[float, pl.DataFrame]] = {}
+#
+# key 只含 (asset_type, target_date), **不含 lookback_days**。
+# 原因: 慢路径算出的宽帧对所有窗口都是同一份, 只是裁剪长度不同。
+# 把 lookback 放进 key 会导致每个窗口各占一个槽位、各算一次 (~3.5s/次):
+# 策略池里有 13 个不同 LOOKBACK_DAYS (120/130/140/200/260...), 首次加载要算 13 次
+# ≈45s, 且槽位上限 10 会让它们互相逐出 -> 每次切页都重新计算。
+# 改为按日期缓存"最大窗口的完整帧", 命中后按请求窗口裁剪, 首次只需算 1 次。
+_history_cache: dict[tuple[str, date], tuple[float, pl.DataFrame]] = {}
 _HISTORY_CACHE_TTL = 120.0  # 秒
+# 单个缓存帧保留的最大交易日数: 取策略池里最大的 LOOKBACK_DAYS 再留余量。
+# 命中后统一从这份帧上裁剪, 所以它必须 >= 任何请求窗口, 否则会少给数据。
+_HISTORY_CACHE_MAX_BARS = 400
 
 # load_prior_consecutive 最多回看多少个已存在的日分区 (缺列时继续往前找的上限)
 _PRIOR_PARTITION_SCAN = 10
@@ -59,6 +69,31 @@ class ScreenerResult:
     rows: list[dict] = field(default_factory=list)
     total: int = 0
     elapsed_ms: float = 0.0
+
+
+def _trim_history(df: pl.DataFrame, target_date: date, lookback_days: int) -> pl.DataFrame | None:
+    """把完整帧裁成"目标日及之前最近 lookback_days 个交易日"。
+
+    与慢路径的裁剪口径**必须完全一致**(按交易日计数, 不用自然日),
+    否则缓存命中与未命中会给出不同窗口 —— test_enriched_history_past_target.py
+    锁定的正是这个不变量。
+
+    返回 None 表示这份帧不够长(缓存是在更小窗口下算的), 调用方应丢弃重算:
+    静默返回短窗口会让策略拿到不足的历史, 算出错误信号。
+    """
+    if "date" not in df.columns:
+        return df
+    upto = df.filter(pl.col("date") <= target_date)
+    if upto.is_empty():
+        return None
+    trading_dates = upto["date"].unique().sort()
+    # 需要 lookback_days + 1 个交易日(起点+窗口), 不足则这份帧不可用
+    if len(trading_dates) < lookback_days + 1:
+        return None
+    if len(trading_dates) > lookback_days:
+        lookback_start = trading_dates[-(lookback_days + 1)]
+        upto = upto.filter(pl.col("date") >= lookback_start)
+    return upto.sort(["symbol", "date"])
 
 
 class ScreenerService:
@@ -259,6 +294,9 @@ class ScreenerService:
 
         优先从 repo 内存缓存获取 (启动时已预计算), 命中时 0ms。
         缓存 miss 时走 scan_parquet + compute_indicators 慢路径。
+
+        进程级缓存按 (asset_type, target_date) 存**最大窗口的完整帧**,
+        命中后按 lookback_days 裁剪下发 —— 见模块顶部 _history_cache 的说明。
         """
         # 优先级 1: repo 级预计算缓存 (启动时 _refresh_enriched 已计算完整历史; 仅 stock)
         t0 = time.perf_counter()
@@ -276,20 +314,29 @@ class ScreenerService:
                             target_date, lookback_days, elapsed, len(cached))
                 return cached
 
-        # 优先级 2: 进程级 history_cache (之前的 TTL 缓存)
-        cache_key = (self.asset_type, target_date, lookback_days)
+        # 优先级 2: 进程级 history_cache —— 按日期存完整帧, 按窗口裁剪
+        cache_key = (self.asset_type, target_date)
         now = time.monotonic()
         ttl_cached = _history_cache.get(cache_key)
         if ttl_cached is not None:
             ts, cached_df = ttl_cached
             if now - ts < _HISTORY_CACHE_TTL:
-                logger.debug("history TTL cache hit: %s lookback=%d", target_date, lookback_days)
-                return cached_df
-            del _history_cache[cache_key]
+                trimmed = _trim_history(cached_df, target_date, lookback_days)
+                if trimmed is not None:
+                    logger.debug("history TTL cache hit: %s lookback=%d -> %d rows",
+                                 target_date, lookback_days, len(trimmed))
+                    return trimmed
+                # 缓存帧比请求窗口短(说明缓存是在更小的窗口下算的), 丢弃重算,
+                # 否则会静默少给数据 —— 策略拿到的历史不足会算出错误的信号。
+                del _history_cache[cache_key]
+            else:
+                del _history_cache[cache_key]
 
         # 优先级 3: scan_parquet + compute_indicators (慢路径, ~5s)
-        logger.warning("_load_enriched_history cache miss, computing indicators (%s, %d)...",
-                       target_date, lookback_days)
+        # 一次算到最大窗口, 让同一日期的所有策略共用这一帧
+        compute_bars = max(lookback_days, _HISTORY_CACHE_MAX_BARS)
+        logger.warning("_load_enriched_history cache miss, computing indicators (%s, %d->%d)...",
+                       target_date, lookback_days, compute_bars)
         from app.indicators.pipeline import (
             compute_indicators,
             compute_limit_signals,
@@ -297,7 +344,13 @@ class ScreenerService:
         )
 
         warmup = 60
-        start = target_date - timedelta(days=min((lookback_days + warmup) * 2, 180))
+        # 按**交易日**需求反推自然日跨度: 原实现硬编码上限 180 自然日(≈120 交易日),
+        # 导致任何 >120 的窗口(如 200/260)都取不到足够历史 —— 帧被裁到 120 后,
+        # 缓存命中判定为"帧不足"而反复重算(实测大窗口每次都花 2.8~3.3s)。
+        # 用 1.5 倍自然日/交易日比(含周末, 不含长假) + 30 天余量, 并保留原上限
+        # 以兼容历史行为; 该跨度只影响 scan 范围, 返回前仍按交易日精确裁剪。
+        calendar_days = int((compute_bars + warmup) * 1.5) + 30
+        start = target_date - timedelta(days=max(calendar_days, 180))
 
         enriched_dir = self.repo.store.data_dir / self._enriched_dirname
         # 同 _compute_enriched_full: turnover_rate 存储列随行透传 (#187)
@@ -335,13 +388,16 @@ class ScreenerService:
             if "name" not in df_full.columns:
                 df_full = df_full.join(instruments.select(inst_cols), on="symbol", how="left")
 
-        # 裁剪掉 warmup 部分, 只保留 lookback 范围 (减少 group_by 开销)。
-        # 按交易日计数: 从数据里实际存在的交易日序列取最后 lookback_days 个交易日,
+        # 裁剪掉 warmup 部分, 只保留 compute_bars 范围 (减少 group_by 开销)。
+        # 按交易日计数: 从数据里实际存在的交易日序列取最后 N 个交易日,
         # 不能用 timedelta(days=N) (自然日), 否则周末/节假日会让窗口偏少, 与回测不一致。
+        #
+        # 注意这里裁到 compute_bars(=max(请求窗口, _HISTORY_CACHE_MAX_BARS)),
+        # 存进缓存的是这一份完整帧; 命中其它窗口时由 _trim_history 再裁。
         if "date" in df_full.columns:
             trading_dates = df_full["date"].unique().sort()
-            if len(trading_dates) > lookback_days:
-                lookback_start = trading_dates[-(lookback_days + 1)]
+            if len(trading_dates) > compute_bars:
+                lookback_start = trading_dates[-(compute_bars + 1)]
             else:
                 lookback_start = trading_dates[0]
             df_full = df_full.filter(pl.col("date") >= lookback_start)
@@ -349,12 +405,13 @@ class ScreenerService:
         df_full = df_full.sort(["symbol", "date"])
 
         elapsed = (time.perf_counter() - t0) * 1000
-        logger.info("_load_enriched_history(%s, %d): computed in %.1fms, %d rows",
-                    target_date, lookback_days, elapsed, len(df_full))
+        logger.info("_load_enriched_history(%s, %d): computed in %.1fms, %d rows (frame bars=%d)",
+                    target_date, lookback_days, elapsed, len(df_full), compute_bars)
 
         _history_cache[cache_key] = (now, df_full)
-        # TTL 先清一轮; 仍超上限时按最旧无条件淘汰 — 否则两分钟内出现 >10 个
-        # 不同 (asset_type, date, lookback) 键时全部新鲜、零逐出, 数 GB 宽帧驻留
+        # TTL 先清一轮; 仍超上限时按最旧无条件淘汰。
+        # key 现在只含 (asset_type, date), 槽位需求从"窗口数"降到"日期数",
+        # 上限 10 足够容纳 10 个不同查询日; 逐出策略仍保留以防历史日期被批量扫描。
         if len(_history_cache) > 10:
             expired = [k for k, (ts, _) in _history_cache.items() if now - ts > _HISTORY_CACHE_TTL]
             for k in expired:
@@ -363,7 +420,11 @@ class ScreenerService:
                 oldest = min(_history_cache, key=lambda k: _history_cache[k][0])
                 del _history_cache[oldest]
 
-        return df_full
+        # 返回值必须与"未命中缓存"时的窗口口径一致; _trim_history 返回 None 只会在
+        # 帧不足时发生(这里刚按 compute_bars 裁过, 正常不会), 兜底返回完整帧。
+        # 注意不能用 `a or b`: Polars DataFrame 的真值判断会抛 TypeError。
+        trimmed = _trim_history(df_full, target_date, lookback_days)
+        return df_full if trimmed is None else trimmed
 
     def run(
         self,
