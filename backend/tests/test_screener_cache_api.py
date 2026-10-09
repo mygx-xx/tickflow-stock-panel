@@ -55,6 +55,37 @@ def test_cached_summary_omits_rows_and_counts_realtime_expirations(monkeypatch, 
     assert "rows" not in payload["results"]["strategy_a"]
 
 
+def test_cached_summary_透出缺数据策略的失败原因(monkeypatch, tmp_path):
+    """跑挂的策略要把原因带给卡片: 否则只剩空白, 用户看不出是策略引用了缺失列。"""
+    reason = '策略引用了面板未提供的数据列 "pb_latest"'
+    cached = {
+        "as_of": "2026-07-20",
+        "results": {
+            "strategy_ok": {"as_of": "2026-07-20", "total": 1, "rows": [{"symbol": "000001.SZ"}]},
+            # 同日重跑才失败: 旧结果还在, 但原因必须一并透出
+            "strategy_stale": {"as_of": "2026-07-20", "total": 3, "rows": []},
+        },
+        "errors": {"strategy_broken": reason, "strategy_stale": reason},
+        "today_ever_rows": {},
+        "updated_at": 1,
+    }
+    monkeypatch.setattr(screener_api.strategy_cache, "read_cache", lambda *_args: cached)
+
+    payload = screener_api.get_cached_summary(_request(tmp_path))
+
+    assert payload["results"]["strategy_stale"]["error"] == reason
+    # 只有失败没有结果的策略也要有条目, 前端才有地方挂原因
+    assert payload["results"]["strategy_broken"] == {
+        "total": 0,
+        "as_of": "2026-07-20",
+        "computed_at": None,
+        "error": reason,
+    }
+    assert "error" not in payload["results"]["strategy_ok"]
+    # 失败策略不进「今日曾命中」差分, 卡片不会同时冒出 -N 失效数
+    assert payload["today_ever_counts"] == {"strategy_ok": 1, "strategy_stale": 0}
+
+
 def test_cached_result_returns_only_requested_rows_with_ext_and_strategy_membership(monkeypatch, tmp_path):
     cached = {
         "as_of": "2026-07-20",

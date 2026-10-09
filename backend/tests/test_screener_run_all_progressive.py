@@ -70,6 +70,17 @@ def _wait_cache_results(tmp_path, want_ids, timeout=8.0) -> dict:
     return (strategy_cache.read_cache(tmp_path) or {}).get("results") or {}
 
 
+def _wait_cache_errors(tmp_path, want_ids, timeout=8.0) -> dict:
+    """等失败原因落进缓存 (cached-summary 靠它给卡片挂「缺数据」)。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        errors = (strategy_cache.read_cache(tmp_path) or {}).get("errors") or {}
+        if all(i in errors for i in want_ids):
+            return errors
+        time.sleep(0.05)
+    return (strategy_cache.read_cache(tmp_path) or {}).get("errors") or {}
+
+
 def _wait_timings(tmp_path, want_ids, timeout=8.0) -> dict:
     """等耗时台账写齐。
 
@@ -347,3 +358,8 @@ def test_run_all_isolates_single_strategy_failure(
     assert set(results) == {"ok_a", "ok_b"}
     assert "broken" not in results
     assert "boom: schema mismatch" in (resp["errors"] or {}).get("broken", "")
+
+    # 失败原因同时落缓存: 首返之后 cached-summary 还能告诉卡片「为什么没数」
+    errors = _wait_cache_errors(tmp_path, ["broken"])
+    assert "boom: schema mismatch" in errors["broken"]
+    assert set(errors) == {"broken"}

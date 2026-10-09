@@ -439,6 +439,8 @@ def get_cached_summary(request: Request):
     """返回策略卡片所需的轻量摘要，不序列化股票明细。"""
     cached = _cached_with_realtime(request)
     results = cached.get("results") or {}
+    cached_as_of = cached.get("as_of")
+    errors = cached.get("errors") or {}
     summary = {
         sid: {
             "total": int(result.get("total") or 0),
@@ -446,12 +448,22 @@ def get_cached_summary(request: Request):
             # 渐进式 run_all 写入的计算时间戳; 监控实时叠加/旧缓存无此字段 → None,
             # 前端视为新鲜 (有值即为最新一轮实时结果)
             "computed_at": result.get("computed_at"),
+            # 本轮跑挂的原因 (缺数据列等): 卡片据此显示「缺数据」而不是静默空白
+            **({"error": errors[sid]} if sid in errors else {}),
         }
         for sid, result in results.items()
         if isinstance(result, dict)
     }
+    # 只有失败没有结果的策略也要有卡片信息, 否则前端拿不到任何条目可挂原因
+    for sid, msg in errors.items():
+        if sid not in summary:
+            summary[sid] = {
+                "total": 0,
+                "as_of": cached_as_of,
+                "computed_at": None,
+                "error": msg,
+            }
 
-    cached_as_of = cached.get("as_of")
     ever_rows = cached.get("today_ever_rows") or {}
     ever_counts = {}
     for sid, result in results.items():
@@ -569,6 +581,16 @@ def market_snapshot(request: Request):
     return {"as_of": str(as_of), "rows": rows}
 
 
+def _strategy_failure_reason(exc: BaseException) -> str:
+    """策略异常 → 一句话原因, 供缓存与卡片 title 展示。
+
+    原始异常可能是 polars 的整表列名 dump 或带堆栈的长文本, 会污染 API 响应,
+    故压平空白并截断。缺列这类能力错配已由引擎收口成中文 ValueError。
+    """
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    return text[:200]
+
+
 def _run_all_progressive(
     *,
     repo,
@@ -633,8 +655,15 @@ def _run_all_progressive(
                 )
                 result = single[sid]
             except Exception as e:
+                reason = _strategy_failure_reason(e)
                 logger.warning("run_all: 策略 %s 执行失败, 跳过: %s", sid, e, exc_info=True)
-                handle.fail_one(sid, str(e))
+                # 失败原因也落缓存: 否则卡片只剩空白, 用户看不出是策略引用了
+                # 面板没提供的列。这里写失败只降级成「看不到原因」。
+                try:
+                    strategy_cache.write_cache(data_dir, str(as_of), {}, {sid: reason})
+                except Exception:  # noqa: BLE001
+                    logger.warning("run_all 失败原因写缓存失败: %s", sid, exc_info=True)
+                handle.fail_one(sid, reason)
                 continue
             payload = {
                 "total": result.total,

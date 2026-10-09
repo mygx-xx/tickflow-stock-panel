@@ -6,6 +6,7 @@
     "results": { strategy_id: { total, as_of, rows } },
     "today_ever_matched": { strategy_id: [symbol, ...] },    // 今日曾命中 symbol 并集
     "today_ever_rows": { strategy_id: { symbol: row_data } },// 今日曾命中的完整行数据
+    "errors": { strategy_id: "失败原因" },                  // 今日跑挂的策略 (缺数据等)
     "updated_at": 1705324800000  # Unix ms
   }
 
@@ -121,11 +122,14 @@ def write_cache(
     data_dir: Path,
     as_of: str,
     results: dict[str, Any],
+    errors: dict[str, str] | None = None,
 ) -> None:
     """将策略结果写入缓存文件，同时更新今日曾命中集合。
 
     - 日期变更时重置 today_ever_matched 和 today_ever_rows
     - 同一天内合并 (并集) 之前曾命中的 symbol，并用最新行数据更新
+    - errors: {策略: 失败原因}。同一策略本轮成功 (出现在 results 里) 即撤销其旧错误，
+      避免重跑修好后卡片继续挂「缺数据」。
     - 旁路: 把当日曾命中集合按日期归档, 供命中日报做跨日差分 (失败不影响主流程)
     """
     path = _cache_path(data_dir)
@@ -133,7 +137,7 @@ def write_cache(
 
     # 整个 read-modify-write 持锁: 避免并发 write 丢更新, 也避免与 read_cache 撕裂
     with _file_lock:
-        payload = _write_cache_locked(path, data_dir, as_of, results)
+        payload = _write_cache_locked(path, data_dir, as_of, results, errors or {})
 
     # 归档在锁外做: 它写的是另一个文件, 不该拖长主缓存的锁持有时间
     if payload is not None:
@@ -150,6 +154,7 @@ def _write_cache_locked(
     data_dir: Path,
     as_of: str,
     results: dict[str, Any],
+    errors: dict[str, str],
 ) -> dict | None:
     """持 _file_lock 后的实际写入逻辑 (read-merge-write + 原子替换)。
 
@@ -164,6 +169,11 @@ def _write_cache_locked(
         merged_results = {**(old.get("results") or {}), **results}
     else:
         merged_results = results
+
+    # 失败原因按日累计: 换日只留本轮, 同日增量写要保住其它策略已记的错误;
+    # 本轮成功的策略从错误表里撤销 (它已有结果, 再报错就是过期信息)。
+    old_errors = (old.get("errors") or {}) if old_as_of == as_of else {}
+    merged_errors = {k: v for k, v in {**old_errors, **errors}.items() if k not in results}
 
     # 当前命中的行数据 → symbol 映射
     current_row_maps: dict[str, dict[str, dict]] = {}
@@ -197,6 +207,7 @@ def _write_cache_locked(
         "results": merged_results,
         "today_ever_matched": today_ever_matched,
         "today_ever_rows": today_ever_rows,
+        "errors": merged_errors,
         "enriched_mtime": enriched_mtime,
         "updated_at": int(time.time() * 1000),
     }

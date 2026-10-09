@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import re
 import sys
 import threading
 import time
@@ -52,6 +53,19 @@ DEFAULT_BASIC_FILTER: dict = {
 
 # 叠加策略硬上限：子策略数量。控制信号计算成本与字段并集膨胀，避免 OOM。
 MAX_COMPOSITE_CHILDREN = 8
+
+
+def _missing_column_hint(strategy_id: str, exc: BaseException) -> str:
+    """polars 缺列报错 → 只保留列名的中文指引。
+
+    原始异常文本会把整张表的列名全量 dump 出来 (上百列), 不能进 API detail。
+    """
+    m = re.search(r'column "([^"]+)"', str(exc))
+    col = m.group(1) if m else "未知列"
+    return (
+        f'策略 {strategy_id} 引用了面板未提供的数据列 "{col}" — '
+        "该列通常来自财务/扩展因子, 需先在数据层同步对应数据, 或改用不依赖该列的策略参数后再运行"
+    )
 
 
 def _normalize_param_defs(params: Any) -> list[dict]:
@@ -875,6 +889,27 @@ class StrategyEngine:
     # ================================================================
 
     def run(
+        self,
+        strategy_id: str,
+        context: StrategyDataContext,
+        pool: list[str] | None = None,
+        params: dict | None = None,
+        overrides: dict | None = None,
+    ) -> StrategyResult:
+        """执行策略, 并把「引用了面板没提供的列」收口成 ValueError。
+
+        选股帧只有 enriched + 指标列; 策略引用财务/扩展因子 (如 pb_latest) 时
+        polars 抛 ColumnNotFoundError。那是策略与数据能力的错配, 不是服务内部
+        故障 — 转成带列名的中文 ValueError, API 才能返回 400 而不是 500。
+        """
+        try:
+            return self._run_one(
+                strategy_id, context, pool=pool, params=params, overrides=overrides
+            )
+        except pl.exceptions.ColumnNotFoundError as e:
+            raise ValueError(_missing_column_hint(strategy_id, e)) from e
+
+    def _run_one(
         self,
         strategy_id: str,
         context: StrategyDataContext,

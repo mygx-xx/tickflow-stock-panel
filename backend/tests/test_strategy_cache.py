@@ -47,3 +47,32 @@ def test_new_date_resets_results_and_ever_rows(tmp_path):
     assert cached["as_of"] == "2026-07-21"
     assert set(cached["results"]) == {"strategy_b"}
     assert set(cached["today_ever_rows"]) == {"strategy_b"}
+
+
+def test_失败原因同日按策略累积_重跑成功即撤销(tmp_path):
+    """渐进式逐策略写缓存: 失败原因要留住给卡片显示, 但重跑修好后不能继续挂错。"""
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {}, {"strategy_a": '缺少列 "pb_latest"'})
+    strategy_cache.write_cache(
+        tmp_path, "2026-07-20", {"strategy_b": _result("600000.SH")}, {"strategy_c": "类型错误"}
+    )
+
+    cached = strategy_cache.read_cache(tmp_path)
+    assert cached["errors"] == {"strategy_a": '缺少列 "pb_latest"', "strategy_c": "类型错误"}
+    # 失败写入不动其它策略结果
+    assert set(cached["results"]) == {"strategy_b"}
+
+    strategy_cache.write_cache(tmp_path, "2026-07-20", {"strategy_a": _result("000001.SZ")})
+
+    assert strategy_cache.read_cache(tmp_path)["errors"] == {"strategy_c": "类型错误"}
+
+
+def test_换日重置失败原因(tmp_path):
+    strategy_cache.write_cache(
+        tmp_path, "2026-07-20", {"strategy_a": _result("000001.SZ")}, {"strategy_b": "缺少列"}
+    )
+    next_day = _result("600000.SH")
+    next_day["as_of"] = "2026-07-21"
+
+    strategy_cache.write_cache(tmp_path, "2026-07-21", {"strategy_a": next_day})
+
+    assert strategy_cache.read_cache(tmp_path)["errors"] == {}
