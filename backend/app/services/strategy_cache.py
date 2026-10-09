@@ -11,6 +11,11 @@
   }
 
 文件路径: data/user_data/strategy_cache.json
+
+旁路文件: data/user_data/strategy_cache_summary.json — 上面 payload 的**无行数据投影**
+(results 剥掉 rows, 另带 today_ever_matched / errors / as_of / updated_at)。策略页卡片的
+摘要端点读它 (实测 151 策略约 55KB vs 全量 15–23MB), 由 write_cache 与全量同批原子替换;
+缺失时端点回退解析全量, 口径不变 (有逐字段等价用例)。
 """
 from __future__ import annotations
 
@@ -36,15 +41,54 @@ def _json_default(obj: Any) -> Any:
 logger = logging.getLogger(__name__)
 
 _CACHE_FILENAME = "strategy_cache.json"
+# 摘要侧文件: 全量缓存的无行数据投影 (每策略 total/as_of/computed_at + 曾命中 symbol
+# 列表), 实测 151 策略约 45KB vs 全量 22.7MB。策略页卡片的摘要读这个, 不再解析全量。
+_SUMMARY_FILENAME = "strategy_cache_summary.json"
 
 # 读写同一 JSON 文件的进程内锁: write_cache 的 read-modify-write 与并发 read_cache
 # 无锁会丢更新/读到半写文件。read_cache 与 write_cache 共用此锁; write 内部复用
 # _read_cache_unlocked 避免自死锁。写入用临时文件 + os.replace 做到原子替换。
 _file_lock = threading.Lock()
 
+# 已解析结果的进程内复用: 缓存文件实测 22.7MB (151 策略 / 4643 行), 整体 json.loads
+# 一次 250–270ms, 而 cached-summary 只留 151 条摘要 —— 策略页首屏与 pendingRun 期间
+# 每 2s 的轮询都要重付这 270ms, 且全程攥着 _file_lock (write 侧在锁内 read-modify-write
+# 整份文件, 实测 570ms, 期间所有读排队)。按 (mtime_ns, size) 命中即复用, 命中与否内容
+# 完全一致。
+#
+# 只在 _file_lock 内读写, 无需额外加锁。key 为缓存文件绝对路径。
+# 返回值与其嵌套内容一律视为**只读**: memo 把同一对象发给多个调用方, 就地改会污染
+# 后续所有读取 (write_cache 的 merge 读也走 memo)。
+_MEMO_MAX_ENTRIES = 8
+_memo: dict[str, tuple[int, int, dict | None]] = {}
+
 
 def _cache_path(data_dir: Path) -> Path:
     return data_dir / "user_data" / _CACHE_FILENAME
+
+
+def _summary_path(data_dir: Path) -> Path:
+    return data_dir / "user_data" / _SUMMARY_FILENAME
+
+
+def summary_of(payload: dict) -> dict:
+    """全量缓存 → 摘要投影 (剥掉每策略的 rows 明细, 其余字段原样保留)。
+
+    today_ever_matched 保留完整 symbol 列表而非只留计数: 端点叠加监控引擎实时结果时
+    要用它和实时行做并集 (实时轮可能命中此前没命中的票)。
+    """
+    results = payload.get("results") or {}
+    return {
+        "as_of": payload.get("as_of"),
+        "updated_at": payload.get("updated_at"),
+        "results": {
+            sid: {k: v for k, v in r.items() if k != "rows"}
+            for sid, r in results.items()
+            if isinstance(r, dict)
+        },
+        "today_ever_matched": payload.get("today_ever_matched") or {},
+        "errors": payload.get("errors") or {},
+    }
 
 
 def _enriched_parquet_path(data_dir: Path, as_of: str) -> Path:
@@ -69,9 +113,26 @@ def read_cache(data_dir: Path) -> dict | None:
     缓存被永久判死, 策略页读不到数据。且判过期后不触发重算, 只能让用户手动重跑,
     保护价值有限。故移除: 盘后缓存总能读出, 实时新鲜度由 /api/screener/cached
     端点叠加监控引擎的内存实时结果 (latest_strategy_results) 来保证。
+
+    返回值来自进程内 memo, 视为只读; 需要改就先复制 (见 _read_cache_unlocked)。
     """
     with _file_lock:
         return _read_cache_unlocked(data_dir)
+
+
+def read_summary(data_dir: Path) -> dict | None:
+    """读取摘要侧文件。返回 None 表示没有摘要 (旧缓存/写失败/已被清), 调用方须回退全量。
+
+    不套 memo: 45KB 解析远小于加判据的成本, 且它每次写都必然跟着换。
+    """
+    path = _summary_path(data_dir)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取策略摘要失败, 调用方将回退全量缓存: %s", e)
+        return None
 
 
 def clear_cache(data_dir: Path) -> None:
@@ -86,26 +147,50 @@ def clear_cache(data_dir: Path) -> None:
     )
     logger.warning("策略缓存被清除, 调用链: %s", chain)
     path = _cache_path(data_dir)
+    summary = _summary_path(data_dir)
     with _file_lock:
         path.unlink(missing_ok=True)
         path.with_name(path.name + ".tmp").unlink(missing_ok=True)
+        summary.unlink(missing_ok=True)
+        summary.with_name(summary.name + ".tmp").unlink(missing_ok=True)
+        _memo.pop(str(path), None)
 
 
 def _read_cache_unlocked(data_dir: Path) -> dict | None:
-    """实际读取逻辑 (不持锁)。供 read_cache 与 write_cache 复用, 避免重入死锁。"""
+    """带 memo 的读取 (调用方须已持 _file_lock)。返回值只读, 不得就地修改。
+
+    供 read_cache 与 write_cache 复用, 避免重入死锁。
+    """
     path = _cache_path(data_dir)
-    if not path.exists():
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        _memo.pop(str(path), None)
         return None
+
+    key = str(path)
+    hit = _memo.get(key)
+    if hit is not None and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size:
+        return hit[2]
+
+    cached = _load_from_disk(path)
+    if len(_memo) >= _MEMO_MAX_ENTRIES:
+        # 正常只有一个 data_dir; 上限只防测试里逐用例换 tmp_path 把表撑大
+        _memo.clear()
+    _memo[key] = (stat.st_mtime_ns, stat.st_size, cached)
+    return cached
+
+
+def _load_from_disk(path: Path) -> dict | None:
+    """从磁盘整体解析缓存文件。返回 None 表示无缓存或读取失败。"""
     try:
         text = path.read_text(encoding="utf-8")
         if not text.strip():
             return None
-        cached = json.loads(text)
+        return json.loads(text)
     except Exception as e:  # noqa: BLE001
         logger.warning("读取策略缓存失败: %s", e)
         return None
-
-    return cached
 
 
 def _rows_to_symbol_map(rows: list[dict]) -> dict[str, dict]:
@@ -147,6 +232,16 @@ def write_cache(
             hits_archive.archive(data_dir, as_of, payload.get("today_ever_matched") or {})
         except Exception as e:  # noqa: BLE001
             logger.warning("命中归档旁路失败 (不影响缓存写入): %s", e)
+
+
+def _write_summary_locked(data_dir: Path, summary: dict) -> None:
+    """摘要落盘 (调用方须已持 _file_lock)。同样用临时文件 + os.replace 原子替换。"""
+    path = _summary_path(data_dir)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(summary, ensure_ascii=False, default=_json_default), encoding="utf-8"
+    )
+    os.replace(tmp, path)
 
 
 def _write_cache_locked(
@@ -216,6 +311,23 @@ def _write_cache_locked(
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, default=_json_default), encoding="utf-8")
         os.replace(tmp, path)
+        # 写侧直接刷新 memo: 同一次写的内容本机已知, 下一笔增量写 (run_all 逐策略落盘)
+        # 的 merge 读即命中, 整写实测 570ms → 285ms, 锁占用减半; 也不依赖 (mtime, size)
+        # 判据 —— Windows 时钟粒度粗, 同刻连续写会撞车使 memo 判命中而返回旧内容。
+        # 外部进程改写仍由 stat 变化兜住 (size 几乎必变)。
+        try:
+            stat = path.stat()
+            _memo[str(path)] = (stat.st_mtime_ns, stat.st_size, payload)
+        except FileNotFoundError:
+            _memo.pop(str(path), None)
+        # 摘要跟着全量一起换 (同一份 payload 派生, 不会算两遍)。
+        # 写失败就删掉旧摘要: 宁可让端点回退解析全量, 也不让它端出一份比全量旧的摘要。
+        # 残留窗口: 两次 replace 之间进程被杀 → 摘要比全量旧一轮, 下一次写即自愈。
+        try:
+            _write_summary_locked(data_dir, summary_of(payload))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("写入策略摘要失败, 已删除旧摘要让端点回退全量: %s", e)
+            _summary_path(data_dir).unlink(missing_ok=True)
         total_rows = sum(len(r.get("rows", [])) for r in merged_results.values())
         total_ever = sum(len(v) for v in today_ever_matched.values())
         logger.info("策略缓存已写入: %s, %d 策略, %d 命中, %d 曾命中", as_of, len(merged_results), total_rows, total_ever)

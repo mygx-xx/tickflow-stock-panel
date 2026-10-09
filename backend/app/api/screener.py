@@ -240,7 +240,9 @@ def _update_cache_strategy(data_dir, as_of: str, strategy_id: str, safe_data: di
     from app.services import strategy_cache
     cached = strategy_cache.read_cache(data_dir)
     if cached and cached.get("as_of") == as_of:
-        results = cached.get("results", {})
+        # 复制一层再改: read_cache 现在返回进程内共享对象, 就地塞进 results 会污染
+        # 之后所有读取 (含本轮 merge 读)。
+        results = dict(cached.get("results") or {})
         results[strategy_id] = {
             "total": safe_data.get("total", 0),
             "as_of": as_of,
@@ -364,27 +366,46 @@ def run_preset(req: PresetRequest, request: Request):
     return _result_with_ext(safe_data, ext_values)
 
 
+def _overlay_realtime(request: Request, cached: dict) -> dict:
+    """把监控引擎内存里的实时结果叠加覆盖同策略 (不落盘)。"""
+    monitor_engine = getattr(request.app.state, "monitor_engine", None)
+    if monitor_engine is None:
+        return cached
+    realtime_results = monitor_engine.latest_strategy_results()
+    if not realtime_results:
+        return cached
+    results = dict(cached.get("results") or {})
+    results.update(realtime_results)
+    cached = dict(cached)
+    cached["results"] = results
+    # 有实时数据时, 以最新时间戳为准
+    import time as _time
+    cached["updated_at"] = int(_time.time() * 1000)
+    return cached
+
+
 def _cached_with_realtime(request: Request) -> dict:
     """读取盘后缓存，并用监控引擎的实时结果覆盖同策略。"""
     data_dir = request.app.state.repo.store.data_dir
     cached = strategy_cache.read_cache(data_dir)
     if cached is None:
         cached = {"as_of": None, "results": {}, "updated_at": None}
+    return _overlay_realtime(request, cached)
 
-    # 叠加监控引擎内存里的实时结果 (若有), 用新鲜数据覆盖同策略的盘后结果
-    monitor_engine = getattr(request.app.state, "monitor_engine", None)
-    if monitor_engine is not None:
-        realtime_results = monitor_engine.latest_strategy_results()
-        if realtime_results:
-            results = dict(cached.get("results") or {})
-            results.update(realtime_results)
-            cached = dict(cached)
-            cached["results"] = results
-            # 有实时数据时, 以最新时间戳为准
-            import time as _time
-            cached["updated_at"] = int(_time.time() * 1000)
 
-    return cached
+def _summary_source(request: Request) -> dict:
+    """卡片摘要的数据源, 两个来源收敛成同一形状 (results / errors / today_ever_matched)。
+
+    优先读摘要侧文件 (实测 151 策略约 45KB); 缺失 (改造前写的旧缓存、摘要写失败、
+    被 clear 掉) 才回退解析全量 (实测 22.7MB / 一次 250–270ms)。
+    """
+    data_dir = request.app.state.repo.store.data_dir
+    cached = strategy_cache.read_summary(data_dir)
+    if cached is None:
+        cached = strategy_cache.read_cache(data_dir)
+    if cached is None:
+        cached = {"as_of": None, "results": {}, "updated_at": None}
+    return _overlay_realtime(request, cached)
 
 
 @router.get("/cached")
@@ -437,7 +458,7 @@ def hits_daily(
 @router.get("/cached-summary")
 def get_cached_summary(request: Request):
     """返回策略卡片所需的轻量摘要，不序列化股票明细。"""
-    cached = _cached_with_realtime(request)
+    cached = _summary_source(request)
     results = cached.get("results") or {}
     cached_as_of = cached.get("as_of")
     errors = cached.get("errors") or {}
@@ -464,17 +485,23 @@ def get_cached_summary(request: Request):
                 "error": msg,
             }
 
-    ever_rows = cached.get("today_ever_rows") or {}
+    # 今日曾命中数: 摘要侧的 today_ever_matched 已经并进了本轮命中的 symbol (写入时
+    # 由 ever_rows 派生), 所以读摘要时直接取长度; 只有叠加了监控引擎实时结果的策略
+    # 需要再并一次 —— 实时轮可能命中此前没命中的票。
+    ever_matched = cached.get("today_ever_matched") or {}
     ever_counts = {}
     for sid, result in results.items():
         if not isinstance(result, dict) or result.get("as_of") != cached_as_of:
             continue
-        current_symbols = {
-            str(row["symbol"])
-            for row in result.get("rows") or []
-            if isinstance(row, dict) and row.get("symbol")
-        }
-        ever_counts[sid] = len(set((ever_rows.get(sid) or {}).keys()) | current_symbols)
+        symbols = set(ever_matched.get(sid) or ())
+        rows = result.get("rows")
+        if rows is not None:
+            symbols |= {
+                str(row["symbol"])
+                for row in rows
+                if isinstance(row, dict) and row.get("symbol")
+            }
+        ever_counts[sid] = len(symbols)
     return {
         "as_of": cached_as_of,
         "results": summary,

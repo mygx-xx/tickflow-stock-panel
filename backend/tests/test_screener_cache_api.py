@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from app.api import screener as screener_api
+from app.services import strategy_cache
 
 
 class _MonitorEngine:
@@ -35,6 +36,8 @@ def test_cached_summary_omits_rows_and_counts_realtime_expirations(monkeypatch, 
                 "600000.SH": {"symbol": "600000.SH"},
             },
         },
+        # write_cache 由 today_ever_rows 派生这份 symbol 列表; 摘要读的是它而非 8MB 明细
+        "today_ever_matched": {"strategy_a": ["000001.SZ", "600000.SH"]},
         "updated_at": 1,
     }
     realtime = {
@@ -189,3 +192,90 @@ def test_cached_keeps_coverage_warnings_with_and_without_ext_columns(monkeypatch
     )
     with_ext = screener_api.get_cached(_request(tmp_path), ext_columns="concept.concept")
     assert with_ext["results"]["strategy_a"]["warnings"] == [_WARNING]
+
+
+# ── 摘要侧文件: 卡片摘要不再解析全量缓存 ────────────────────────────────────
+# 全量实测 22.7MB / 一次解析 250–270ms, 摘要投影实测约 45KB。这两条返回路径必须
+# 给出**同一份**卡片数据, 否则省下的时间是用口径漂移换的。
+
+_AS_OF = "2026-07-20"
+
+
+def _res(total: int, *symbols: str, as_of: str = _AS_OF, computed_at: int | None = None) -> dict:
+    out = {
+        "as_of": as_of,
+        "total": total,
+        "rows": [{"symbol": s, "close": 1.0} for s in symbols],
+    }
+    if computed_at is not None:
+        out["computed_at"] = computed_at
+    return out
+
+
+def test_摘要命中时端点不再读全量缓存(tmp_path, monkeypatch):
+    strategy_cache.write_cache(tmp_path, _AS_OF, {"strategy_a": _res(2, "000001.SZ", "000002.SZ")})
+
+    def _boom(*_args):
+        raise AssertionError("摘要侧命中时不该解析全量缓存")
+
+    monkeypatch.setattr(strategy_cache, "read_cache", _boom)
+
+    payload = screener_api.get_cached_summary(_request(tmp_path))
+
+    assert payload["results"]["strategy_a"] == {
+        "total": 2,
+        "as_of": _AS_OF,
+        "computed_at": None,
+    }
+    assert payload["today_ever_counts"] == {"strategy_a": 2}
+
+
+def test_摘要与全量两条路径给出同一份卡片数据(tmp_path, monkeypatch):
+    strategy_cache.write_cache(
+        tmp_path,
+        _AS_OF,
+        {
+            "strategy_a": _res(2, "000001.SZ", "000002.SZ", computed_at=111),
+            # 过期日期的策略: 两条路径都要既带上它又不给它 ever 计数
+            "strategy_old": _res(1, "600000.SH", as_of="2026-07-19", computed_at=222),
+        },
+        {"strategy_broken": '缺少列 "pb_latest"'},
+    )
+    # 实时轮命中了此前没命中的 300001.SZ → ever 必须并上它, 摘要侧只有 symbol 列表可用
+    realtime = {"strategy_a": _res(2, "000002.SZ", "300001.SZ")}
+
+    # 钉住时钟: 实时叠加会写 updated_at, 不钉的话两次调用的毫秒数可能不同
+    monkeypatch.setattr("time.time", lambda: 1_700_000_000.0)
+
+    via_summary = screener_api.get_cached_summary(_request(tmp_path, realtime))
+
+    monkeypatch.setattr(strategy_cache, "read_summary", lambda *_args: None)
+    via_full = screener_api.get_cached_summary(_request(tmp_path, realtime))
+
+    assert via_summary == via_full
+    # 等价之外再点名关键口径, 防止两边一起错
+    assert via_summary["results"]["strategy_a"]["total"] == 2
+    # 实时叠加会整体替换该策略的条目 → 盘后的 computed_at 随之消失, 两条路径一致
+    assert via_summary["results"]["strategy_a"]["computed_at"] is None
+    assert via_summary["results"]["strategy_old"]["computed_at"] == 222
+    assert via_summary["results"]["strategy_broken"]["error"] == '缺少列 "pb_latest"'
+    assert via_summary["today_ever_counts"] == {"strategy_a": 3}
+    assert "strategy_old" not in via_summary["today_ever_counts"]
+
+
+def test_摘要写失败时删掉旧摘要_端点回退全量(tmp_path, monkeypatch):
+    """宁可回退解析全量, 也不让端点端出比全量旧的摘要。"""
+    strategy_cache.write_cache(tmp_path, _AS_OF, {"strategy_a": _res(1, "000001.SZ")})
+    assert strategy_cache._summary_path(tmp_path).exists()
+
+    def _raise(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(strategy_cache, "_write_summary_locked", _raise)
+    strategy_cache.write_cache(tmp_path, _AS_OF, {"strategy_a": _res(2, "000001.SZ", "000002.SZ")})
+
+    assert not strategy_cache._summary_path(tmp_path).exists()
+
+    payload = screener_api.get_cached_summary(_request(tmp_path))
+    assert payload["results"]["strategy_a"]["total"] == 2
+    assert payload["today_ever_counts"] == {"strategy_a": 2}
